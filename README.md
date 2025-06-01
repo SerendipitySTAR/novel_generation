@@ -496,6 +496,44 @@ graph TD
     * `Orchestration Layer`: 使用LangGraph串联以上流程。
 * **技术验证点：** 核心流程是否跑通？RAG提供的上下文对章节生成是否有帮助？初步的一致性如何？
 
+#### Current MVP Implementation Status (As of 2025-06-01)
+
+The project has made significant progress towards achieving the Phase 1 MVP goals. Here's a summary of the current implementation:
+
+*   **Core Workflow Orchestration**:
+    *   The `WorkflowManager` (`src/orchestration/workflow_manager.py`) uses LangGraph to manage a sequence of agents to generate a multi-chapter novel outline and (mocked) content.
+    *   The workflow includes initialization of novel parameters, outline generation, worldview creation, plot outlining (chapter-by-chapter summaries), character generation, knowledge base initialization, and a loop structure for generating a (fixed, e.g., 3) number of chapters.
+
+*   **Implemented Agents (MVP Level)**:
+    *   `DatabaseManager` (`src/persistence/database_manager.py`): Manages an SQLite database (`main_novel_generation.db` by default when run via `main.py`) with a schema to store novels, outlines, worldviews, plots, characters, chapters, and knowledge base entries. Core models are defined in `src/core/models.py`.
+    *   `LLMClient` (`src/llm_abstraction/llm_client.py`): Basic client for OpenAI API interaction.
+    *   `NarrativePathfinderAgent` (`src/agents/narrative_pathfinder_agent.py`): Structure in place. Output is currently mocked within the `WorkflowManager` when a dummy API key is used.
+    *   `WorldWeaverAgent` (`src/agents/world_weaver_agent.py`): Structure in place. Output is currently mocked within the `WorkflowManager` when a dummy API key is used.
+    *   `PlotArchitectAgent` (`src/agents/plot_architect_agent.py`): Structure in place. The `WorkflowManager` currently generates mocked chapter-by-chapter plot summaries based on this agent's conceptual role.
+    *   `CharacterSculptorAgent` (`src/agents/character_sculptor_agent.py`): Generates basic character profiles (name, description, role). Uses an internal mock LLM response for deterministic output without API calls in the current testing setup. Saves characters to the database.
+    *   `KnowledgeBaseManager` (`src/knowledge_base/knowledge_base_manager.py`): Manages a ChromaDB vector store for Retrieval Augmented Generation (RAG). Requires a valid OpenAI API key for embedding generation.
+    *   `LoreKeeperAgent` (`src/agents/lore_keeper_agent.py`): Initializes the knowledge base with outline, worldview, plot, and character data, and can update it with chapter summaries. Its full RAG capabilities (embedding and semantic search) depend on a valid OpenAI API key.
+    *   `ContextSynthesizerAgent` (`src/agents/context_synthesizer_agent.py`): Prepares a comprehensive brief for each chapter by fetching data from the database and context from the `LoreKeeperAgent`.
+    *   `ChapterChroniclerAgent` (`src/agents/chapter_chronicler_agent.py`): Generates chapter content (title, body, summary). Uses an internal mock LLM response for deterministic output in the current testing setup. Saves chapters to the database.
+
+*   **Command-Line Interface (CLI)**:
+    *   A basic CLI is available via `main.py` in the project root.
+    *   Usage: `python main.py --theme "Your novel theme" [--style "Your novel style"]`
+    *   It initiates the `WorkflowManager` and prints the generated novel components to the console.
+
+*   **Current Limitations & API Key Usage**:
+    *   **OpenAI API Key**: Most AI-powered generation steps (initial outline, worldview, actual character details, chapter content, and knowledge base embeddings/retrieval) are currently either mocked or will use fallback mechanisms if a valid `OPENAI_API_KEY` is not provided in a `.env` file or as an environment variable.
+    *   The `main.py` script and agent test suites will set up a *dummy* API key if one is not found, allowing the workflow to run up to the point where actual OpenAI services are required (primarily embedding generation by `KnowledgeBaseManager`). At this point, the workflow will stop if only a dummy key is present.
+    *   To experience full functionality, a valid OpenAI API key with access to models like `gpt-3.5-turbo` (for text generation) and embedding models is required.
+
+*   **Next Steps for MVP Completion**:
+    *   Thoroughly test the end-to-end workflow with a valid OpenAI API key.
+    *   Refine prompts for all agents based on real outputs.
+    *   Ensure the RAG system effectively contributes to chapter context.
+    *   Address any bugs or inconsistencies found during full end-to-end testing.
+
+This status reflects the project's capability to run the structural workflow of novel generation, with placeholders for most of the AI-generated content when external API services are not configured.
+
 ### 8.3. 阶段 2: 核心功能完善与智能体初步成型 
 
 * **目标：** 完善各生成模块，实现用户手册中描述的各智能体的核心职责和交互，知识库功能增强。

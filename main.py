@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+import os
+import argparse
+from dotenv import load_dotenv
+
+from src.orchestration.workflow_manager import WorkflowManager, NovelWorkflowState # Assuming NovelWorkflowState is importable
+from src.persistence.database_manager import DatabaseManager # For direct DB access in main for final output
+
+def setup_dummy_api_key():
+    """
+    Checks for OPENAI_API_KEY. If not found, and no .env file with it exists,
+    creates a .env file with a dummy key to allow components to initialize.
+    """
+    load_dotenv() # Try loading existing .env first
+    if not os.getenv("OPENAI_API_KEY"):
+        env_file_exists = os.path.exists(".env")
+        key_in_env_file = False
+        if env_file_exists:
+            with open(".env", "r") as f:
+                if "OPENAI_API_KEY" in f.read():
+                    key_in_env_file = True
+
+        if not env_file_exists or not key_in_env_file:
+            print("INFO: OPENAI_API_KEY not found in environment or .env file.")
+            print("INFO: Creating a .env file with a DUMMY OpenAI API key (sk-dummyclikey...) for initialization purposes.")
+            print("INFO: This dummy key will NOT work for actual OpenAI API calls.")
+            print("INFO: Please set a valid OPENAI_API_KEY in your .env file or environment for full functionality.")
+            with open(".env", "w") as f:
+                f.write("OPENAI_API_KEY=\"sk-dummyclikeyformainexecution\"\n")
+
+    load_dotenv() # Load again to pick up newly created .env if any
+    # Final check, though LLMClients will do their own validation too
+    if not os.getenv("OPENAI_API_KEY"):
+        print("ERROR: Failed to set up or load OPENAI_API_KEY. Application might not run correctly.")
+    else:
+        print(f"INFO: OPENAI_API_KEY is set (Value starts with: {os.getenv('OPENAI_API_KEY')[:10]}...).")
+        if "dummyclikeyformainexecution" in os.getenv("OPENAI_API_KEY"): # Match the exact dummy key
+            print("INFO: Using a DUMMY API key. LLM-dependent features will use mocks or fail if not mocked.")
+
+def parse_arguments() -> dict:
+    """Parses command-line arguments."""
+    parser = argparse.ArgumentParser(description="Novel Generation CLI")
+    parser.add_argument("--theme", type=str, required=True, help="The theme for your novel.")
+    parser.add_argument("--style", type=str, default="general fiction", help="Style preferences (e.g., 'fantasy, dark humor'). Defaults to 'general fiction'.")
+    args = parser.parse_args()
+    return {"theme": args.theme, "style_preferences": args.style}
+
+def main_cli():
+    """Main CLI function using argparse."""
+    setup_dummy_api_key()
+
+    print("\n--- Novel Generation Setup ---")
+    user_input_data = parse_arguments()
+    print(f"Theme: {user_input_data['theme']}")
+    print(f"Style: {user_input_data['style_preferences']}")
+
+    print("\nInitializing WorkflowManager...")
+    # Assuming default DB name is handled by WorkflowManager and DatabaseManager
+    # Ensure any test DBs are cleaned up if you run this after tests, or use a unique DB for main.
+    workflow_db_name = "main_novel_generation.db"
+    workflow_chroma_dir = "./main_novel_chroma_db" # For LoreKeeper via WorkflowManager
+
+    # Clean up previous main run DBs if they exist, for a fresh run each time
+    import shutil
+    if os.path.exists(workflow_db_name):
+        print(f"INFO: Removing previous database: {workflow_db_name}")
+        os.remove(workflow_db_name)
+    if os.path.exists(workflow_chroma_dir):
+        print(f"INFO: Removing previous Chroma database: {workflow_chroma_dir}")
+        shutil.rmtree(workflow_chroma_dir)
+
+
+    manager = WorkflowManager(db_name=workflow_db_name) # Pass db_name to constructor
+    print(f"INFO: WorkflowManager will use DB: {workflow_db_name} and Chroma dir: {workflow_chroma_dir} (via LoreKeeperAgent)")
+
+
+    print("\nStarting novel generation workflow...")
+    final_state: NovelWorkflowState = manager.run_workflow(user_input_data)
+    print("\n--- Novel Generation Workflow Complete ---")
+
+    # Display Output
+    print("\n--- Generated Novel ---")
+    if final_state.get('error_message'):
+        print(f"Workflow failed: {final_state['error_message']}")
+        print("\nWorkflow History:")
+        for entry in final_state.get('history', []):
+            print(f"  - {entry}")
+    else:
+        novel_id = final_state.get('novel_id') # Changed from narrative_id to novel_id
+
+        # Access the db_manager instance from the WorkflowManager if it's made available
+        # Or instantiate a new one for display purposes.
+        # For this example, we'll instantiate a new one.
+        display_db_manager = DatabaseManager(db_name=workflow_db_name)
+
+        novel_record = display_db_manager.get_novel_by_id(novel_id) if novel_id else None
+
+        print(f"Novel ID: {novel_id}")
+        print(f"Theme: {final_state.get('user_input', {}).get('theme')}")
+        print(f"Style: {final_state.get('user_input', {}).get('style_preferences')}")
+
+        if novel_record:
+            outline_data = display_db_manager.get_outline_by_id(novel_record['active_outline_id']) if novel_record['active_outline_id'] else None
+            worldview_data = display_db_manager.get_worldview_by_id(novel_record['active_worldview_id']) if novel_record['active_worldview_id'] else None
+            plot_data = display_db_manager.get_plot_by_id(novel_record['active_plot_id']) if novel_record['active_plot_id'] else None
+            characters_data = display_db_manager.get_characters_for_novel(novel_id) if novel_id else []
+
+            if outline_data: print(f"\nOutline: {outline_data['overview_text']}")
+            if worldview_data: print(f"\nWorldview: {worldview_data['description_text']}")
+            if plot_data: print(f"\nPlot Summary (concatenated chapter plots):\n{plot_data['plot_summary']}")
+
+            if characters_data:
+                print("\nCharacters:")
+                for char in characters_data:
+                    print(f"  - {char['name']}: {char['description']} ({char['role_in_story']})")
+            else:
+                print("\nCharacters: No characters were generated or found.")
+        else:
+            print("\nNovel core data (outline, worldview, plot, characters) could not be fully retrieved from DB.")
+            print(f"  Narrative Outline Text from state: {final_state.get('narrative_outline_text')}")
+            print(f"  Worldview Text from state: {final_state.get('worldview_text')}")
+
+
+        generated_chapters = final_state.get('generated_chapters', [])
+        if generated_chapters:
+            print("\n--- Chapters ---")
+            for chapter in generated_chapters:
+                print(f"\nChapter {chapter['chapter_number']}: {chapter['title']}")
+                print(f"Summary: {chapter['summary']}")
+                print(f"Content:\n{chapter['content']}")
+        else:
+            print("\nNo chapters were generated by the workflow.")
+            print("This might be due to the workflow stopping before chapter generation (e.g., at LoreKeeper initialization if API key is dummy),")
+            print("or if the chapter generation loop was configured for 0 chapters.")
+
+        print("\nFull Workflow History:")
+        for entry in final_state.get('history', []):
+            print(f"  - {entry}")
+
+        # Suggestion for user:
+        print(f"\nINFO: All persistent data for this novel (ID: {novel_id}) is in '{workflow_db_name}'.")
+        print(f"INFO: Vector embeddings (if generated) are in '{workflow_chroma_dir}'.")
+
+if __name__ == "__main__":
+    main_cli()
