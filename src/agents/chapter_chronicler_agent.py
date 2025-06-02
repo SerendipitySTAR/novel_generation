@@ -22,13 +22,21 @@ class ChapterChroniclerAgent:
         self.db_manager = DatabaseManager(db_name=db_name)
 
     def _construct_prompt(self, chapter_brief: str, current_chapter_plot_summary: str, style_preferences: str) -> str:
+        # Prompt refined to be more explicit about using the plot summary and brief,
+        # and the RAG context if demarcated in the brief.
         prompt = f"""You are a novelist writing a chapter. Adhere to the style: {style_preferences}.
+
         Chapter Brief (context, characters, lore):
         --- BEGIN CHAPTER BRIEF ---
         {chapter_brief}
         --- END CHAPTER BRIEF ---
 
         Specific Plot for THIS Chapter: {current_chapter_plot_summary}
+
+        Your primary goal for this chapter's content is to flesh out the 'Specific Plot for THIS Chapter'.
+        Use the 'Chapter Brief' for essential background, character states, and relevant lore to ensure consistency.
+        Weave these elements together to write a compelling narrative for this chapter.
+        Refer to any 'Relevant Lore and Context' (often demarcated by '--- RELEVANT LORE AND CONTEXT ---') provided in the brief.
 
         Your output MUST be structured with these exact headings on new lines:
         Title:
@@ -45,90 +53,99 @@ class ChapterChroniclerAgent:
         return prompt
 
     def _parse_llm_response(self, llm_response: str, novel_id: int, chapter_number: int) -> Optional[Dict[str, Any]]:
+        parsing_log_prefix = f"ChapterChroniclerAgent (Ch {chapter_number}):"
         try:
-            title = f"Chapter {chapter_number} (Untitled)" # Default title
-            content = "Content not generated." # Default content
-            summary = "Summary not generated." # Default summary
+            title = f"Chapter {chapter_number} (Untitled)"
+            content = "Content not generated."
+            summary = "Summary not generated."
+            parse_path = "Initial" # To log parsing attempts
 
-            # Try to find Title: (must be at the start of a line)
+            # Attempt to find Title: - must be at the start of a line.
             title_match = re.search(r"^Title:(.*?)$", llm_response, re.MULTILINE | re.IGNORECASE)
             if title_match:
                 title_text = title_match.group(1).strip()
-                if title_text: # Ensure it's not just whitespace
-                    title = title_text
+                if title_text: title = title_text
+                parse_path += "->TitleOK"
+            else:
+                parse_path += "->TitleFail"
+                print(f"{parsing_log_prefix} Warning - 'Title:' marker not found or not at start of a line.")
 
-            # Try to find Content: (everything between Content: and Summary:, multiline)
+            # Attempt to find Content: (everything between Content: and Summary:, multiline)
+            # This regex assumes "Summary:" follows "Content:".
             content_match = re.search(r"^Content:(.*?)Summary:", llm_response, re.DOTALL | re.IGNORECASE | re.MULTILINE)
             if content_match:
                 content_text = content_match.group(1).strip()
-                if content_text:
-                    content = content_text
+                if content_text: content = content_text
+                parse_path += "->ContentOK"
             else:
-                # Fallback for content if Summary: is missing or Content: is the last significant block
+                parse_path += "->ContentAlt"
+                # Fallback for content if "Summary:" is missing or "Content:" is the last significant block
                 content_match_fallback = re.search(r"^Content:(.*)", llm_response, re.DOTALL | re.IGNORECASE | re.MULTILINE)
                 if content_match_fallback:
                     content_text = content_match_fallback.group(1).strip()
-                    if content_text:
-                        content = content_text
+                    if content_text: content = content_text
+                    parse_path += "->ContentAltOK"
+                    print(f"{parsing_log_prefix} Warning - 'Summary:' marker not found after 'Content:'. Content might include summary text.")
+                else:
+                    parse_path += "->ContentAltFail"
+                    print(f"{parsing_log_prefix} Warning - 'Content:' marker not found or content is empty.")
 
-            # Try to find Summary: (everything after Summary:, multiline)
+
+            # Attempt to find Summary: (everything after Summary:, multiline)
             summary_match = re.search(r"^Summary:(.*)", llm_response, re.DOTALL | re.IGNORECASE | re.MULTILINE)
             if summary_match:
                 summary_text = summary_match.group(1).strip()
-                if summary_text:
-                    summary = summary_text
+                if summary_text: summary = summary_text
+                parse_path += "->SummaryOK"
+            else:
+                 parse_path += "->SummaryFail"
+                 print(f"{parsing_log_prefix} Warning - 'Summary:' marker not found or not at start of a line.")
 
-            # If structured parsing failed to get content, but there is a response, use a more general fallback.
+            # The 'desperate parse' for content:
+            # If content is still the default placeholder AND the LLM response was not empty,
+            # it means structured parsing failed significantly.
             if content == "Content not generated." and llm_response.strip():
-                print("ChapterChroniclerAgent: Warning - Structured parsing for Content failed. Using fallback.")
-                # Attempt to take everything after "Title: [parsed_title]\n" or just after "Content:" if title is default
-                # This part is tricky and depends on how consistently the LLM fails.
-                # A simple approach: if Title was found, take text after it. Otherwise, take all.
-                # This might grab the Summary too if it was present but Content was not.
-                current_content_start_index = 0
-                if title != f"Chapter {chapter_number} (Untitled)" and title_match:
-                    current_content_start_index = title_match.end()
+                parse_path += "->DesperateContent"
+                print(f"{parsing_log_prefix} Warning - Structured parsing for Content failed significantly. Using desperate fallback.")
 
-                # Look for "Content:" marker after the title to be more precise
-                content_marker_search = re.search(r"^Content:", llm_response[current_content_start_index:], re.MULTILINE | re.IGNORECASE)
-                if content_marker_search:
-                    current_content_start_index += content_marker_search.end()
+                response_remainder = llm_response
+                # Try to strip title part if title was found and it's at the beginning
+                if title_match and llm_response.strip().startswith(title_match.group(0).strip()):
+                    response_remainder = llm_response[len(title_match.group(0)):].strip()
 
-                potential_content = llm_response[current_content_start_index:].strip()
+                # Try to strip "Content:" marker if it exists at the start of the remainder
+                content_marker_match = re.match(r"Content:\s*", response_remainder, re.IGNORECASE | re.MULTILINE)
+                if content_marker_match:
+                    response_remainder = response_remainder[content_marker_match.end():].strip()
 
-                # If summary was parsed, try to remove it from this fallback content
-                if summary != "Summary not generated." and summary_match and summary_match.group(0) in potential_content:
-                    potential_content = potential_content.split(summary_match.group(0))[0].strip()
+                # Try to strip "Summary:" and following text if summary was found
+                # This is tricky because summary_match might be from original llm_response
+                # We look for the summary marker in the *current* remainder.
+                summary_marker_in_remainder_match = re.search(r"^Summary:.*", response_remainder, re.DOTALL | re.IGNORECASE | re.MULTILINE)
+                if summary_marker_in_remainder_match:
+                    response_remainder = response_remainder.split(summary_marker_in_remainder_match.group(0))[0].strip()
 
-                if potential_content:
-                    content = potential_content
+                if response_remainder:
+                    content = response_remainder
+                    parse_path += "->DesperateContentOK"
                 else:
-                    print("ChapterChroniclerAgent: Error - Fallback for content also resulted in empty content.")
-                    return None # Essential content is missing.
+                    print(f"{parsing_log_prefix} Error - Desperate parse for content also resulted in empty content.")
+                    print(f"{parsing_log_prefix} Final Parse Path: {parse_path}")
+                    return None
 
-            # Final check if anything meaningful was parsed
-            if title == f"Chapter {chapter_number} (Untitled)" and \
-               content == "Content not generated." and \
-               summary == "Summary not generated." and \
-               not llm_response.strip(): # if all are defaults and response was empty
-                 print(f"ChapterChroniclerAgent: Error - Could not parse any key sections, and response was empty.")
-                 return None
-            elif content == "Content not generated.": # If content is still placeholder, means parsing failed critically
-                 print(f"ChapterChroniclerAgent: Error - Content section remains empty after all parsing attempts. Response: {llm_response[:500]}")
+            if content == "Content not generated.": # If content is still placeholder, parsing failed critically
+                 print(f"{parsing_log_prefix} Error - Content section remains empty after all parsing attempts. Response (first 500 chars): {llm_response[:500]}")
+                 print(f"{parsing_log_prefix} Final Parse Path: {parse_path}")
                  return None
 
-
+            print(f"{parsing_log_prefix} Final Parse Path: {parse_path}")
             return {
-                "id": 0,
-                "novel_id": novel_id,
-                "chapter_number": chapter_number,
-                "title": title,
-                "content": content,
-                "summary": summary,
+                "id": 0, "novel_id": novel_id, "chapter_number": chapter_number,
+                "title": title, "content": content, "summary": summary,
                 "creation_date": datetime.now(timezone.utc).isoformat()
             }
         except Exception as e:
-            print(f"ChapterChroniclerAgent: Exception during LLM response parsing - {e}. Response (first 500 chars): {llm_response[:500]}")
+            print(f"{parsing_log_prefix} Exception during LLM response parsing - {e}. Response (first 500 chars): {llm_response[:500]}")
             return None
 
     def generate_and_save_chapter(self, novel_id: int, chapter_number: int, chapter_brief: str,
@@ -138,10 +155,7 @@ class ChapterChroniclerAgent:
         print(f"ChapterChroniclerAgent: Sending prompt for Chapter {chapter_number} to LLM.")
         try:
             llm_response_text = self.llm_client.generate_text(
-                prompt=prompt,
-                model_name="gpt-3.5-turbo",
-                temperature=0.7,
-                max_tokens=2000 # Default was 1500, prompt asks for 700-1200 words, so 2000 tokens is safer
+                prompt=prompt, model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=2000
             )
             print(f"ChapterChroniclerAgent: Received response from LLM for Chapter {chapter_number}.")
         except Exception as e:
@@ -190,7 +204,7 @@ if __name__ == "__main__":
              print("ERROR: Test cannot reliably proceed with a known dummy key pattern. Please set a real API key.")
              exit(1)
 
-    test_sql_db_name = "test_live_chapter_agent_refined_v2.db" # New DB for this test
+    test_sql_db_name = "test_live_chapter_agent_refined_v2.db"
     if os.path.exists(test_sql_db_name):
         os.remove(test_sql_db_name)
 
@@ -213,7 +227,10 @@ Main Plot Arc: Discovery -> Experimentation & Minor Abuse -> First Encounter wit
 Previous Events: This is Chapter 1.
 Focus Characters for this Chapter:
 Character: Alistair Finch - Role: Protagonist. Description: Brilliant but socially awkward clockmaker, mid-30s, prefers machines to people. Fascinated by temporal mechanics.
-Relevant Lore and Context: The Timekeepers Guild is a powerful, secretive organization. Unauthorized manipulation of time is the highest crime. Legends speak of 'Chronos Shards' - artifacts that can influence time.
+--- RELEVANT LORE AND CONTEXT (from Knowledge Base) ---
+The Timekeepers Guild values precision above all. They view temporal anomalies as a disease.
+Chronometers are usually powered by miniature cavorite springs, but this one seems different.
+--- END LORE AND CONTEXT ---
 """
         chapter_plot_summary = "Alistair discovers an odd, pulsing chronometer in a box of antique clock parts. Intrigued, he takes it to his workbench. While examining it, he accidentally activates it and experiences a brief, disorienting loop of the last few seconds: a dropped tool clattering to the floor three times in quick succession before he realizes what happened."
         novel_style = "Steampunk, detailed mechanical descriptions, slightly tense, discovery-focused."

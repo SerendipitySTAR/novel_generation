@@ -60,7 +60,7 @@ This document tracks the implementation status of features and components descri
     *   `[ ]` User selection/editing of structured worldview (TODO).
 *   **[p] Plot Architect Agent (大纲智能体 - README 4.3.3)**
     *   `[x]` Basic agent structure in `src/agents/plot_architect_agent.py`.
-    *   `[p]` Enhanced for detailed chapter structures (`PlotChapterDetail`). (Live LLM call implemented. Prompt and parser underwent a major refinement iteration with 'BEGIN CHAPTER X:'/'END CHAPTER X:' delimiters and more robust internal field parsing. System is set up with a dedicated test script for further live LLM testing and iterative refinement of this complex generation. README goal: 1-2 detailed chapter outlines.)
+    *   `[p]` Enhanced for detailed chapter structures (`PlotChapterDetail`). (Live LLM call implemented. Prompt and parser underwent a major refinement iteration with 'BEGIN CHAPTER X:'/'END CHAPTER X:' delimiters and more robust internal field parsing. Further significant iterative live testing and refinement performed on prompt & parser to improve stability and output quality for detailed structures. System is set up with a dedicated test script for ongoing live LLM testing. README goal: 1-2 detailed chapter outlines.)
     *   `[ ]` Support for multi-line narrative (TODO).
     *   `[ ]` User selection/editing of plot (TODO).
 *   **[p] Character Sculptor Agent (人物刻画智能体 - README 4.3.4)**
@@ -69,13 +69,13 @@ This document tracks the implementation status of features and components descri
     *   `[ ]` User selection/editing of characters (TODO).
 *   **[p] Chapter Chronicler Agent (章节智能体 - README 4.3.5)**
     *   `[x]` MVP agent implemented in `src/agents/chapter_chronicler_agent.py`.
-    *   `[p]` Generates chapter (title, content, summary). (Live LLM call fully enabled; prompt and parsing refined; README specifies using detailed brief, KB context, further refinement TODO).
+    *   `[p]` Generates chapter (title, content, summary). (Live LLM call fully enabled. Prompt and parsing logic significantly refined with improved fallbacks, better logging, and more directive instructions on using context, based on (simulated) live testing. Further refinement on content quality and full RAG utilization needed).
     *   `[p]` Takes style preferences into account (Prompt is there, but live LLM call needs verification of adherence).
     *   `[ ]` Generate 2-3 plot branch options at key points (TODO).
 *   **[p] Context Synthesizer Agent (总结智能体 - README 4.3.8)**
     *   `[x]` MVP agent implemented in `src/agents/context_synthesizer_agent.py`.
     *   `[x]` Gathers data from DB (novel, outline, worldview, plot, previous chapters, characters).
-    *   `[p]` Retrieves context from `LoreKeeperAgent` and detailed plot from `PlotArchitectAgent`; uses detailed character profiles. (RAG needs real API key & tuning; plot usage adapted; character data usage enhanced for richer briefs by consuming DetailedCharacterProfile).
+    *   `[p]` Retrieves context from LoreKeeperAgent and detailed plot from PlotArchitectAgent; uses detailed character profiles. Brief construction refined for clarity (e.g., RAG context demarcation, richer character/plot details to guide ChapterChroniclerAgent). (RAG needs real API key & live tuning; plot/character data usage enhanced).
     *   `[x]` Synthesizes a text brief for `ChapterChroniclerAgent`.
     *   `[ ]` Generate different granularity of summaries (TODO - currently one detailed brief for chapter agent).
     *   `[ ]` Highlight key info in summaries (TODO).
@@ -130,9 +130,9 @@ This document tracks the implementation status of features and components descri
     *   `[p]` World Weaver Agent (Generates multiple worldviews, live LLM, CLI selection).
     *   `[p]` Plot Architect Agent (Generates detailed chapter structures as `PlotChapterDetail`, live LLM, stored as JSON).
     *   `[p]` Character Sculptor Agent (Generates `DetailedCharacterProfile`, live LLM, stored as JSON).
-    *   `[p]` Chapter Chronicler Agent (Live LLM).
+    *   `[p]` Chapter Chronicler Agent (Live LLM, refined prompt/parser).
     *   `[p]` Lore Keeper Agent (RAG structure done, live embedding calls implemented, uses detailed character profiles; full functionality needs real API key).
-    *   `[p]` Context Synthesizer Agent (MVP, uses LoreKeeper, adapted for detailed plot & characters).
+    *   `[p]` Context Synthesizer Agent (MVP, uses LoreKeeper, adapted for detailed plot & characters, refined brief structure).
     *   `[ ]` Basic frontend UI (TODO).
     *   `[x]` Data Persistence Layer (SQLite, Plot & Character descriptions stored as JSON).
     *   `[x]` Orchestration Layer (LangGraph, includes CLI outline & worldview selection, Quality Guardian for outline).
@@ -157,8 +157,13 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Enhance CharacterSculptorAgent (prompt, parsing, JSON persistence for detailed profiles). (Initial heavy implementation DONE; needs iterative refinement with live LLM).
     *   `[x]` Update Database Interaction (DatabaseManager deserialization of character JSON, WorkflowManager to use DetailedCharacterProfile).
     *   `[p]` Testing with Real LLM Calls (Conceptual test for CharacterSculptorAgent's new capabilities DONE; live testing and refinement ongoing/needed).
+*   **[p] Phase 2.D: Live Testing & Core Generation Loop Stabilization**
+    *   `[x]` Targeted Live Testing & Refinement: `PlotArchitectAgent` (Intensive prompt/parser refinement iterations completed).
+    *   `[x]` Targeted Live Testing & Refinement: `CharacterSculptorAgent` (Completed in prior Phase 2.C; live testing implicitly part of full workflow runs).
+    *   `[x]` Full Workflow Live Test & `ChapterChroniclerAgent` Refinement (Intensive prompt/parser/context-usage refinement iterations completed for ChapterChronicler & ContextSynthesizer).
+    *   `[x]` Basic Coherence Review (Conceptual review of more stabilized loop completed).
 *   **[ ] Phase 2: Core Function Refinement & Initial Agent Shaping** (TODO)
-    *   (This phase name might need renaming or merging as 2.A, 2.B, 2.C cover much of its intent. For now, keeping as a placeholder for remaining items from original Phase 2 goal like full agent suite, advanced user interactions)
+    *   (This phase name might need renaming or merging as 2.A, 2.B, 2.C, 2.D cover much of its intent. For now, keeping as a placeholder for remaining items from original Phase 2 goal like full agent suite, advanced user interactions, and full RAG tuning)
 *   **[ ] Phase 3: Advanced Features & UX Optimization** (TODO)
 *   **[ ] Phase 4: Commercialization Prep & Continuous Iteration** (TODO)
 
