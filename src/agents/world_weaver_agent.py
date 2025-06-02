@@ -25,6 +25,7 @@ Based on this outline, please generate a worldview description (approximately 15
 2.  **Overall Mood & Atmosphere:** What is the dominant feeling or emotional tone of this world (e.g., hopeful, grim, mysterious, adventurous)?
 3.  **Key Unique Elements or Rules:** What are 1-2 distinctive features, laws of physics, societal norms, magical systems, or technologies that define this world and are relevant to the outline?
 
+Present this as a continuous block of text.
 Please generate the worldview description now:
 """
         return prompt

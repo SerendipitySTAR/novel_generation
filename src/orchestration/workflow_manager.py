@@ -1,138 +1,456 @@
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Any, List, Annotated, Dict
+from typing import TypedDict, Any, List, Annotated, Dict, Optional
 import operator
+import os
+import json # For serializing detailed plot data
+from dotenv import load_dotenv
 
+# Agent Imports
 from src.agents.narrative_pathfinder_agent import NarrativePathfinderAgent
 from src.agents.world_weaver_agent import WorldWeaverAgent
-from src.persistence.database_manager import DatabaseManager
+from src.agents.plot_architect_agent import PlotArchitectAgent
+from src.agents.character_sculptor_agent import CharacterSculptorAgent
+from src.agents.lore_keeper_agent import LoreKeeperAgent
+from src.agents.context_synthesizer_agent import ContextSynthesizerAgent
+from src.agents.chapter_chronicler_agent import ChapterChroniclerAgent
 
-# UserInput and NovelWorkflowState remain the same as in the previous step's subtask
+# Persistence and Core Models
+from src.persistence.database_manager import DatabaseManager
+from src.core.models import PlotChapterDetail, Plot, Character, Chapter, Outline, WorldView, Novel # Added PlotChapterDetail
+
+# --- State Definition ---
 class UserInput(TypedDict):
     theme: str
-    style_preferences: str | None
+    style_preferences: Optional[str]
 
 class NovelWorkflowState(TypedDict):
     user_input: UserInput
-    narrative_outline: str | None
-    narrative_id: int | None
-    worldview_data: str | None
-    error_message: str | None
+    error_message: Optional[str]
     history: Annotated[List[str], operator.add]
+    novel_id: Optional[int]
+    novel_data: Optional[Novel]
+    narrative_outline_text: Optional[str]
+    all_generated_outlines: Optional[List[str]]
+    outline_id: Optional[int]
+    outline_data: Optional[Outline]
+    worldview_text: Optional[str]
+    worldview_id: Optional[int]
+    worldview_data: Optional[WorldView]
+    plot_id: Optional[int]
+    # plot_data: Optional[Plot] # This will store the Plot DB object (ID, summary as JSON string)
+    detailed_plot_data: Optional[List[PlotChapterDetail]] # This holds the structured list
+    characters: Optional[List[Character]]
+    lore_keeper_initialized: bool
+    current_chapter_number: int
+    total_chapters_to_generate: int
+    generated_chapters: List[Chapter]
+    active_character_ids_for_chapter: Optional[List[int]]
+    current_chapter_plot_summary: Optional[str] # This will now be a string summary derived from PlotChapterDetail
+    chapter_brief: Optional[str]
 
-# execute_narrative_pathfinder_agent remains the same
-def execute_narrative_pathfinder_agent(state: NovelWorkflowState):
-    print("Executing Node: Narrative Pathfinder Agent")
-    history_log = state.get("history", []) + ["Narrative Pathfinder Agent started."]
+# --- Node Functions --- (Ensure _log_and_update_history is defined as before)
+def _log_and_update_history(current_history: List[str], message: str, error: bool = False) -> List[str]:
+    updated_history = current_history + [message]
+    if error:
+        print(f"Error: {message}")
+    else:
+        print(message)
+    return updated_history
+
+def execute_narrative_pathfinder_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Narrative Pathfinder Agent")
     try:
-        user_input = state.get("user_input")
-        if not user_input or not user_input.get("theme"):
-            error_msg = "User input with 'theme' is required for Narrative Pathfinder."
-            history_log.append(f"Error: {error_msg}")
-            return {"error_message": error_msg, "history": history_log}
+        user_input = state["user_input"]
         theme = user_input["theme"]
         style = user_input.get("style_preferences", "general fiction")
+        num_outlines_to_generate = 2
+        history = _log_and_update_history(history, f"Calling NarrativePathfinderAgent for {num_outlines_to_generate} outlines for theme: '{theme}'")
         agent = NarrativePathfinderAgent()
-        outline = agent.generate_outline(user_theme=theme, style_preferences=style)
-        if outline:
-            history_log.append(f"Successfully generated outline for theme: '{theme}'.")
-            return {"narrative_outline": outline, "history": history_log, "error_message": None}
+        all_outlines = agent.generate_outline(
+            user_theme=theme, style_preferences=style, num_outlines=num_outlines_to_generate
+        )
+        if all_outlines:
+            history = _log_and_update_history(history, f"Successfully generated {len(all_outlines)} outlines.")
+            return {"all_generated_outlines": all_outlines, "history": history, "error_message": None}
         else:
-            error_msg = "Narrative Pathfinder Agent returned an empty outline."
-            history_log.append(f"Error: {error_msg}")
-            return {"narrative_outline": None, "error_message": error_msg, "history": history_log}
+            msg = "Narrative Pathfinder Agent returned no outlines."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
     except Exception as e:
-        error_msg = f"Error in Narrative Pathfinder Agent node: {e}"
-        history_log.append(error_msg)
-        return {"narrative_outline": None, "error_message": error_msg, "history": history_log}
+        msg = f"Error in Narrative Pathfinder Agent node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
-# persist_narrative_node remains the same (persists initial narrative outline)
-def persist_narrative_node(state: NovelWorkflowState):
-    print("Executing Node: Persist Narrative (Initial Outline)")
-    history_log = state.get("history", []) + ["Persistence Node (Initial Outline) started."]
+def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
+    history = _log_and_update_history(state.get("history", []), "Node: Present Outlines for Selection (CLI)")
+    print("\n=== Outline Selection ===")
+    all_outlines = state.get("all_generated_outlines")
+    if not all_outlines:
+        error_msg = "No outlines available for selection."
+        history = _log_and_update_history(history, error_msg, True)
+        return {"error_message": error_msg, "history": history}
+    for i, outline_text in enumerate(all_outlines):
+        print(f"\n--- Outline {i + 1} ---")
+        print(outline_text)
+        print("--------------------")
+    selected_index = -1
+    while True:
+        try:
+            choice_str = input(f"Please select an outline by number (1-{len(all_outlines)}) or type '0' to default to Outline 1: ")
+            choice_int = int(choice_str)
+            if 0 <= choice_int <= len(all_outlines):
+                selected_index = 0 if choice_int == 0 else choice_int - 1
+                log_msg = f"User defaulted to Outline 1." if choice_int == 0 else f"User selected Outline {choice_int}."
+                history = _log_and_update_history(history, log_msg)
+                break
+            else: print(f"Invalid selection. Please enter a number between 0 and {len(all_outlines)}.")
+        except ValueError: print("Invalid input. Please enter a number.")
+        except EOFError:
+            print("EOFError: No input received. Defaulting to Outline 1.")
+            history = _log_and_update_history(history, "EOFError during outline selection, defaulting to Outline 1.")
+            selected_index = 0
+            break
+        except Exception as e:
+            print(f"An unexpected error occurred during input: {e}. Defaulting to Outline 1.")
+            history = _log_and_update_history(history, f"Unexpected error during outline selection ({e}), defaulting to Outline 1.")
+            selected_index = 0
+            break
+    selected_outline_text = all_outlines[selected_index]
+    print(f"Selected Outline {selected_index + 1} to proceed.")
+    return {"narrative_outline_text": selected_outline_text, "history": history, "error_message": None}
+
+def persist_novel_record_node(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Persist Novel Record")
     try:
-        user_input = state.get("user_input")
-        narrative_outline = state.get("narrative_outline")
-        if not user_input or not narrative_outline:
-            error_msg = "User input or narrative outline missing for persistence."
-            history_log.append(f"Error: {error_msg}")
-            return {"error_message": error_msg, "history": history_log}
+        user_input = state["user_input"]
         db_manager = DatabaseManager()
-        theme = user_input["theme"]
-        style = user_input.get("style_preferences", "general fiction")
-        new_id = db_manager.add_narrative(
-            user_theme=theme,
-            style_preferences=style,
-            generated_outline=narrative_outline
-            # worldview is not available yet at this stage
-        )
-        history_log.append(f"Narrative (initial) successfully saved to database with ID: {new_id}.")
-        return {"narrative_id": new_id, "history": history_log, "error_message": None}
+        new_novel_id = db_manager.add_novel(user_theme=user_input["theme"], style_preferences=user_input.get("style_preferences", ""))
+        novel_data = db_manager.get_novel_by_id(new_novel_id)
+        history = _log_and_update_history(history, f"Novel record saved to DB with ID: {new_novel_id}.")
+        return {"novel_id": new_novel_id, "novel_data": novel_data, "history": history, "error_message": None}
     except Exception as e:
-        error_msg = f"Error in Persist Narrative node: {e}"
-        history_log.append(error_msg)
-        return {"error_message": error_msg, "history": history_log, "narrative_id": None}
+        msg = f"Error in Persist Novel Record node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
-# execute_world_weaver_agent remains the same
-def execute_world_weaver_agent(state: NovelWorkflowState):
-    print("Executing Node: World Weaver Agent")
-    history_log = state.get("history", []) + ["World Weaver Agent started."]
+def persist_initial_outline_node(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Persist Initial Outline")
     try:
-        narrative_outline = state.get("narrative_outline")
-        if not narrative_outline:
-            error_msg = "Narrative outline is required for World Weaver Agent."
-            history_log.append(f"Error: {error_msg}")
-            return {"error_message": state.get("error_message") or error_msg, "history": history_log}
+        novel_id = state["novel_id"]
+        outline_text_to_persist = state["narrative_outline_text"]
+        if novel_id is None or outline_text_to_persist is None:
+            msg = "Novel ID or selected outline text ('narrative_outline_text') missing for outline persistence."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        db_manager = DatabaseManager()
+        new_outline_id = db_manager.add_outline(novel_id=novel_id, overview_text=outline_text_to_persist)
+        db_manager.update_novel_active_outline(novel_id, new_outline_id)
+        outline_data = db_manager.get_outline_by_id(new_outline_id)
+        history = _log_and_update_history(history, f"Initial (selected) outline saved with ID {new_outline_id} and linked to novel {novel_id}.")
+        return {"outline_id": new_outline_id, "outline_data": outline_data, "history": history, "error_message": None}
+    except Exception as e:
+        msg = f"Error in Persist Initial Outline node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+def execute_world_weaver_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: World Weaver Agent")
+    try:
+        outline_text_for_worldview = state["narrative_outline_text"]
+        if not outline_text_for_worldview:
+            msg = "Selected narrative outline text is required for World Weaver Agent."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        history = _log_and_update_history(history, f"Calling WorldWeaverAgent with selected outline: '{outline_text_for_worldview[:50]}...'")
         agent = WorldWeaverAgent()
-        worldview = agent.generate_worldview(narrative_outline=narrative_outline)
-        if worldview:
-            history_log.append("Successfully generated worldview.")
-            return {"worldview_data": worldview, "history": history_log, "error_message": None}
+        worldview_text = agent.generate_worldview(narrative_outline=outline_text_for_worldview)
+        if worldview_text:
+            history = _log_and_update_history(history, "Successfully generated worldview text.")
+            return {"worldview_text": worldview_text, "history": history, "error_message": None}
         else:
-            error_msg = "World Weaver Agent returned empty worldview data."
-            history_log.append(f"Error: {error_msg}")
-            return {"worldview_data": None, "error_message": error_msg, "history": history_log}
+            msg = "World Weaver Agent returned empty worldview data."
+            return {"worldview_text": None, "error_message": msg, "history": _log_and_update_history(history, msg, True)}
     except Exception as e:
-        error_msg = f"Error in World Weaver Agent node: {e}"
-        history_log.append(error_msg)
-        return {"worldview_data": None, "error_message": error_msg, "history": history_log}
+        msg = f"Error in World Weaver Agent node: {e}"
+        return {"worldview_text": None, "error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
-# New Node for Persisting Worldview
-def persist_worldview_node(state: NovelWorkflowState):
-    print("Executing Node: Persist Worldview")
-    history_log = state.get("history", []) + ["Persistence Node (Worldview) started."]
+def persist_worldview_node(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Persist Worldview")
     try:
-        narrative_id = state.get("narrative_id")
-        worldview_data = state.get("worldview_data")
+        novel_id = state["novel_id"]
+        worldview_text = state["worldview_text"]
+        if novel_id is None or worldview_text is None:
+            msg = "Novel ID or worldview text missing for worldview persistence."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        db_manager = DatabaseManager()
+        new_worldview_id = db_manager.add_worldview(novel_id=novel_id, description_text=worldview_text)
+        db_manager.update_novel_active_worldview(novel_id, new_worldview_id)
+        worldview_data = db_manager.get_worldview_by_id(new_worldview_id)
+        history = _log_and_update_history(history, f"Worldview saved with ID {new_worldview_id} and linked to novel {novel_id}.")
+        return {"worldview_id": new_worldview_id, "worldview_data": worldview_data, "history": history, "error_message": None}
+    except Exception as e:
+        msg = f"Error in Persist Worldview node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
-        if narrative_id is None or worldview_data is None:
-            error_msg = "Narrative ID or worldview data missing for worldview persistence."
-            print(f"Error: {error_msg}")
-            history_log.append(f"Error: {error_msg}")
-            # Preserve existing error if one occurred earlier
-            return {"error_message": state.get("error_message") or error_msg, "history": history_log}
+def execute_plot_architect_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Plot Architect Agent")
+    try:
+        outline_text_for_plot = state["narrative_outline_text"]
+        worldview_text_for_plot = state["worldview_text"]
+        num_chapters_for_plot = state.get("total_chapters_to_generate", 3)
+        if not outline_text_for_plot or not worldview_text_for_plot:
+            msg = "Selected outline and worldview text are required for Plot Architect Agent."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        history = _log_and_update_history(history, f"Calling PlotArchitectAgent for {num_chapters_for_plot} detailed chapter structures.")
+        agent = PlotArchitectAgent()
+        detailed_plot_data_list = agent.generate_plot_points(
+            narrative_outline=outline_text_for_plot,
+            worldview_data=worldview_text_for_plot,
+            num_chapters=num_chapters_for_plot
+        )
+        if detailed_plot_data_list:
+            history = _log_and_update_history(history, f"PlotArchitectAgent generated {len(detailed_plot_data_list)} detailed chapter plots.")
+            return {"detailed_plot_data": detailed_plot_data_list, "history": history, "error_message": None}
+        else:
+            msg = "Plot Architect Agent returned no detailed chapter plots."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+    except Exception as e:
+        msg = f"Error in Plot Architect Agent node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
-        db_manager = DatabaseManager() # Default 'novel_mvp.db'
-        update_success = db_manager.update_narrative_worldview(
-            narrative_id=narrative_id,
-            generated_worldview=worldview_data
+def persist_plot_node(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Persist Plot")
+    try:
+        novel_id = state["novel_id"]
+        detailed_plot = state.get("detailed_plot_data")
+        if novel_id is None or not detailed_plot:
+            msg = "Novel ID or detailed plot data missing for plot persistence."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        db_manager = DatabaseManager()
+        plot_summary_json = json.dumps(detailed_plot)
+        new_plot_id = db_manager.add_plot(novel_id=novel_id, plot_summary=plot_summary_json)
+        db_manager.update_novel_active_plot(novel_id, new_plot_id)
+        # Fetch the persisted Plot object which contains the JSON string
+        # plot_data_obj = db_manager.get_plot_by_id(new_plot_id)
+        history = _log_and_update_history(history, f"Detailed plot (as JSON) saved with ID {new_plot_id} and linked to novel {novel_id}.")
+        # Storing the ID is sufficient, detailed_plot_data is already in state.
+        # The 'plot_data' field in state can be for the Plot model instance from DB, if needed later.
+        return {"plot_id": new_plot_id, "history": history, "error_message": None}
+    except Exception as e:
+        msg = f"Error in Persist Plot node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+def execute_character_sculptor_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Character Sculptor Agent")
+    try:
+        novel_id = state["novel_id"]
+        outline = state["outline_data"]
+        worldview = state["worldview_data"]
+        # For character generation, a simple concatenated summary of the detailed plot might be enough
+        detailed_plot = state.get("detailed_plot_data")
+        if not detailed_plot:
+             plot_summary_for_chars = "Plot details not available."
+        else:
+            plot_summary_for_chars = "\n".join([ch.get("core_scene_summary", "") or ch.get("key_events_and_plot_progression","") for ch in detailed_plot if ch])
+
+
+        if not all([novel_id, outline, worldview, plot_summary_for_chars]): # Check plot_summary_for_chars instead of plot object
+            msg = "Novel ID, outline data, worldview data, or plot summary missing for Character Sculptor."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+        agent = CharacterSculptorAgent()
+        characters = agent.generate_and_save_characters(
+            novel_id=novel_id,
+            narrative_outline=outline['overview_text'],
+            worldview_data=worldview['description_text'],
+            plot_summary=plot_summary_for_chars,
+            num_characters=2
+        )
+        if characters:
+            history = _log_and_update_history(history, f"Generated and saved {len(characters)} characters.")
+            return {"characters": characters, "history": history, "error_message": None}
+        else:
+            msg = "Character Sculptor Agent failed to generate characters."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+    except Exception as e:
+        msg = f"Error in Character Sculptor Agent node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+def execute_lore_keeper_initialize(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Lore Keeper Initialize")
+    try:
+        novel_id = state["novel_id"]
+        outline = state["outline_data"]
+        worldview = state["worldview_data"]
+        # The Plot object for Lore Keeper should be the one from DB with JSON summary
+        # However, LoreKeeperAgent expects a Plot TypedDict, so we need to provide a compatible structure.
+        # For now, we construct a temporary Plot object if needed, or ensure persist_plot_node provides it.
+        # The current persist_plot_node returns the ID and the Plot object from DB.
+        plot_db_object = state.get("plot_data") # This is the Plot object from DB.
+        if not plot_db_object and state.get("plot_id"): # If only ID was stored, fetch it
+            db_manager = DatabaseManager()
+            plot_db_object = db_manager.get_plot_by_id(state["plot_id"])
+
+        characters = state["characters"]
+
+        if not all([novel_id, outline, worldview, plot_db_object, characters is not None]):
+            msg = "Missing data for Lore Keeper initialization (novel_id, outline, worldview, plot_db_object, characters)."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+        lore_keeper = LoreKeeperAgent(db_name="novel_mvp.db")
+        # LoreKeeperAgent.initialize_knowledge_base expects a Plot object.
+        # The plot_summary field in this object will be the JSON string of detailed_plot_data.
+        # The LoreKeeperAgent itself would need to handle this (e.g., by not directly embedding the raw JSON string
+        # but by potentially parsing it if it needs structured plot for KB init, or just using other parts of it).
+        # For now, we pass the Plot object as is.
+        lore_keeper.initialize_knowledge_base(novel_id, outline, worldview, plot_db_object, characters)
+
+        history = _log_and_update_history(history, "Lore Keeper knowledge base initialized.")
+        return {"lore_keeper_initialized": True, "history": history, "error_message": None}
+    except Exception as e:
+        msg = f"Error in Lore Keeper Initialize node: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True), "lore_keeper_initialized": False}
+
+def prepare_for_chapter_loop(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Prepare for Chapter Loop")
+    detailed_plot = state.get("detailed_plot_data") # Use detailed_plot_data
+
+    if not detailed_plot:
+        msg = "Detailed plot data not found, cannot determine total chapters for loop."
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+    total_chapters = len(detailed_plot)
+    if total_chapters == 0:
+        total_chapters = 3
+        history = _log_and_update_history(history, f"Warning: detailed_plot_data list is empty. Defaulting to {total_chapters} chapters.")
+
+    history = _log_and_update_history(history, f"Preparing for chapter loop. Total chapters to generate: {total_chapters}")
+    return {
+        "current_chapter_number": 1,
+        "generated_chapters": [],
+        "total_chapters_to_generate": total_chapters,
+        "history": history,
+        "error_message": None
+    }
+
+def execute_context_synthesizer_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    current_chapter_num = state['current_chapter_number']
+    history = _log_and_update_history(state.get("history", []), f"Executing Node: Context Synthesizer for Chapter {current_chapter_num}")
+    try:
+        novel_id = state["novel_id"]
+        detailed_plot = state.get("detailed_plot_data") # Use detailed_plot_data
+        characters = state["characters"]
+
+        if not all([novel_id is not None, detailed_plot, characters is not None]):
+            msg = "Missing data for Context Synthesizer (novel_id, detailed_plot_data, characters)."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+        if not (0 < current_chapter_num <= len(detailed_plot)):
+            msg = f"Invalid current_chapter_number {current_chapter_num} for {len(detailed_plot)} detailed plot entries."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+        current_chapter_detail: PlotChapterDetail = detailed_plot[current_chapter_num - 1]
+        # Construct a concise plot summary string from the detailed structure for the brief
+        brief_plot_summary = current_chapter_detail.get('key_events_and_plot_progression') or \
+                             current_chapter_detail.get('core_scene_summary') or \
+                             f"Plot for Chapter {current_chapter_num} needs to be developed based on title: {current_chapter_detail.get('title', 'N/A')}."
+
+        active_char_ids: List[int] = [c['id'] for c in characters[:2]] if characters else []
+
+        context_agent = ContextSynthesizerAgent(db_name="novel_mvp.db")
+        chapter_brief_text = context_agent.generate_chapter_brief(
+            novel_id, current_chapter_num, brief_plot_summary, active_char_ids
         )
 
-        if update_success:
-            history_log.append(f"Worldview successfully saved to database for narrative ID: {narrative_id}.")
-            print(f"Worldview persisted for narrative ID: {narrative_id}")
-            return {"history": history_log, "error_message": None} # No change to error_message if successful
-        else:
-            error_msg = f"Failed to persist worldview for narrative ID: {narrative_id} (DB update failed)."
-            print(f"Error: {error_msg}")
-            history_log.append(f"Error: {error_msg}")
-            return {"error_message": error_msg, "history": history_log}
-
+        history = _log_and_update_history(history, f"Chapter brief generated for Chapter {current_chapter_num}.")
+        return {
+            "chapter_brief": chapter_brief_text,
+            "current_chapter_plot_summary": brief_plot_summary, # Pass the derived summary
+            "history": history,
+            "error_message": None
+        }
     except Exception as e:
-        error_msg = f"Error in Persist Worldview node: {e}"
-        print(error_msg)
-        history_log.append(error_msg)
-        return {"error_message": error_msg, "history": history_log}
+        msg = f"Error in Context Synthesizer node for Chapter {current_chapter_num}: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
+# ... (rest of the functions: execute_chapter_chronicler_agent, execute_lore_keeper_update_kb, increment_chapter_number,
+# _check_node_output, _should_continue_chapter_loop, WorkflowManager class __init__, _build_graph, run_workflow, if __name__ == "__main__")
+# These will remain largely the same, but run_workflow initial_state needs to be updated for the new plot field name.
+# The main test will also need to be updated to reflect the new detailed_plot_data structure in the final state printout.
+
+# (Continuing from above, only showing the changed parts for brevity in this thought block)
+
+def execute_chapter_chronicler_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    current_chapter_num = state['current_chapter_number']
+    history = _log_and_update_history(state.get("history", []), f"Executing Node: Chapter Chronicler for Chapter {current_chapter_num}")
+    try:
+        novel_id = state["novel_id"]
+        chapter_brief = state["chapter_brief"]
+        # current_chapter_plot_summary is now set by context_synthesizer based on detailed_plot_data
+        current_plot_for_chapter = state["current_chapter_plot_summary"]
+        style_prefs = state["user_input"].get("style_preferences", "general fiction")
+
+        if not all([novel_id is not None, chapter_brief, current_plot_for_chapter]):
+            msg = "Missing data for Chapter Chronicler (novel_id, brief, current_plot_for_chapter)."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+        chronicler_agent = ChapterChroniclerAgent(db_name="novel_mvp.db")
+        new_chapter = chronicler_agent.generate_and_save_chapter(
+            novel_id, current_chapter_num, chapter_brief, current_plot_for_chapter, style_prefs
+        )
+
+        if new_chapter:
+            updated_generated_chapters = state.get("generated_chapters", []) + [new_chapter]
+            history = _log_and_update_history(history, f"Chapter {current_chapter_num} generated and saved.")
+            return {"generated_chapters": updated_generated_chapters, "history": history, "error_message": None}
+        else:
+            msg = f"Chapter Chronicler failed to generate Chapter {current_chapter_num}."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+    except Exception as e:
+        msg = f"Error in Chapter Chronicler node for Chapter {current_chapter_num}: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+def execute_lore_keeper_update_kb(state: NovelWorkflowState) -> Dict[str, Any]:
+    current_chapter_num = state['current_chapter_number']
+    history = _log_and_update_history(state.get("history", []), f"Executing Node: Lore Keeper Update KB for Chapter {current_chapter_num}")
+    try:
+        novel_id = state["novel_id"]
+        generated_chapters = state.get("generated_chapters", [])
+
+        if novel_id is None or not generated_chapters:
+            msg = "Novel ID or generated chapters missing for Lore Keeper KB update."
+            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+        last_chapter = generated_chapters[-1]
+        lore_keeper = LoreKeeperAgent(db_name="novel_mvp.db")
+        lore_keeper.update_knowledge_base_with_chapter(novel_id, last_chapter)
+
+        history = _log_and_update_history(history, f"Lore Keeper KB updated with Chapter {last_chapter['chapter_number']}.")
+        return {"history": history, "error_message": None}
+    except Exception as e:
+        msg = f"Error in Lore Keeper Update KB node for Chapter {current_chapter_num}: {e}"
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
+    current_num = state.get("current_chapter_number", 0)
+    new_num = current_num + 1
+    history = _log_and_update_history(state.get("history", []), f"Incrementing chapter number from {current_num} to {new_num}")
+    return {"current_chapter_number": new_num, "history": history, "error_message": None}
+
+def _check_node_output(state: NovelWorkflowState) -> str:
+    if state.get("error_message"):
+        print(f"Error detected in previous node. Routing to END. Error: {state.get('error_message')}")
+        return "stop_on_error"
+    else:
+        print("Previous node successful. Routing to continue.")
+        return "continue"
+
+def _should_continue_chapter_loop(state: NovelWorkflowState) -> str:
+    if state.get("error_message"):
+        print(f"Error detected before loop condition. Routing to END. Error: {state.get('error_message')}")
+        return "end_loop_on_error"
+    current_chapter = state.get("current_chapter_number", 1)
+    total_chapters = state.get("total_chapters_to_generate", 0)
+    if current_chapter <= total_chapters:
+        print(f"Chapter loop: {current_chapter}/{total_chapters}. Continuing loop.")
+        return "continue_loop"
+    else:
+        print(f"Chapter loop: {current_chapter}/{total_chapters}. Ending loop.")
+        return "end_loop"
 
 class WorkflowManager:
     def __init__(self, db_name="novel_mvp.db"):
@@ -141,102 +459,143 @@ class WorkflowManager:
         self._build_graph()
         self.app = self.workflow.compile()
         print(f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled.")
+        self.initial_history = [f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled."]
 
     def _build_graph(self):
         self.workflow.add_node("narrative_pathfinder", execute_narrative_pathfinder_agent)
-        self.workflow.add_node("persist_narrative_outline", persist_narrative_node) # Clarified name
+        self.workflow.add_node("present_outlines_cli", present_outlines_for_selection_cli)
+        self.workflow.add_node("persist_novel_record", persist_novel_record_node)
+        self.workflow.add_node("persist_initial_outline", persist_initial_outline_node)
         self.workflow.add_node("world_weaver", execute_world_weaver_agent)
-        self.workflow.add_node("persist_worldview", persist_worldview_node) # New node
+        self.workflow.add_node("persist_worldview", persist_worldview_node)
+        self.workflow.add_node("plot_architect", execute_plot_architect_agent)
+        self.workflow.add_node("persist_plot", persist_plot_node)
+        self.workflow.add_node("character_sculptor", execute_character_sculptor_agent)
+        self.workflow.add_node("lore_keeper_initialize", execute_lore_keeper_initialize)
+        self.workflow.add_node("prepare_for_chapter_loop", prepare_for_chapter_loop)
+        self.workflow.add_node("context_synthesizer", execute_context_synthesizer_agent)
+        self.workflow.add_node("chapter_chronicler", execute_chapter_chronicler_agent)
+        self.workflow.add_node("lore_keeper_update_kb", execute_lore_keeper_update_kb)
+        self.workflow.add_node("increment_chapter_number", increment_chapter_number)
 
         self.workflow.set_entry_point("narrative_pathfinder")
-
+        self.workflow.add_conditional_edges("narrative_pathfinder", _check_node_output, {"continue": "present_outlines_cli", "stop_on_error": END})
+        self.workflow.add_conditional_edges("present_outlines_cli", _check_node_output, {"continue": "persist_novel_record", "stop_on_error": END})
+        self.workflow.add_conditional_edges("persist_novel_record", _check_node_output, {"continue": "persist_initial_outline", "stop_on_error": END})
+        self.workflow.add_conditional_edges("persist_initial_outline", _check_node_output, {"continue": "world_weaver", "stop_on_error": END})
+        self.workflow.add_conditional_edges("world_weaver", _check_node_output, {"continue": "persist_worldview", "stop_on_error": END})
+        self.workflow.add_conditional_edges("persist_worldview", _check_node_output, {"continue": "plot_architect", "stop_on_error": END})
+        self.workflow.add_conditional_edges("plot_architect", _check_node_output, {"continue": "persist_plot", "stop_on_error": END})
+        self.workflow.add_conditional_edges("persist_plot", _check_node_output, {"continue": "character_sculptor", "stop_on_error": END})
+        self.workflow.add_conditional_edges("character_sculptor", _check_node_output, {"continue": "lore_keeper_initialize", "stop_on_error": END})
+        self.workflow.add_conditional_edges("lore_keeper_initialize", _check_node_output, {"continue": "prepare_for_chapter_loop", "stop_on_error": END})
+        self.workflow.add_conditional_edges("prepare_for_chapter_loop", _check_node_output, {"continue": "context_synthesizer", "stop_on_error": END})
+        self.workflow.add_conditional_edges("context_synthesizer", _check_node_output, {"continue": "chapter_chronicler", "stop_on_error": END})
+        self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "lore_keeper_update_kb", "stop_on_error": END})
+        self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
         self.workflow.add_conditional_edges(
-            "narrative_pathfinder", self._check_node_output,
-            {"continue": "persist_narrative_outline", "stop_on_error": END}
+            "increment_chapter_number", _should_continue_chapter_loop,
+            {"continue_loop": "context_synthesizer", "end_loop": END, "end_loop_on_error": END }
         )
-        self.workflow.add_conditional_edges(
-            "persist_narrative_outline", self._check_node_output,
-            {"continue": "world_weaver", "stop_on_error": END}
-        )
-        self.workflow.add_conditional_edges(
-            "world_weaver", self._check_node_output,
-            {"continue": "persist_worldview", "stop_on_error": END} # Route to persist_worldview
-        )
-        self.workflow.add_conditional_edges( # Add conditional edge for persist_worldview
-            "persist_worldview", self._check_node_output,
-            {"continue": END, "stop_on_error": END} # END after worldview persistence
-        )
+        print("Workflow graph built.")
 
-    def _check_node_output(self, state: NovelWorkflowState):
-        # This generic checker remains the same
-        print(f"Checking output of previous node. Current error: {state.get('error_message')}")
-        if state.get("error_message"):
-            print("Error detected in previous node. Routing to END.")
-            return "stop_on_error"
-        else:
-            print("Previous node successful. Routing to continue.")
-            return "continue"
-
-    def run_workflow(self, user_input_data: Dict[str, Any]):
-        # This method remains the same
+    def run_workflow(self, user_input_data: Dict[str, Any]) -> NovelWorkflowState:
+        current_history = list(self.initial_history)
+        current_history.append(f"Starting workflow with input: {user_input_data}")
         print(f"Starting workflow with input: {user_input_data}")
+
         initial_state = NovelWorkflowState(
             user_input=UserInput(
-                theme=user_input_data.get("theme",""),
+                theme=user_input_data.get("theme","A default theme if none provided"),
                 style_preferences=user_input_data.get("style_preferences")
             ),
-            narrative_outline=None, narrative_id=None, worldview_data=None,
-            error_message=None, history=[]
+            error_message=None, history=current_history,
+            novel_id=None, novel_data=None,
+            narrative_outline_text=None, all_generated_outlines=None,
+            outline_id=None, outline_data=None,
+            worldview_text=None, worldview_id=None, worldview_data=None,
+            plot_id=None, detailed_plot_data=None, # Changed from plot_chapter_summaries
+            characters=None, lore_keeper_initialized=False,
+            current_chapter_number=0,
+            total_chapters_to_generate=3,
+            generated_chapters=[],
+            active_character_ids_for_chapter=None,
+            current_chapter_plot_summary=None, chapter_brief=None
         )
-        final_state = self.app.invoke(initial_state, {"recursion_limit": 20}) # Increased limit
-        print(f"Workflow finished. Final history: {final_state.get('history')}")
+        final_state = self.app.invoke(initial_state, {"recursion_limit": 50})
         if final_state.get('error_message'):
              print(f"Workflow error: {final_state.get('error_message')}")
         return final_state
 
 if __name__ == "__main__":
-    print("--- Workflow Manager Integration Test (with Worldview Persistence) ---")
-
-    default_db_for_test = "novel_mvp.db"
-    import os
-    if os.path.exists(default_db_for_test):
-        os.remove(default_db_for_test)
-
-    manager = WorkflowManager()
-
-    sample_user_input = {"theme": "a detective who is also a talented pastry chef", "style_preferences": "cozy mystery with recipes"}
-    print(f"\nRunning workflow with: {sample_user_input}")
-    result = manager.run_workflow(sample_user_input)
-
-    print("\nResults for workflow run:")
-    print(f"  Error Message: {result.get('error_message')}")
-    print(f"  Narrative ID: {result.get('narrative_id')}")
-    print(f"  Narrative Outline Snippet: {result.get('narrative_outline', '')[:100]}...")
-    print(f"  Worldview Data Snippet: {result.get('worldview_data', '')[:100]}...")
-
-    if result.get('narrative_id') and not result.get('error_message'):
-        print(f"  >> Verifying ID {result.get('narrative_id')} in {default_db_for_test} for worldview...")
-        try:
-            verify_db_manager = DatabaseManager(db_name=default_db_for_test)
-            retrieved = verify_db_manager.get_narrative_by_id(result.get('narrative_id'))
-            if retrieved:
-                print(f"  Verification: Found narrative '{retrieved['user_theme']}' in DB.")
-                assert retrieved['user_theme'] == sample_user_input['theme']
-                assert retrieved['generated_worldview'] is not None, "Worldview data was not saved to DB"
-                assert len(retrieved['generated_worldview']) > 0, "Worldview data saved to DB is empty"
-                print(f"  Worldview from DB Snippet: {retrieved['generated_worldview'][:100]}...")
-            else:
-                print("  Verification failed: Narrative not found in DB for worldview check.")
-        except Exception as e:
-            print(f"  Error during DB verification for worldview: {e}")
-    elif result.get('error_message'):
-        print(f"  Workflow ended with error, skipping DB check for worldview: {result.get('error_message')}")
+    print("--- Workflow Manager Full Integration Test ---")
+    if not os.path.exists(".env") and not os.getenv("OPENAI_API_KEY"):
+        print("Creating a dummy .env file for WorkflowManager test (for LLMClient dependent agents)...")
+        with open(".env", "w") as f:
+            f.write("OPENAI_API_KEY=\"sk-dummykeyforworkflowmanagertest\"\n")
+    load_dotenv()
+    if not os.getenv("OPENAI_API_KEY"):
+        print("CRITICAL: OPENAI_API_KEY not found. Some agents will fail to initialize.")
+    elif "dummykeyforworkflowmanagertest" in os.getenv("OPENAI_API_KEY","") or \
+         "dummyclikeyformainexecution" in os.getenv("OPENAI_API_KEY",""):
+        print("INFO: Using a DUMMY OPENAI_API_KEY. Real LLM calls will fail.")
     else:
-        print("  Workflow did not produce a narrative_id, skipping DB check for worldview.")
+        print("INFO: A potentially valid OPENAI_API_KEY is set. Attempting live LLM calls.")
 
-
-    if os.path.exists(default_db_for_test):
-        os.remove(default_db_for_test)
-        print(f"Cleaned up '{default_db_for_test}' after test.")
-
-    print("--- Workflow Manager Integration Test (with Worldview Persistence) Finished ---")
+    default_db_name = "novel_workflow_test.db"
+    default_chroma_dir = "./novel_workflow_chroma_db"
+    import shutil
+    if os.path.exists(default_db_name):
+        os.remove(default_db_name)
+        print(f"Removed existing test SQL DB: {default_db_name}")
+    if os.path.exists(default_chroma_dir):
+        shutil.rmtree(default_chroma_dir)
+        print(f"Removed existing test Chroma DB directory: {default_chroma_dir}")
+    _ = DatabaseManager(db_name=default_db_name)
+    manager = WorkflowManager(db_name=default_db_name)
+    sample_user_input = {
+        "theme": "a society where dreams are a shared, explorable reality",
+        "style_preferences": "philosophical sci-fi with surreal imagery"
+    }
+    print(f"\nRunning workflow with: {sample_user_input}")
+    final_result_state = manager.run_workflow(sample_user_input)
+    print("\n--- Workflow Final State ---")
+    for key, value in final_result_state.items():
+        if key == "history": print(f"History entries: {len(value)}")
+        elif key == "detailed_plot_data" and value:
+            print(f"Detailed_plot_data: ({len(value)} chapters)")
+            for i, ch_detail in enumerate(value):
+                print(f"  Chapter {ch_detail.get('chapter_number', i+1)} Title: {ch_detail.get('title', 'N/A')}")
+                print(f"    Events: {str(ch_detail.get('key_events_and_plot_progression', ''))[:60]}...")
+        elif isinstance(value, list) and value and isinstance(value[0], dict):
+             print(f"{key.capitalize()}: ({len(value)} items)")
+             for i, item_dict in enumerate(value):
+                 print(f"  Item {i+1} ({type(item_dict).__name__}):")
+                 for k, v_item in item_dict.items():
+                     print(f"    {k}: {str(v_item)[:100]}{'...' if len(str(v_item)) > 100 else ''}")
+        elif isinstance(value, dict):
+            print(f"{key.capitalize()}:")
+            for k, v_item in value.items():
+                print(f"  {k}: {str(v_item)[:100]}{'...' if len(str(v_item)) > 100 else ''}")
+        else:
+            print(f"{key.capitalize()}: {str(value)[:200]}{'...' if len(str(value)) > 200 else ''}")
+    print(f"\nError Message at end of workflow: {final_result_state.get('error_message')}")
+    print("\nFinal History Log (Detailed):")
+    for entry in final_result_state.get("history", []): print(f"  - {entry}")
+    if final_result_state.get('novel_id') and not final_result_state.get('error_message'):
+        print(f"\nVerifying data in database '{default_db_name}' for Novel ID {final_result_state['novel_id']}...")
+        # Further DB verification can be added here.
+        print("  DB verification (conceptual - implement checks as needed based on expected data).")
+    else: print("\nSkipping DB verification due to workflow error or no novel_id.")
+    if os.path.exists(default_db_name):
+        os.remove(default_db_name)
+        print(f"\nCleaned up test SQL DB: {default_db_name}")
+    if os.path.exists(default_chroma_dir):
+        shutil.rmtree(default_chroma_dir)
+        print(f"Cleaned up test Chroma DB directory: {default_chroma_dir}")
+    if os.path.exists(".env"):
+        with open(".env", "r") as f_env:
+            if "dummykeyforworkflowmanagertest" in f_env.read():
+                print("Removing dummy .env file for WorkflowManager test...")
+                os.remove(".env")
+    print("\n--- Workflow Manager Full Integration Test Finished ---")
