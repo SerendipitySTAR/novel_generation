@@ -496,6 +496,51 @@ graph TD
     * `Orchestration Layer`: 使用LangGraph串联以上流程。
 * **技术验证点：** 核心流程是否跑通？RAG提供的上下文对章节生成是否有帮助？初步的一致性如何？
 
+#### Current MVP Implementation Status (As of 2025-06-01)
+
+The project has made significant progress towards achieving the Phase 1 MVP goals. Here's a summary of the current implementation:
+
+*   **Core Workflow Orchestration**:
+    *   The `WorkflowManager` (`src/orchestration/workflow_manager.py`) uses LangGraph to manage a sequence of agents to generate a multi-chapter novel outline and (mocked) content.
+    *   The workflow includes initialization of novel parameters, outline generation, worldview creation, plot outlining (chapter-by-chapter summaries), character generation, knowledge base initialization, and a loop structure for generating a (fixed, e.g., 3) number of chapters.
+    *   The workflow now triggers live LLM calls for all AI-driven content generation steps.
+    *   Improved error logging within the `LLMClient` provides more diagnostic information for API call failures.
+
+*   **Implemented Agents (MVP Level)**:
+    *   `DatabaseManager` (`src/persistence/database_manager.py`): Manages an SQLite database (`main_novel_generation.db` by default when run via `main.py`) with a schema to store novels, outlines, worldviews, plots, characters, chapters, and knowledge base entries. Core models are defined in `src/core/models.py`.
+    *   `LLMClient` (`src/llm_abstraction/llm_client.py`): Basic client for OpenAI API interaction with enhanced error logging.
+    *   `NarrativePathfinderAgent` (`src/agents/narrative_pathfinder_agent.py`): Now capable of generating multiple distinct outlines (workflow selects the first for MVP). Live LLM calls are implemented and its prompt has been refined.
+    *   `WorldWeaverAgent` (`src/agents/world_weaver_agent.py`): Live LLM calls are implemented and its prompt has been refined.
+    *   `PlotArchitectAgent` (`src/agents/plot_architect_agent.py`): Prompt and parsing logic updated to directly generate chapter-by-chapter plot summaries. Live LLM calls are implemented and its prompt/parsing have been refined.
+    *   `CharacterSculptorAgent` (`src/agents/character_sculptor_agent.py`): Generates basic character profiles. Internal LLM mock removed; now makes live LLM calls and its prompt has been refined. Saves characters to the database.
+    *   `KnowledgeBaseManager` (`src/knowledge_base/knowledge_base_manager.py`): Manages a ChromaDB vector store for Retrieval Augmented Generation (RAG). Requires a valid OpenAI API key for embedding generation.
+    *   `LoreKeeperAgent` (`src/agents/lore_keeper_agent.py`): Initializes the knowledge base with outline, worldview, plot, and character data, and can update it with chapter summaries. Its full RAG capabilities (embedding and semantic search) depend on a valid OpenAI API key.
+    *   `ContextSynthesizerAgent` (`src/agents/context_synthesizer_agent.py`): Prepares a comprehensive brief for each chapter by fetching data from the database and context from the `LoreKeeperAgent`.
+    *   `ChapterChroniclerAgent` (`src/agents/chapter_chronicler_agent.py`): Generates chapter content (title, body, summary). Internal LLM mock removed; now makes live LLM calls and its prompt/parsing have been refined. Saves chapters to the database.
+
+*   **Command-Line Interface (CLI)**:
+    *   A basic CLI is available via `main.py` in the project root.
+    *   Usage: `python main.py --theme "Your novel theme" [--style "Your novel style"]`
+    *   It initiates the `WorkflowManager` and prints the generated novel components to the console.
+
+*   **OpenAI API Key Requirement**:
+        *   The system is now configured to make live OpenAI API calls for all core content generation (outlines, worldview, plot summaries, character details, chapter content) and for knowledge base embeddings. **A valid OpenAI API key is therefore essential for the workflow to run successfully beyond initial setup.** Without it, API calls will fail, typically halting the workflow at the first agent requiring an LLM or embedding service.
+        *   You need to set your `OPENAI_API_KEY` as an environment variable. The recommended way is to create a `.env` file in the project root:
+            1.  Copy the `.env.example` file to a new file named `.env`.
+            2.  Open `.env` and replace `"your_openai_api_key_here"` with your actual OpenAI API key.
+        *   The `main.py` script will create a *dummy* API key in a `.env` file if no key is found, allowing structural tests but causing API calls to fail.
+        *   The `LoreKeeperAgent` will not be able to generate or use embeddings if a dummy key is used, so the RAG functionality will be minimal (returning no specific context). The workflow will likely halt when `LoreKeeperAgent` attempts to initialize embeddings if only a dummy key is present.
+        *   Ensure your API key has access to necessary models (e.g., `gpt-3.5-turbo` or `gpt-4` for generation, and text embedding models).
+
+*   **Next Steps for MVP Completion**:
+    *   Thoroughly test the end-to-end workflow with a valid OpenAI API key.
+    *   Refine prompts for all agents based on real outputs (ongoing).
+    *   Ensure the RAG system effectively contributes to chapter context with a live key.
+    *   Address any bugs or inconsistencies found during full end-to-end testing.
+
+This status reflects the project's capability to run the structural workflow of novel generation, with placeholders for most of the AI-generated content when external API services are not configured.
+
+For a detailed breakdown of all features from the development manual and their current implementation status, please see the [Project Todo List (todo_list.md)](./todo_list.md).
 ### 8.3. 阶段 2: 核心功能完善与智能体初步成型 
 
 * **目标：** 完善各生成模块，实现用户手册中描述的各智能体的核心职责和交互，知识库功能增强。
@@ -590,3 +635,5 @@ graph TD
 ---
 
 这份开发手册提供了一个全面的框架。在实际执行过程中，您需要根据团队的技术实力、资源投入以及项目进展，不断地细化每个模块的设计，并对计划进行调整。祝您的项目取得圆满成功！如果您在具体实施的某个环节需要更深入的探讨，请随时告诉我。
+
+[end of README.md]
