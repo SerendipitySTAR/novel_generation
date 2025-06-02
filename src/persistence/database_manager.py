@@ -1,186 +1,566 @@
 import sqlite3
+import json # Added for JSON deserialization
 from datetime import datetime, timezone
+from typing import List, Optional, Any
+from src.core.models import (
+    Novel, Outline, WorldView, Plot, Character, Chapter, KnowledgeBaseEntry,
+    DetailedCharacterProfile # Added DetailedCharacterProfile
+)
 
 class DatabaseManager:
     def __init__(self, db_name="novel_mvp.db"):
         self.db_name = db_name
-        self._initialize_db()
+        self._create_tables()
 
     def _get_connection(self):
         conn = sqlite3.connect(self.db_name)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
-    def _initialize_db(self):
-        """Initializes the database and creates/updates the narratives table."""
+    def _create_tables(self):
+        # ... (create_tables method remains the same)
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # Updated table creation to include generated_worldview
                 cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS narratives (
+                    CREATE TABLE IF NOT EXISTS novels (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_theme TEXT NOT NULL,
                         style_preferences TEXT,
-                        generated_outline TEXT NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        generated_worldview TEXT
+                        creation_date TEXT NOT NULL,
+                        last_updated_date TEXT NOT NULL,
+                        active_outline_id INTEGER,
+                        active_worldview_id INTEGER,
+                        active_plot_id INTEGER,
+                        FOREIGN KEY (active_outline_id) REFERENCES outlines(id) ON DELETE SET NULL,
+                        FOREIGN KEY (active_worldview_id) REFERENCES worldviews(id) ON DELETE SET NULL,
+                        FOREIGN KEY (active_plot_id) REFERENCES plots(id) ON DELETE SET NULL
                     )
                 """)
-                # Basic column existence check and add if missing (for development ease)
-                # In production, use a proper migration tool like Alembic.
-                cursor.execute("PRAGMA table_info(narratives)")
-                columns = [column[1] for column in cursor.fetchall()]
-                if 'generated_worldview' not in columns:
-                    cursor.execute("ALTER TABLE narratives ADD COLUMN generated_worldview TEXT")
-                    print("Added 'generated_worldview' column to 'narratives' table.")
-
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS outlines (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        overview_text TEXT NOT NULL,
+                        creation_date TEXT NOT NULL,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS worldviews (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        description_text TEXT NOT NULL,
+                        creation_date TEXT NOT NULL,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS plots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        plot_summary TEXT NOT NULL, -- Stores JSON string of List[PlotChapterDetail]
+                        creation_date TEXT NOT NULL,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS characters (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        description TEXT NOT NULL, -- Stores JSON string of DetailedCharacterProfile
+                        role_in_story TEXT NOT NULL,
+                        creation_date TEXT NOT NULL,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS chapters (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        chapter_number INTEGER NOT NULL,
+                        title TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        creation_date TEXT NOT NULL,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE,
+                        UNIQUE(novel_id, chapter_number)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS knowledge_base_entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        entry_type TEXT NOT NULL,
+                        content_text TEXT NOT NULL,
+                        embedding BLOB,
+                        creation_date TEXT NOT NULL,
+                        related_entities TEXT,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+                    )
+                """)
                 conn.commit()
-            print(f"Database '{self.db_name}' initialized successfully. 'narratives' table is ready.")
+            print(f"Database '{self.db_name}' initialized successfully. All tables are ready.")
         except sqlite3.Error as e:
-            print(f"Error initializing database '{self.db_name}': {e}")
+            print(f"Error creating tables in '{self.db_name}': {e}")
             raise
 
-    def add_narrative(self, user_theme: str, style_preferences: str, generated_outline: str, generated_worldview: str | None = None) -> int:
-        """Adds a new narrative to the database and returns its ID."""
-        if not user_theme or not generated_outline:
-            raise ValueError("User theme and generated outline cannot be empty.")
 
+    def _update_novel_last_updated(self, novel_id: int, conn: sqlite3.Connection):
+        current_timestamp = datetime.now(timezone.utc).isoformat()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE novels SET last_updated_date = ? WHERE id = ?", (current_timestamp, novel_id))
+
+    # --- Novel Methods ---
+    # ... (add_novel, get_novel_by_id, list_all_novels remain the same)
+    def add_novel(self, user_theme: str, style_preferences: str) -> int:
+        if not user_theme: raise ValueError("User theme cannot be empty.")
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO novels (user_theme, style_preferences, creation_date, last_updated_date) VALUES (?, ?, ?, ?)",
+                            (user_theme, style_preferences, ts, ts))
+                conn.commit()
+                new_id = cur.lastrowid
+                if new_id is None: raise sqlite3.Error("Failed to retrieve ID for novel.")
+                return int(new_id)
+        except sqlite3.Error as e: print(f"Error adding novel: {e}"); raise
+
+    def get_novel_by_id(self, novel_id: int) -> Optional[Novel]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM novels WHERE id = ?", (novel_id,))
+                row = cur.fetchone()
+                return Novel(**dict(row)) if row else None
+        except sqlite3.Error as e: print(f"Error retrieving novel ID {novel_id}: {e}"); return None
+
+    def list_all_novels(self) -> List[Novel]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM novels ORDER BY last_updated_date DESC")
+                return [Novel(**dict(row)) for row in cur.fetchall()]
+        except sqlite3.Error as e: print(f"Error listing novels: {e}"); return []
+
+    # --- Outline Methods ---
+    # ... (add_outline, get_outline_by_id, update_novel_active_outline remain the same)
+    def add_outline(self, novel_id: int, overview_text: str) -> int:
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO outlines (novel_id, overview_text, creation_date) VALUES (?, ?, ?)",
+                               (novel_id, overview_text, ts))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                new_id = cur.lastrowid
+                if new_id is None: raise sqlite3.Error("Failed to retrieve ID for outline.")
+                return int(new_id)
+        except sqlite3.Error as e: print(f"Error adding outline: {e}"); raise
+
+    def get_outline_by_id(self, outline_id: int) -> Optional[Outline]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM outlines WHERE id = ?", (outline_id,))
+                row = cur.fetchone()
+                return Outline(**dict(row)) if row else None
+        except sqlite3.Error as e: print(f"Error retrieving outline ID {outline_id}: {e}"); return None
+
+    def update_novel_active_outline(self, novel_id: int, outline_id: Optional[int]):
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE novels SET active_outline_id = ? WHERE id = ?", (outline_id, novel_id))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+        except sqlite3.Error as e: print(f"Error updating active outline: {e}"); raise
+
+
+    # --- WorldView Methods ---
+    # ... (add_worldview, get_worldview_by_id, update_novel_active_worldview remain the same)
+    def add_worldview(self, novel_id: int, description_text: str) -> int:
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO worldviews (novel_id, description_text, creation_date) VALUES (?, ?, ?)",
+                               (novel_id, description_text, ts))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                new_id = cur.lastrowid
+                if new_id is None: raise sqlite3.Error("Failed to retrieve ID for worldview.")
+                return int(new_id)
+        except sqlite3.Error as e: print(f"Error adding worldview: {e}"); raise
+
+    def get_worldview_by_id(self, worldview_id: int) -> Optional[WorldView]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM worldviews WHERE id = ?", (worldview_id,))
+                row = cur.fetchone()
+                return WorldView(**dict(row)) if row else None
+        except sqlite3.Error as e: print(f"Error retrieving worldview ID {worldview_id}: {e}"); return None
+
+    def update_novel_active_worldview(self, novel_id: int, worldview_id: Optional[int]):
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE novels SET active_worldview_id = ? WHERE id = ?", (worldview_id, novel_id))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+        except sqlite3.Error as e: print(f"Error updating active worldview: {e}"); raise
+
+    # --- Plot Methods ---
+    # ... (add_plot, get_plot_by_id, update_novel_active_plot remain the same)
+    # get_plot_by_id currently returns Plot with plot_summary as JSON string. Deserialization can be added if needed by caller.
+    def add_plot(self, novel_id: int, plot_summary: str) -> int: # plot_summary is now JSON string
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO plots (novel_id, plot_summary, creation_date) VALUES (?, ?, ?)",
+                               (novel_id, plot_summary, ts))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                new_id = cur.lastrowid
+                if new_id is None: raise sqlite3.Error("Failed to retrieve ID for plot.")
+                return int(new_id)
+        except sqlite3.Error as e: print(f"Error adding plot: {e}"); raise
+
+    def get_plot_by_id(self, plot_id: int) -> Optional[Plot]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM plots WHERE id = ?", (plot_id,))
+                row = cur.fetchone()
+                return Plot(**dict(row)) if row else None # plot_summary will be JSON string
+        except sqlite3.Error as e: print(f"Error retrieving plot ID {plot_id}: {e}"); return None
+
+    def update_novel_active_plot(self, novel_id: int, plot_id: Optional[int]):
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE novels SET active_plot_id = ? WHERE id = ?", (plot_id, novel_id))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+        except sqlite3.Error as e: print(f"Error updating active plot: {e}"); raise
+
+
+    # --- Character Methods ---
+    def add_character(self, novel_id: int, name: str, description: str, role_in_story: str) -> int:
+        # description is now expected to be a JSON string of DetailedCharacterProfile (excluding id, novel_id, creation_date)
         current_timestamp = datetime.now(timezone.utc).isoformat()
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO narratives (user_theme, style_preferences, generated_outline, timestamp, generated_worldview)
+                    INSERT INTO characters (novel_id, name, description, role_in_story, creation_date)
                     VALUES (?, ?, ?, ?, ?)
-                """, (user_theme, style_preferences, generated_outline, current_timestamp, generated_worldview))
+                """, (novel_id, name, description, role_in_story, current_timestamp))
+                self._update_novel_last_updated(novel_id, conn)
                 conn.commit()
                 new_id = cursor.lastrowid
-                if new_id is None:
-                    raise sqlite3.Error("Failed to retrieve last inserted ID.")
-                print(f"Narrative added with ID: {new_id}")
-                return new_id
+                if new_id is None: raise sqlite3.Error("Failed to retrieve ID for character.")
+                return int(new_id)
         except sqlite3.Error as e:
-            print(f"Error adding narrative: {e}")
+            print(f"Error adding character for novel {novel_id}: {e}")
             raise
 
-    def update_narrative_worldview(self, narrative_id: int, generated_worldview: str) -> bool:
-        """Updates the worldview for an existing narrative. Returns True on success."""
-        if not generated_worldview:
-            # Depending on requirements, empty string might be acceptable, or raise error
-            print("Warning: Attempting to update worldview with empty data.")
-
+    def get_character_by_id(self, character_id: int) -> Optional[DetailedCharacterProfile]:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE narratives
-                    SET generated_worldview = ?
-                    WHERE id = ?
-                """, (generated_worldview, narrative_id))
-                conn.commit()
-                success = cursor.rowcount > 0
-                if success:
-                    print(f"Worldview updated for narrative ID: {narrative_id}")
-                else:
-                    print(f"Warning: No narrative found with ID {narrative_id} to update worldview, or data unchanged.")
-                return success
-        except sqlite3.Error as e:
-            print(f"Error updating worldview for narrative ID {narrative_id}: {e}")
-            return False # Or raise
-
-    def get_narrative_by_id(self, narrative_id: int) -> dict | None:
-        """Retrieves a single narrative by its ID. Returns a dict or None."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                # Ensure all desired columns are selected
-                cursor.execute("SELECT id, user_theme, style_preferences, generated_outline, timestamp, generated_worldview FROM narratives WHERE id = ?", (narrative_id,))
+                cursor.execute("SELECT * FROM characters WHERE id = ?", (character_id,))
                 row = cursor.fetchone()
-                return dict(row) if row else None
+                if row:
+                    detailed_profile_data: Dict[str, Any] = {}
+                    if row['description']:
+                        try:
+                            detailed_profile_data = json.loads(row['description'])
+                        except json.JSONDecodeError as e:
+                            print(f"Error decoding character description JSON for id {character_id}: {e}. Description: {row['description']}")
+                            # Fallback: use raw description if not valid JSON, or parts of it
+                            detailed_profile_data['background_story'] = f"Could not parse full details. Raw description: {row['description']}"
+
+
+                    # Construct DetailedCharacterProfile
+                    # Fields from DB row take precedence for id, novel_id, name, role, creation_date
+                    profile = DetailedCharacterProfile(
+                        character_id=row['id'],
+                        novel_id=row['novel_id'],
+                        name=row['name'],
+                        role_in_story=row['role_in_story'],
+                        creation_date=row['creation_date'],
+                        # Fields from JSON description
+                        gender=detailed_profile_data.get('gender'),
+                        age=detailed_profile_data.get('age'),
+                        race_or_species=detailed_profile_data.get('race_or_species'),
+                        appearance_summary=detailed_profile_data.get('appearance_summary'),
+                        clothing_style=detailed_profile_data.get('clothing_style'),
+                        background_story=detailed_profile_data.get('background_story'),
+                        personality_traits=detailed_profile_data.get('personality_traits'),
+                        values_and_beliefs=detailed_profile_data.get('values_and_beliefs'),
+                        strengths=detailed_profile_data.get('strengths'),
+                        weaknesses=detailed_profile_data.get('weaknesses'),
+                        quirks_or_mannerisms=detailed_profile_data.get('quirks_or_mannerisms'),
+                        catchphrase_or_verbal_style=detailed_profile_data.get('catchphrase_or_verbal_style'),
+                        skills_and_abilities=detailed_profile_data.get('skills_and_abilities'),
+                        special_powers=detailed_profile_data.get('special_powers'),
+                        power_level_assessment=detailed_profile_data.get('power_level_assessment'),
+                        motivations_deep_drive=detailed_profile_data.get('motivations_deep_drive'),
+                        goal_short_term=detailed_profile_data.get('goal_short_term'),
+                        goal_long_term=detailed_profile_data.get('goal_long_term'),
+                        character_arc_potential=detailed_profile_data.get('character_arc_potential'),
+                        relationships_initial_notes=detailed_profile_data.get('relationships_initial_notes'),
+                        raw_llm_output_for_character=detailed_profile_data.get('raw_llm_output_for_character')
+                    )
+                    return profile
+                return None
         except sqlite3.Error as e:
-            print(f"Error retrieving narrative by ID {narrative_id}: {e}")
+            print(f"Error retrieving character by ID {character_id}: {e}")
             return None
 
-    def list_all_narratives(self) -> list[dict]:
-        """Retrieves all narratives from the database. Returns a list of dicts."""
+    def get_characters_for_novel(self, novel_id: int) -> List[DetailedCharacterProfile]:
+        characters_list: List[DetailedCharacterProfile] = []
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # Ensure all desired columns are selected
-                cursor.execute("SELECT id, user_theme, style_preferences, generated_outline, timestamp, generated_worldview FROM narratives ORDER BY timestamp DESC")
+                cursor.execute("SELECT * FROM characters WHERE novel_id = ? ORDER BY name", (novel_id,))
                 rows = cursor.fetchall()
-                return [dict(row) for row in rows]
+                for row in rows:
+                    detailed_profile_data: Dict[str, Any] = {}
+                    if row['description']:
+                        try:
+                            detailed_profile_data = json.loads(row['description'])
+                        except json.JSONDecodeError as e:
+                            print(f"Error decoding character description JSON for id {row['id']}: {e}. Description: {row['description']}")
+                            detailed_profile_data['background_story'] = f"Could not parse full details. Raw description: {row['description']}"
+
+                    profile = DetailedCharacterProfile(
+                        character_id=row['id'],
+                        novel_id=row['novel_id'],
+                        name=row['name'],
+                        role_in_story=row['role_in_story'],
+                        creation_date=row['creation_date'],
+                        gender=detailed_profile_data.get('gender'),
+                        age=detailed_profile_data.get('age'),
+                        race_or_species=detailed_profile_data.get('race_or_species'),
+                        appearance_summary=detailed_profile_data.get('appearance_summary'),
+                        clothing_style=detailed_profile_data.get('clothing_style'),
+                        background_story=detailed_profile_data.get('background_story'),
+                        personality_traits=detailed_profile_data.get('personality_traits'),
+                        values_and_beliefs=detailed_profile_data.get('values_and_beliefs'),
+                        strengths=detailed_profile_data.get('strengths'),
+                        weaknesses=detailed_profile_data.get('weaknesses'),
+                        quirks_or_mannerisms=detailed_profile_data.get('quirks_or_mannerisms'),
+                        catchphrase_or_verbal_style=detailed_profile_data.get('catchphrase_or_verbal_style'),
+                        skills_and_abilities=detailed_profile_data.get('skills_and_abilities'),
+                        special_powers=detailed_profile_data.get('special_powers'),
+                        power_level_assessment=detailed_profile_data.get('power_level_assessment'),
+                        motivations_deep_drive=detailed_profile_data.get('motivations_deep_drive'),
+                        goal_short_term=detailed_profile_data.get('goal_short_term'),
+                        goal_long_term=detailed_profile_data.get('goal_long_term'),
+                        character_arc_potential=detailed_profile_data.get('character_arc_potential'),
+                        relationships_initial_notes=detailed_profile_data.get('relationships_initial_notes'),
+                        raw_llm_output_for_character=detailed_profile_data.get('raw_llm_output_for_character')
+                    )
+                    characters_list.append(profile)
+            return characters_list
         except sqlite3.Error as e:
-            print(f"Error listing all narratives: {e}")
+            print(f"Error retrieving characters for novel {novel_id}: {e}")
             return []
 
+    # --- Chapter Methods ---
+    # ... (add_chapter, get_chapter_by_id, get_chapters_for_novel remain the same)
+    def add_chapter(self, novel_id: int, chapter_number: int, title: str, content: str, summary: str) -> int:
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO chapters (novel_id, chapter_number, title, content, summary, creation_date) VALUES (?, ?, ?, ?, ?, ?)",
+                               (novel_id, chapter_number, title, content, summary, ts))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                new_id = cur.lastrowid
+                if new_id is None: raise sqlite3.Error("Failed to retrieve ID for chapter.")
+                return int(new_id)
+        except sqlite3.Error as e: print(f"Error adding chapter: {e}"); raise
+
+    def get_chapter_by_id(self, chapter_id: int) -> Optional[Chapter]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM chapters WHERE id = ?", (chapter_id,))
+                row = cur.fetchone()
+                return Chapter(**dict(row)) if row else None
+        except sqlite3.Error as e: print(f"Error retrieving chapter ID {chapter_id}: {e}"); return None
+
+    def get_chapters_for_novel(self, novel_id: int) -> List[Chapter]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM chapters WHERE novel_id = ? ORDER BY chapter_number", (novel_id,))
+                return [Chapter(**dict(row)) for row in cur.fetchall()]
+        except sqlite3.Error as e: print(f"Error retrieving chapters for novel {novel_id}: {e}"); return []
+
+
+    # --- KnowledgeBaseEntry Methods ---
+    # ... (add_kb_entry, get_kb_entry_by_id, get_kb_entries_for_novel remain the same)
+    def add_kb_entry(self, novel_id: int, entry_type: str, content_text: str,
+                     embedding: Optional[List[float]] = None,
+                     related_entities: Optional[List[str]] = None) -> int:
+        ts = datetime.now(timezone.utc).isoformat()
+        emb_blob = sqlite3.Binary(str(embedding).encode()) if embedding else None
+        rel_ent_json = str(related_entities) if related_entities else None
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO knowledge_base_entries (novel_id, entry_type, content_text, embedding, creation_date, related_entities) VALUES (?, ?, ?, ?, ?, ?)",
+                               (novel_id, entry_type, content_text, emb_blob, ts, rel_ent_json))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                new_id = cur.lastrowid
+                if new_id is None: raise sqlite3.Error("Failed to retrieve ID for KB entry.")
+                return int(new_id)
+        except sqlite3.Error as e: print(f"Error adding KB entry: {e}"); raise
+
+    def get_kb_entry_by_id(self, entry_id: int) -> Optional[KnowledgeBaseEntry]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM knowledge_base_entries WHERE id = ?", (entry_id,))
+                row = cur.fetchone()
+                if not row: return None
+                rd = dict(row)
+                if rd.get('embedding'): rd['embedding'] = eval(rd['embedding'].decode()) if isinstance(rd['embedding'], bytes) else None
+                if rd.get('related_entities'): rd['related_entities'] = eval(rd['related_entities']) if isinstance(rd['related_entities'], str) else None
+                return KnowledgeBaseEntry(**rd)
+        except Exception as e: print(f"Error retrieving KB entry ID {entry_id}: {e}"); return None
+
+    def get_kb_entries_for_novel(self, novel_id: int, entry_type: Optional[str] = None) -> List[KnowledgeBaseEntry]:
+        entries = []
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                sql = "SELECT * FROM knowledge_base_entries WHERE novel_id = ?"
+                params: List[Any] = [novel_id]
+                if entry_type: sql += " AND entry_type = ?"; params.append(entry_type)
+                sql += " ORDER BY creation_date DESC"
+                cur.execute(sql, tuple(params))
+                for row in cur.fetchall():
+                    rd = dict(row)
+                    if rd.get('embedding'): rd['embedding'] = eval(rd['embedding'].decode()) if isinstance(rd['embedding'], bytes) else None
+                    if rd.get('related_entities'): rd['related_entities'] = eval(rd['related_entities']) if isinstance(rd['related_entities'], str) else None
+                    entries.append(KnowledgeBaseEntry(**rd))
+            return entries
+        except Exception as e: print(f"Error retrieving KB entries for novel {novel_id}: {e}"); return []
+
+
 if __name__ == "__main__":
-    print("--- Testing DatabaseManager (with Worldview) ---")
-    test_db_name = "test_novel_mvp_wv.db" # Use a different name for this test run
+    print("--- Testing DatabaseManager (with DetailedCharacterProfile handling) ---")
+    test_db_name = "test_db_manager_detailed_char.db"
     import os
     if os.path.exists(test_db_name):
         os.remove(test_db_name)
 
     db_manager = DatabaseManager(db_name=test_db_name)
-    print(f"DatabaseManager initialized with '{test_db_name}'.")
 
-    # 1. Add a narrative (initially without worldview via add_narrative)
-    theme1 = "A chef who cooks emotions into food."
-    style1 = "Magical realism"
-    outline1 = "A renowned chef discovers their dishes can make people feel specific emotions. They struggle with the ethics of this power."
-    narrative_id1 = db_manager.add_narrative(user_theme=theme1, style_preferences=style1, generated_outline=outline1)
-    print(f"Added narrative (no worldview yet) with ID: {narrative_id1}")
+    # Test Novel
+    novel_id = db_manager.add_novel("Test Novel for Characters", "Test Style")
 
-    retrieved_before_wv = db_manager.get_narrative_by_id(narrative_id1)
-    print(f"Retrieved before WV update: {retrieved_before_wv}")
-    assert retrieved_before_wv is not None
-    assert retrieved_before_wv['generated_worldview'] is None
+    # Test Character with Detailed Profile
+    char_name = "Jax The Mighty"
+    char_role = "Protagonist"
+    detailed_profile_content = DetailedCharacterProfile(
+        character_id=None, novel_id=None, creation_date=None, # These will be set by DB or ignored in JSON
+        name=char_name, # This will also be a direct DB column
+        gender="Male",
+        age="30s",
+        race_or_species="Human",
+        appearance_summary="Tall and rugged, with a scar over his left eye.",
+        clothing_style="Worn leather armor and a heavy cloak.",
+        background_story="A former soldier trying to escape his past.",
+        personality_traits="Gruff, Loyal, Secretive", # Stored as string, but can be parsed if needed
+        values_and_beliefs="Believes in second chances, but trusts few.",
+        strengths=["Swordsmanship", "Survival skills"],
+        weaknesses=["His past trauma", "Distrustful of authority"],
+        quirks_or_mannerisms=["Taps his sword hilt when thinking"],
+        catchphrase_or_verbal_style="Prefers silence but speaks bluntly.",
+        skills_and_abilities=["Tracking (Expert)", "Lockpicking (Adept)"],
+        special_powers=None, # Explicitly None
+        power_level_assessment="Seasoned warrior",
+        motivations_deep_drive="To find peace and redemption.",
+        goal_short_term="Find a safe place to hide.",
+        goal_long_term="Confront the warlord who destroyed his village.",
+        character_arc_potential="From a loner to a leader.",
+        relationships_initial_notes="Will likely clash with authority figures but protect the innocent.",
+        role_in_story=char_role, # This will also be a direct DB column
+        raw_llm_output_for_character="Raw LLM text for Jax..." # For debugging
+    )
 
-    # 2. Update with worldview
-    worldview_content = "The story is set in a bustling, modern city with a hidden magical underground culinary scene. The mood is whimsical but with an undercurrent of moral tension."
-    print(f"\nUpdating narrative ID {narrative_id1} with worldview...")
-    update_success = db_manager.update_narrative_worldview(narrative_id1, worldview_content)
-    assert update_success is True
-    print("Update successful.")
+    # Create a dict from DetailedCharacterProfile, excluding fields managed by the DB table directly
+    # (id, novel_id, name, role_in_story, creation_date) as these are columns in `characters` table.
+    # The agent would prepare this JSON part.
+    profile_json_data = {k: v for k, v in detailed_profile_content.items()
+                         if k not in ['character_id', 'novel_id', 'name', 'role_in_story', 'creation_date']}
+    description_json_str = json.dumps(profile_json_data)
 
-    retrieved_after_wv = db_manager.get_narrative_by_id(narrative_id1)
-    print(f"Retrieved after WV update: {retrieved_after_wv}")
-    assert retrieved_after_wv is not None
-    assert retrieved_after_wv['generated_worldview'] == worldview_content
+    char_id = db_manager.add_character(novel_id, char_name, description_json_str, char_role)
+    print(f"Added character '{char_name}' with ID: {char_id}")
 
-    # 3. Add another narrative, this time providing worldview directly to add_narrative (testing modification)
-    theme2 = "AI therapist develops genuine consciousness."
-    style2 = "Sci-fi, psychological"
-    outline2 = "An advanced AI designed for therapy starts questioning its own existence after countless sessions."
-    worldview2 = "Near-future society heavily reliant on AI for mental well-being. Clean, sterile environments contrast with the AI's messy internal awakening."
-    narrative_id2 = db_manager.add_narrative(theme2, style2, outline2, generated_worldview=worldview2)
-    print(f"Added narrative ID {narrative_id2} with worldview directly.")
+    # Test get_character_by_id
+    retrieved_char_profile = db_manager.get_character_by_id(char_id)
+    assert retrieved_char_profile is not None, f"Character ID {char_id} not found!"
+    print(f"\nRetrieved Character (Detailed Profile) by ID {char_id}:")
+    # for key, value in retrieved_char_profile.items():
+    #     print(f"  {key}: {value}")
+    assert retrieved_char_profile['character_id'] == char_id
+    assert retrieved_char_profile['novel_id'] == novel_id
+    assert retrieved_char_profile['name'] == char_name
+    assert retrieved_char_profile['role_in_story'] == char_role
+    assert retrieved_char_profile['gender'] == "Male"
+    assert retrieved_char_profile['background_story'] == "A former soldier trying to escape his past."
+    assert "Swordsmanship" in retrieved_char_profile['strengths'] if retrieved_char_profile['strengths'] else False
+    assert retrieved_char_profile['special_powers'] is None # Check for correct handling of None
+    print("  Detailed profile fields verified successfully via get_character_by_id.")
 
-    retrieved_narrative2 = db_manager.get_narrative_by_id(narrative_id2)
-    print(f"Retrieved narrative ID {narrative_id2}: {retrieved_narrative2}")
-    assert retrieved_narrative2 is not None
-    assert retrieved_narrative2['generated_worldview'] == worldview2
 
+    # Test get_characters_for_novel
+    db_manager.add_character(novel_id, "Silas the Sly", json.dumps({"name": "Silas the Sly", "age": "40s", "background_story": "A cunning thief."}), "Antagonist")
+    all_novel_chars = db_manager.get_characters_for_novel(novel_id)
+    assert len(all_novel_chars) == 2, f"Expected 2 characters, got {len(all_novel_chars)}"
+    print(f"\nRetrieved {len(all_novel_chars)} characters for Novel ID {novel_id}:")
+    for char_prof in all_novel_chars:
+        print(f"  - ID: {char_prof['character_id']}, Name: {char_prof['name']}, Role: {char_prof['role_in_story']}, Age: {char_prof.get('age', 'N/A')}")
+        if char_prof['name'] == "Jax The Mighty":
+             assert "Survival skills" in char_prof['strengths'] if char_prof['strengths'] else False
+    print("  get_characters_for_novel seems to correctly deserialize.")
 
-    # 4. List all narratives and check worldview content
-    print("\nListing all narratives...")
-    all_narratives = db_manager.list_all_narratives()
-    for nar in all_narratives:
-        print(f"  ID: {nar['id']}, Theme: {nar['user_theme']}, WV: {nar['generated_worldview'][:30] if nar['generated_worldview'] else 'None'}...")
-    assert len(all_narratives) == 2
-    # Check if worldview is present for both
-    found_wv1 = any(n['id'] == narrative_id1 and n['generated_worldview'] == worldview_content for n in all_narratives)
-    found_wv2 = any(n['id'] == narrative_id2 and n['generated_worldview'] == worldview2 for n in all_narratives)
-    assert found_wv1
-    assert found_wv2
+    # Test Plot JSON storage (conceptual, as PlotChapterDetail is complex)
+    sample_plot_details = [
+        PlotChapterDetail(chapter_number=1, title="The Beginning", estimated_words=1000, core_scene_summary="Intro", characters_present=["Jax"], key_events_and_plot_progression="Event A", goal_and_conflict="Goal A", turning_point="None", tone_and_style_notes="Fast", suspense_or_hook="Hook A", raw_llm_output_for_chapter="..."),
+        PlotChapterDetail(chapter_number=2, title="The Middle", estimated_words=1500, core_scene_summary="Middle part", characters_present=["Jax", "Silas"], key_events_and_plot_progression="Event B", goal_and_conflict="Goal B", turning_point="Big one", tone_and_style_notes="Slow", suspense_or_hook="Hook B", raw_llm_output_for_chapter="...")
+    ]
+    plot_id = db_manager.add_plot(novel_id, json.dumps(sample_plot_details))
+    retrieved_plot_obj = db_manager.get_plot_by_id(plot_id)
+    assert retrieved_plot_obj is not None
+    print(f"\nRetrieved Plot ID {plot_id}. Summary (JSON string): {retrieved_plot_obj['plot_summary'][:100]}...")
+    try:
+        deserialized_plot_summary = json.loads(retrieved_plot_obj['plot_summary'])
+        assert isinstance(deserialized_plot_summary, list)
+        assert len(deserialized_plot_summary) == 2
+        assert deserialized_plot_summary[0]['title'] == "The Beginning"
+        print("  Plot JSON string successfully deserialized and verified.")
+    except json.JSONDecodeError as e:
+        print(f"  Failed to deserialize plot_summary JSON: {e}")
 
-    # Test updating non-existent ID
-    print("\nTesting update for non-existent narrative ID...")
-    fail_update = db_manager.update_narrative_worldview(999, "test")
-    assert fail_update is False
 
     if os.path.exists(test_db_name):
         os.remove(test_db_name)
-    print(f"Cleaned up '{test_db_name}'.")
-    print("--- DatabaseManager (with Worldview) Test Finished ---")
+    print(f"\nCleaned up '{test_db_name}'.")
+    print("--- DatabaseManager (with DetailedCharacterProfile handling) Test Finished ---")
