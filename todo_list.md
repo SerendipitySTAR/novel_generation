@@ -60,16 +60,16 @@ This document tracks the implementation status of features and components descri
     *   `[ ]` User selection/editing of structured worldview (TODO).
 *   **[p] Plot Architect Agent (大纲智能体 - README 4.3.3)**
     *   `[x]` Basic agent structure in `src/agents/plot_architect_agent.py`.
-    *   `[p]` Enhanced for detailed chapter structures (`PlotChapterDetail`). (Live LLM call implemented. Prompt and parser underwent a major refinement iteration with 'BEGIN CHAPTER X:'/'END CHAPTER X:' delimiters and more robust internal field parsing. Further significant iterative live testing and refinement performed on prompt & parser to improve stability and output quality for detailed structures. System is set up with a dedicated test script for ongoing live LLM testing. README goal: 1-2 detailed chapter outlines.)
+    *   `[p]` Enhanced for detailed chapter structures (`PlotChapterDetail`). (Live LLM call implemented. Prompt and parser underwent major refinement iteration with 'BEGIN CHAPTER X:'/'END CHAPTER X:' delimiters and more robust internal field parsing. Further significant iterative live testing and refinement performed on prompt & parser to improve stability and output quality for detailed structures. System is set up with a dedicated test script for ongoing live LLM testing. Prompt has now also undergone an initial quality pass aiming for more creative and distinct chapter elements. README goal: 1-2 detailed chapter outlines.)
     *   `[ ]` Support for multi-line narrative (TODO).
     *   `[ ]` User selection/editing of plot (TODO).
 *   **[p] Character Sculptor Agent (人物刻画智能体 - README 4.3.4)**
     *   `[x]` MVP agent implemented in `src/agents/character_sculptor_agent.py`.
-    *   `[p]` Significantly enhanced to generate detailed character profiles (`DetailedCharacterProfile` TypedDict) with many fields (background, personality, skills, goals, etc.). Serializes profile to JSON in DB's `description` field. `DatabaseManager` handles deserialization. (Live LLM call implemented; prompt and complex parsing logic for detailed structure added; requires significant iterative refinement with live LLM testing to ensure consistency and completeness of all fields).
+    *   `[p]` Significantly enhanced to generate detailed character profiles (`DetailedCharacterProfile` TypedDict) with many fields (background, personality, skills, goals, etc.). Serializes profile to JSON in DB's `description` field. `DatabaseManager` handles deserialization. (Live LLM call implemented; prompt and complex parsing logic for detailed structure added. Prompt has now also undergone an initial quality pass aiming for better interrelation between fields and character depth. Requires significant iterative refinement with live LLM testing to ensure consistency and completeness of all fields).
     *   `[ ]` User selection/editing of characters (TODO).
 *   **[p] Chapter Chronicler Agent (章节智能体 - README 4.3.5)**
     *   `[x]` MVP agent implemented in `src/agents/chapter_chronicler_agent.py`.
-    *   `[p]` Generates chapter (title, content, summary). (Live LLM call fully enabled. Prompt and parsing logic significantly refined with improved fallbacks, better logging, and more directive instructions on using context, based on (simulated) live testing. Further refinement on content quality and full RAG utilization needed).
+    *   `[p]` Generates chapter (title, content, summary). (Live LLM call fully enabled. Prompt and parsing logic significantly refined with improved fallbacks, better logging, and more directive instructions on using context, based on (simulated) live testing. Prompt has now also undergone an initial quality pass aiming for more engaging prose, better use of character detail, and effective RAG context integration. Further refinement on content quality and full RAG utilization needed).
     *   `[p]` Takes style preferences into account (Prompt is there, but live LLM call needs verification of adherence).
     *   `[ ]` Generate 2-3 plot branch options at key points (TODO).
 *   **[p] Context Synthesizer Agent (总结智能体 - README 4.3.8)**
@@ -162,10 +162,17 @@ This document tracks the implementation status of features and components descri
     *   `[x]` Targeted Live Testing & Refinement: `CharacterSculptorAgent` (Completed in prior Phase 2.C; live testing implicitly part of full workflow runs).
     *   `[x]` Full Workflow Live Test & `ChapterChroniclerAgent` Refinement (Intensive prompt/parser/context-usage refinement iterations completed for ChapterChronicler & ContextSynthesizer).
     *   `[x]` Basic Coherence Review (Conceptual review of more stabilized loop completed).
-*   **[ ] Phase 2: Core Function Refinement & Initial Agent Shaping** (TODO)
-    *   (This phase name might need renaming or merging as 2.A, 2.B, 2.C, 2.D cover much of its intent. For now, keeping as a placeholder for remaining items from original Phase 2 goal like full agent suite, advanced user interactions, and full RAG tuning)
-*   **[ ] Phase 3: Advanced Features & UX Optimization** (TODO)
-*   **[ ] Phase 4: Commercialization Prep & Continuous Iteration** (TODO)
+*   **[p] Phase 3.A: Real-Use Enablement - Live Workflow Hardening & Quality Pass (Revised Focus)**
+    *   `[x]` Enhance RAG Context Logging.
+    *   `[x]` Initial Quality Pass on Prompts (Content Focus for PlotArchitect, CharacterSculptor, ChapterChronicler DONE).
+    *   [ ] (Implicit) Intensive Live End-to-End Workflow Testing (`main.py`) - This is ongoing / covered by the need for further agent refinement.
+    *   [ ] (Implicit) Critical Bug Fixing & Parser Robustness (Iterative) - Initial major pass done, ongoing as needed.
+    *   [ ] (Implicit) RAG System - Live Functional Check - Basic logging in place, deeper functional check & tuning needed.
+    *   [ ] (Implicit) Basic Coherence Review - Initial conceptual review done, ongoing with live tests.
+*   **[ ] Phase 2: Core Function Refinement & Initial Agent Shaping** (TODO) # This phase name might need renaming or merging as 2.A-D & 3.A cover much of its intent.
+*   **[ ] Phase 3: Advanced Features & UX Optimization** (TODO) # Original Phase 3
+*   **[ ] Phase 4: Commercialization Prep & Continuous Iteration** (TODO) # Original Phase 4
+
 
 ## 5. Other Considerations
 

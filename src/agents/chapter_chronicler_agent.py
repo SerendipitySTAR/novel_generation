@@ -42,11 +42,18 @@ class ChapterChroniclerAgent:
         Title:
         [A compelling title for this chapter. Single line.]
 
+        # Instructions for Content generation - focused on improving narrative quality.
         Content:
-        [The full chapter text. Aim for 700-1000 words. Develop the 'Specific Plot for THIS Chapter'.]
+        [The full chapter text. Aim for approximately 700-1000 words.
+        It is CRUCIAL that the Content directly enacts and expands upon the 'Specific Plot for THIS Chapter' provided.
+        - Show, Don't Tell: Focus on vivid descriptions of settings, character actions, and emotions.
+        - Dialogue: Incorporate meaningful dialogue that reveals character personality, motivations, and advances the plot.
+        - Character Consistency: Ensure character behaviors, decisions, and speech patterns are consistent with their detailed profiles and motivations as described in the 'Chapter Brief'.
+        - Utilize Context: If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly weave these details into the narrative where appropriate to enhance world-building and consistency. Avoid large blocks of exposition (info-dumping).
+        - Pacing and Flow: Maintain a good narrative pace suitable for the chapter's events and tone.]
 
         Summary:
-        [A concise 2-3 sentence summary of THIS chapter's key events and outcomes.]
+        [A concise 2-3 sentence summary of the key plot advancements, character developments, and critical outcomes that occurred *within this chapter's Content only*.]
 
         Ensure "Title:", "Content:", and "Summary:" are on their own lines. Do not add any other text before "Title:", or after the "Summary:" text.
         """
@@ -60,80 +67,91 @@ class ChapterChroniclerAgent:
             summary = "Summary not generated."
             parse_path = "Initial" # To log parsing attempts
 
-            # Attempt to find Title: - must be at the start of a line.
-            title_match = re.search(r"^Title:(.*?)$", llm_response, re.MULTILINE | re.IGNORECASE)
+            # Robust regex for Title, Content, Summary
+            # Allow for potential whitespace variations and ensure markers are at the start of a line.
+            # Capture content non-greedily.
+            title_regex = r"^\s*Title:(.*?)$"
+            # Content: captures everything until "Summary:" or end of string if "Summary:" is missing
+            content_regex = r"^\s*Content:(.*?)(?=(?:\n\s*Summary:)|$)"
+            summary_regex = r"^\s*Summary:(.*)$"
+
+            title_match = re.search(title_regex, llm_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
+            content_match = re.search(content_regex, llm_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
+            summary_match = re.search(summary_regex, llm_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
+
             if title_match:
                 title_text = title_match.group(1).strip()
-                if title_text: title = title_text
-                parse_path += "->TitleOK"
+                if title_text:
+                    title = title_text
+                    parse_path += "->TitleOK"
+                else:
+                    parse_path += "->TitleEmpty"
+                    print(f"{parsing_log_prefix} Info - 'Title:' marker found but content is empty. Using default.")
             else:
                 parse_path += "->TitleFail"
                 print(f"{parsing_log_prefix} Warning - 'Title:' marker not found or not at start of a line.")
 
-            # Attempt to find Content: (everything between Content: and Summary:, multiline)
-            # This regex assumes "Summary:" follows "Content:".
-            content_match = re.search(r"^Content:(.*?)Summary:", llm_response, re.DOTALL | re.IGNORECASE | re.MULTILINE)
             if content_match:
                 content_text = content_match.group(1).strip()
-                if content_text: content = content_text
-                parse_path += "->ContentOK"
-            else:
-                parse_path += "->ContentAlt"
-                # Fallback for content if "Summary:" is missing or "Content:" is the last significant block
-                content_match_fallback = re.search(r"^Content:(.*)", llm_response, re.DOTALL | re.IGNORECASE | re.MULTILINE)
-                if content_match_fallback:
-                    content_text = content_match_fallback.group(1).strip()
-                    if content_text: content = content_text
-                    parse_path += "->ContentAltOK"
-                    print(f"{parsing_log_prefix} Warning - 'Summary:' marker not found after 'Content:'. Content might include summary text.")
+                if content_text:
+                    content = content_text
+                    parse_path += "->ContentOK"
                 else:
-                    parse_path += "->ContentAltFail"
-                    print(f"{parsing_log_prefix} Warning - 'Content:' marker not found or content is empty.")
+                    parse_path += "->ContentEmpty"
+                    print(f"{parsing_log_prefix} Warning - 'Content:' marker found but content is empty.")
+            else:
+                parse_path += "->ContentFail"
+                print(f"{parsing_log_prefix} Warning - 'Content:' marker not found or structured incorrectly relative to 'Summary:'.")
 
-
-            # Attempt to find Summary: (everything after Summary:, multiline)
-            summary_match = re.search(r"^Summary:(.*)", llm_response, re.DOTALL | re.IGNORECASE | re.MULTILINE)
             if summary_match:
                 summary_text = summary_match.group(1).strip()
-                if summary_text: summary = summary_text
-                parse_path += "->SummaryOK"
-            else:
-                 parse_path += "->SummaryFail"
-                 print(f"{parsing_log_prefix} Warning - 'Summary:' marker not found or not at start of a line.")
-
-            # The 'desperate parse' for content:
-            # If content is still the default placeholder AND the LLM response was not empty,
-            # it means structured parsing failed significantly.
-            if content == "Content not generated." and llm_response.strip():
-                parse_path += "->DesperateContent"
-                print(f"{parsing_log_prefix} Warning - Structured parsing for Content failed significantly. Using desperate fallback.")
-
-                response_remainder = llm_response
-                # Try to strip title part if title was found and it's at the beginning
-                if title_match and llm_response.strip().startswith(title_match.group(0).strip()):
-                    response_remainder = llm_response[len(title_match.group(0)):].strip()
-
-                # Try to strip "Content:" marker if it exists at the start of the remainder
-                content_marker_match = re.match(r"Content:\s*", response_remainder, re.IGNORECASE | re.MULTILINE)
-                if content_marker_match:
-                    response_remainder = response_remainder[content_marker_match.end():].strip()
-
-                # Try to strip "Summary:" and following text if summary was found
-                # This is tricky because summary_match might be from original llm_response
-                # We look for the summary marker in the *current* remainder.
-                summary_marker_in_remainder_match = re.search(r"^Summary:.*", response_remainder, re.DOTALL | re.IGNORECASE | re.MULTILINE)
-                if summary_marker_in_remainder_match:
-                    response_remainder = response_remainder.split(summary_marker_in_remainder_match.group(0))[0].strip()
-
-                if response_remainder:
-                    content = response_remainder
-                    parse_path += "->DesperateContentOK"
+                if summary_text:
+                    summary = summary_text
+                    parse_path += "->SummaryOK"
                 else:
-                    print(f"{parsing_log_prefix} Error - Desperate parse for content also resulted in empty content.")
-                    print(f"{parsing_log_prefix} Final Parse Path: {parse_path}")
-                    return None
+                    parse_path += "->SummaryEmpty"
+                    print(f"{parsing_log_prefix} Info - 'Summary:' marker found but content is empty. Using default.")
+            else:
+                parse_path += "->SummaryFail"
+                print(f"{parsing_log_prefix} Warning - 'Summary:' marker not found or not at start of a line.")
 
-            if content == "Content not generated.": # If content is still placeholder, parsing failed critically
+            # Desperate Parse Fallback Logic
+            if content == "Content not generated." and llm_response.strip():
+                parse_path += "->DesperateParse"
+                print(f"{parsing_log_prefix} Info - Content not found via primary parsing. Attempting desperate fallback.")
+
+                temp_content = llm_response # Start with the full response
+
+                # If title was found, try to remove it and anything before it
+                if title_match and title_match.group(0) in temp_content:
+                    temp_content = temp_content.split(title_match.group(0), 1)[-1]
+                    parse_path += "->DP_TitleStrip"
+
+                # If summary was found, try to remove it and anything after it
+                # This is tricky if summary is embedded within content.
+                # We assume if Summary marker was found, it's *after* the main content.
+                if summary_match and summary_match.group(0) in temp_content:
+                    temp_content = temp_content.split(summary_match.group(0), 1)[0]
+                    parse_path += "->DP_SummaryStrip"
+
+                # Remove "Content:" marker itself if it's at the beginning of what's left
+                temp_content = re.sub(r"^\s*Content:\s*", "", temp_content.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+
+                if temp_content:
+                    content = temp_content
+                    parse_path += "->DP_ContentFound"
+                    print(f"{parsing_log_prefix} Info - Desperate parse assigned remaining text to content.")
+                else:
+                    parse_path += "->DP_ContentFail"
+                    print(f"{parsing_log_prefix} Error - Desperate parse for content also resulted in empty content.")
+
+            # Final check: If title was NOT found, but content was (either normally or via desperate parse)
+            if not title_match and content != "Content not generated.":
+                parse_path += "->TitleMissingContentExists"
+                print(f"{parsing_log_prefix} Info - Title was not parsed, but content exists. Using default title.")
+                # Title remains the default "Chapter X (Untitled)"
+
+            if content == "Content not generated.":
                  print(f"{parsing_log_prefix} Error - Content section remains empty after all parsing attempts. Response (first 500 chars): {llm_response[:500]}")
                  print(f"{parsing_log_prefix} Final Parse Path: {parse_path}")
                  return None

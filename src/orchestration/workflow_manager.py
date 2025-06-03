@@ -401,8 +401,10 @@ def execute_context_synthesizer_agent(state: NovelWorkflowState) -> Dict[str, An
             novel_id, current_chapter_num, brief_plot_summary, active_char_ids
         )
         history = _log_and_update_history(history, f"Chapter brief generated for Chapter {current_chapter_num}.")
+        # Storing the specific plot focus for the chronicler separately as requested by subtask.
         return {
-            "chapter_brief": chapter_brief_text, "current_chapter_plot_summary": brief_plot_summary,
+            "chapter_brief": chapter_brief_text,
+            "current_plot_focus_for_chronicler": brief_plot_summary, # Changed key name
             "history": history, "error_message": None
         }
     except Exception as e:
@@ -414,15 +416,33 @@ def execute_chapter_chronicler_agent(state: NovelWorkflowState) -> Dict[str, Any
     history = _log_and_update_history(state.get("history", []), f"Executing Node: Chapter Chronicler for Chapter {current_chapter_num}")
     try:
         novel_id = state["novel_id"]
-        chapter_brief = state["chapter_brief"]
-        current_plot_for_chapter = state["current_chapter_plot_summary"]
+        chapter_brief_text = state["chapter_brief"] # Renamed for clarity from 'chapter_brief'
+        plot_focus_for_chapter = state["current_plot_focus_for_chronicler"] # Using new key
         style_prefs = state["user_input"].get("style_preferences", "general fiction")
-        if not all([novel_id is not None, chapter_brief, current_plot_for_chapter]):
-            msg = "Missing data for Chapter Chronicler."
-            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+        if not all([novel_id is not None, chapter_brief_text, plot_focus_for_chapter]):
+            msg = "Missing data for Chapter Chronicler (novel_id, chapter_brief, or plot_focus_for_chapter)."
+            history_log = _log_and_update_history(history, msg, True) # Ensure history is updated
+            return {"error_message": msg, "history": history_log}
+
+        # Print the full brief for RAG context visibility
+        if chapter_brief_text:
+            print(f"--- Chapter {current_chapter_num} - Brief for ChroniclerAgent ---")
+            print(chapter_brief_text) # This will include the RAG context section
+            print(f"--- End of Brief for Chapter {current_chapter_num} ---")
+        else:
+            # This case should ideally be caught by the check above, but as a safeguard:
+            error_msg = f"Chapter {current_chapter_num} brief is missing."
+            history_log = _log_and_update_history(history, error_msg, True)
+            print(f"Error: {error_msg}")
+            return {
+                "history": history_log,
+                "error_message": state.get("error_message") or error_msg
+            }
+
         chronicler_agent = ChapterChroniclerAgent(db_name="novel_mvp.db")
         new_chapter = chronicler_agent.generate_and_save_chapter(
-            novel_id, current_chapter_num, chapter_brief, current_plot_for_chapter, style_prefs
+            novel_id, current_chapter_num, chapter_brief_text, plot_focus_for_chapter, style_prefs
         )
         if new_chapter:
             updated_generated_chapters = state.get("generated_chapters", []) + [new_chapter]
@@ -554,7 +574,9 @@ class WorkflowManager:
             total_chapters_to_generate=3,
             generated_chapters=[],
             active_character_ids_for_chapter=None,
-            current_chapter_plot_summary=None, chapter_brief=None
+            current_chapter_plot_summary=None, # This key is no longer directly set by context_synthesizer for chronicler
+            current_plot_focus_for_chronicler=None, # New key
+            chapter_brief=None
         )
         final_state = self.app.invoke(initial_state, {"recursion_limit": 50})
         if final_state.get('error_message'):

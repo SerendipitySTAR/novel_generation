@@ -56,6 +56,15 @@ For EACH chapter, you MUST provide the following fields, using the exact heading
 Do not add any commentary or text outside of this structure for each chapter.
 Ensure there is a blank line after "END CHAPTER X:" before the next "BEGIN CHAPTER X+1:" (if applicable for {num_chapters} > 1).
 
+# General Guidance for Content Quality - Added to improve creative output and coherence.
+General Guidance for Content Quality:
+- For each chapter's "Key Events and Plot Progression": Ensure these events create a clear cause-and-effect chain and build towards the chapter's Turning Point or the main Goal.
+- For "Goal and Conflict": Make the conflict tangible and specific to this chapter. What obstacles must be overcome related to the goal?
+- For "Turning Point": This should be a significant shift or revelation. If it's a minor chapter, it could be a smaller realization or decision.
+- For "Suspense or Hook": Craft a compelling reason for the reader to engage with the next chapter. This could be an unanswered question, a new threat, or a character left in a precarious situation.
+- Aim for unique and engaging ideas for each chapter that fit the overall Narrative Outline and Worldview. Avoid overly generic plot devices unless they serve a specific, creative purpose.
+- Ensure details across chapters show a progression and do not contradict each other unless intentional (e.g. a misleading clue).
+
 ---
 Narrative Outline:
 {narrative_outline}
@@ -64,7 +73,7 @@ Worldview Data:
 {worldview_data}
 ---
 
-Please generate the detailed plot for {num_chapters} chapters now, following the specified format strictly.
+Please generate the detailed plot for {num_chapters} chapters now, following the specified format strictly and adhering to the content quality guidance.
 """
         return prompt
 
@@ -79,30 +88,112 @@ Please generate the detailed plot for {num_chapters} chapters now, following the
         # 4. Implement fallbacks if primary parsing fails.
         chapters_details: List[PlotChapterDetail] = []
 
-        # Helper function to extract a field value
-        def get_field_value(pattern: str, text_block: str, is_list: bool = False) -> Optional[Any]:
-            # Use re.MULTILINE to ensure ^ matches the start of each line within the block
-            match = re.search(pattern, text_block, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        # Helper function to extract a field value using a more flexible regex pattern
+        # that looks for the field name and captures content until the next field name or end of block.
+        def get_field_value(
+            field_name_variations: List[str],
+            text_block: str,
+            is_list: bool = False,
+            block_chapter_num: Optional[int] = None # For logging
+            ) -> Optional[Any]:
+
+            # Construct a regex pattern for field variations.
+            # Example: (?:Title|Chapter Title|Header):
+            # Captures content until the next potential field heading or end of string.
+            # The lookahead `(?=\n\s*\w[\w\s()]*:|$)` tries to stop before a line that looks like "AnotherField: ..."
+            # or end of string if no such line is found.
+            pattern_str = r"^(?:" + "|".join(re.escape(variation) for variation in field_name_variations) + r"):\s*(.*?)(?=\n\s*\w[\w\s()\-]*:|$)"
+
+            match = re.search(pattern_str, text_block, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+
+            field_display_name = field_name_variations[0] # For logging
+
             if match:
                 value = match.group(1).strip()
+                if not value: # If value is empty string after strip.
+                    print(f"PlotArchitectAgent: Warning (Ch {block_chapter_num}) - Field '{field_display_name}' found but content is empty.")
+                    return None if not is_list else []
+
                 if is_list:
-                    if value.lower() in ["none", "n/a", ""]:
-                        return [] # Return empty list for "None" or empty
-                    return [s.strip() for s in value.split(',') if s.strip()]
+                    # Handle "None", "N/A", or empty string for lists
+                    if value.lower() in ["none", "n/a"]:
+                        return []
+
+                    # Try splitting by comma first
+                    items = [s.strip() for s in value.split(',') if s.strip()]
+
+                    # If comma splitting results in a single item that contains newlines,
+                    # it might be a bulleted or numbered list.
+                    if len(items) == 1 and '\n' in items[0]:
+                        print(f"PlotArchitectAgent: Info (Ch {block_chapter_num}) - Field '{field_display_name}' has single comma-item with newlines, trying newline split.")
+                        # Split by newline, then strip common list markers (bullets, numbers)
+                        newline_items = []
+                        for line_item in items[0].split('\n'):
+                            line_item_stripped = line_item.strip()
+                            # Remove leading bullets/numbers like "*- ", "1. ", "- " etc.
+                            line_item_cleaned = re.sub(r"^\s*[-*\d]+\.?\s*", "", line_item_stripped)
+                            if line_item_cleaned: # Add if not empty after cleaning
+                                newline_items.append(line_item_cleaned)
+                        if newline_items: # If newline splitting yielded results
+                            return newline_items
+                        else: # If newline splitting also failed to yield multiple items, return original single item list
+                            print(f"PlotArchitectAgent: Warning (Ch {block_chapter_num}) - Field '{field_display_name}' newline split for list resulted in no items. Original: '{items[0]}'")
+                            return items if items[0] else [] # return the original single item if it's not empty, else empty list
+                    return items
                 return value
+            else:
+                # This print warning is now part of the main loop for clarity
+                # print(f"PlotArchitectAgent: Warning (Ch {block_chapter_num}) - Field '{field_display_name}' not found in chapter block.")
+                pass
             return None
 
-        chapter_block_regex = r"BEGIN CHAPTER\s*(\d+):\s*(.*?)\s*END CHAPTER\s*\1:"
-        matches = re.finditer(chapter_block_regex, llm_response, re.IGNORECASE | re.DOTALL)
+        # --- Main Parsing Logic ---
+        # Attempt 1: Strict BEGIN CHAPTER X: ... END CHAPTER X:
+        chapter_blocks = []
+        strict_block_regex = r"BEGIN CHAPTER\s*(\d+):\s*(.*?)\s*END CHAPTER\s*\1:"
+        strict_matches = list(re.finditer(strict_block_regex, llm_response, re.IGNORECASE | re.DOTALL))
+
+        if strict_matches:
+            print(f"PlotArchitectAgent: Found {len(strict_matches)} chapter blocks using strict BEGIN/END pattern.")
+            for match in strict_matches:
+                chapter_blocks.append({
+                    "number_str": match.group(1).strip(),
+                    "text": match.group(2).strip(),
+                    "source": "strict"
+                })
+        else:
+            # Attempt 2: Fallback - Split by "BEGIN CHAPTER X:"
+            print(f"PlotArchitectAgent: Info - Strict BEGIN/END pattern found no blocks. Trying fallback: split by 'BEGIN CHAPTER'.")
+            # Regex to find "BEGIN CHAPTER X:" and capture X and the text following it.
+            # The text following is captured non-greedily (.*?) up to the next "BEGIN CHAPTER" or end of string.
+            fallback_block_regex = r"BEGIN CHAPTER\s*(\d+):\s*(.*?)(?=(?:BEGIN CHAPTER\s*\d+:)|$)"
+            fallback_matches = list(re.finditer(fallback_block_regex, llm_response, re.IGNORECASE | re.DOTALL))
+
+            if fallback_matches:
+                print(f"PlotArchitectAgent: Found {len(fallback_matches)} chapter blocks using fallback BEGIN pattern.")
+                for match in fallback_matches:
+                    chapter_blocks.append({
+                        "number_str": match.group(1).strip(),
+                        "text": match.group(2).strip(), # Content until next BEGIN or EOS
+                        "source": "fallback_begin_only"
+                    })
+            else:
+                print(f"PlotArchitectAgent: Error - No chapter blocks found using either strict or fallback BEGIN/END patterns.")
+
 
         parsed_chapters_count = 0
-        for match in matches:
+        for block_info in chapter_blocks:
             if parsed_chapters_count >= num_chapters:
-                print(f"PlotArchitectAgent: Warning - Parsed requested {num_chapters} chapters, but more BEGIN/END blocks found. Ignoring extras.")
+                print(f"PlotArchitectAgent: Warning - Parsed requested {num_chapters} chapters, but more blocks found ({block_info['source']} source). Ignoring extras.")
                 break
 
-            chapter_num_from_block = int(match.group(1).strip())
-            block_text = match.group(2).strip()
+            try:
+                chapter_num_from_block = int(block_info["number_str"])
+            except ValueError:
+                print(f"PlotArchitectAgent: Warning - Could not parse chapter number '{block_info['number_str']}' from block. Skipping block.")
+                continue
+
+            block_text = block_info["text"]
 
             details = PlotChapterDetail(
                 chapter_number=chapter_num_from_block,
@@ -112,38 +203,65 @@ Please generate the detailed plot for {num_chapters} chapters now, following the
                 suspense_or_hook=None, raw_llm_output_for_chapter=block_text
             )
 
-            details['title'] = get_field_value(r"^Title:\s*(.*)", block_text) or f"Chapter {chapter_num_from_block} (Title TBD)"
+            field_parsers = {
+                'title': (["Title"], False),
+                'estimated_words_str': (["Estimated Words", "Est. Words", "Word Count", "Approximate Words"], False),
+                'core_scene_summary': (["Core Scene Summary", "Main Scene", "Scene Summary", "Chapter Summary"], False),
+                'characters_present': (["Characters Present", "Characters", "Appearing Characters"], True),
+                'key_events_and_plot_progression': (["Key Events and Plot Progression", "Key Events", "Events", "Plot Progression", "Plot Development"], False),
+                'goal_and_conflict': (["Goal and Conflict", "Goal & Conflict", "Goal/Conflict", "Chapter Goal", "Main Conflict"], False),
+                'turning_point': (["Turning Point", "Turning Points", "Key Revelation"], False),
+                'tone_and_style_notes': (["Tone and Style Notes", "Tone & Style", "Tone", "Style Notes", "Narrative Style"], False),
+                'suspense_or_hook': (["Suspense or Hook", "Suspense/Hook", "Hook", "Cliffhanger", "Next Chapter Hook"], False)
+            }
 
-            est_words_str = get_field_value(r"^(?:Estimated Words|Est\. Words|Word Count):\s*(.*)", block_text)
-            if est_words_str:
-                num_match = re.search(r'\d+', est_words_str)
+            parsed_values = {}
+            for field_key, (variations, is_list_type) in field_parsers.items():
+                parsed_values[field_key] = get_field_value(variations, block_text, is_list_type, chapter_num_from_block)
+                if parsed_values[field_key] is None and not (is_list_type and parsed_values[field_key] == []): # Check for None, not empty list
+                    print(f"PlotArchitectAgent: Warning (Ch {chapter_num_from_block}) - Field '{variations[0]}' not found or empty in chapter block. Block snippet: '{block_text[:100]}...'")
+
+
+            details['title'] = parsed_values['title'] or f"Chapter {chapter_num_from_block} (Title TBD)"
+
+            if parsed_values['estimated_words_str']:
+                num_match = re.search(r'\d+', parsed_values['estimated_words_str'])
                 if num_match:
                     try: details['estimated_words'] = int(num_match.group(0))
-                    except ValueError: print(f"PlotArchitectAgent: Warning - Could not convert estimated_words '{est_words_str}' to int for chapter {chapter_num_from_block}.")
+                    except ValueError: print(f"PlotArchitectAgent: Warning (Ch {chapter_num_from_block}) - Could not convert estimated_words '{parsed_values['estimated_words_str']}' to int.")
+                else:
+                    print(f"PlotArchitectAgent: Warning (Ch {chapter_num_from_block}) - No number found in estimated_words string: '{parsed_values['estimated_words_str']}'.")
 
-            details['core_scene_summary'] = get_field_value(r"^(?:Core Scene Summary|Main Scene|Scene Summary):\s*(.*)", block_text)
-            details['characters_present'] = get_field_value(r"^(?:Characters Present|Characters):\s*(.*)", block_text, is_list=True)
-            details['key_events_and_plot_progression'] = get_field_value(r"^(?:Key Events and Plot Progression|Key Events|Events|Plot Progression):\s*(.*)", block_text)
-            details['goal_and_conflict'] = get_field_value(r"^(?:Goal and Conflict|Goal & Conflict|Goal/Conflict):\s*(.*)", block_text)
-            details['turning_point'] = get_field_value(r"^(?:Turning Point|Turning Points):\s*(.*)", block_text)
-            details['tone_and_style_notes'] = get_field_value(r"^(?:Tone and Style Notes|Tone & Style|Tone|Style Notes):\s*(.*)", block_text)
-            details['suspense_or_hook'] = get_field_value(r"^(?:Suspense or Hook|Suspense/Hook|Hook|Cliffhanger):\s*(.*)", block_text)
+            details['core_scene_summary'] = parsed_values['core_scene_summary']
+            details['characters_present'] = parsed_values['characters_present'] if parsed_values['characters_present'] is not None else []
+            details['key_events_and_plot_progression'] = parsed_values['key_events_and_plot_progression']
+            details['goal_and_conflict'] = parsed_values['goal_and_conflict']
+            details['turning_point'] = parsed_values['turning_point']
+            details['tone_and_style_notes'] = parsed_values['tone_and_style_notes']
+            details['suspense_or_hook'] = parsed_values['suspense_or_hook']
 
             chapters_details.append(details)
             parsed_chapters_count += 1
 
-        if not chapters_details and llm_response.strip(): # Fallback if BEGIN/END structure failed entirely
-            print(f"PlotArchitectAgent: Error - No chapter blocks parsed with BEGIN/END markers. Treating response as single raw block for chapter 1. Response: {llm_response[:500]}")
-            chapters_details.append(PlotChapterDetail(
-                chapter_number=1, title="Chapter 1 (Global Parsing Error)", raw_llm_output_for_chapter=llm_response.strip(),
-                estimated_words=None, core_scene_summary=None, characters_present=None, key_events_and_plot_progression=None,
-                goal_and_conflict=None, turning_point=None, tone_and_style_notes=None, suspense_or_hook=None
-            ))
+        if not chapters_details and llm_response.strip():
+            # This case is less likely now with the fallback BEGIN CHAPTER split, but kept as a final safety net.
+            print(f"PlotArchitectAgent: Error - No chapter blocks parsed even with fallbacks. Treating response as single raw block for chapter 1. Response: {llm_response[:500]}")
+            # Create a default chapter detail if all parsing fails but there's content
+            default_chapter_detail = PlotChapterDetail(
+                chapter_number=1,
+                title="Chapter 1 (Global Parsing Error)",
+                raw_llm_output_for_chapter=llm_response.strip(),
+                estimated_words=None, core_scene_summary=None, characters_present=[],
+                key_events_and_plot_progression=None, goal_and_conflict=None,
+                turning_point=None, tone_and_style_notes=None, suspense_or_hook=None
+            )
+            chapters_details.append(default_chapter_detail)
+
         elif len(chapters_details) < num_chapters:
-            print(f"PlotArchitectAgent: Warning - Expected {num_chapters} chapters, but only parsed {len(chapters_details)} structured blocks.")
+            print(f"PlotArchitectAgent: Warning - Expected {num_chapters} chapters, but only parsed {len(chapters_details)} structured blocks successfully.")
 
         if chapters_details:
-             print(f"PlotArchitectAgent: Successfully parsed {len(chapters_details)} chapter structures.")
+             print(f"PlotArchitectAgent: Successfully parsed {len(chapters_details)} chapter structures from {len(chapter_blocks)} detected blocks.")
         else:
             print(f"PlotArchitectAgent: Error - No plot summaries could be parsed even with fallbacks.")
 

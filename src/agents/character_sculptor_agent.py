@@ -61,7 +61,15 @@ Relationships_Initial_Notes: [Brief ideas on how this character might relate to 
 Role_in_Story: [Briefly restate or refine their primary role based on the details generated, e.g., Protagonist, Antagonist, Mentor, Catalyst]
 END CHARACTER PROFILE:
 
-Provide detailed and creative information for each field. Ensure all requested fields are present.
+# General Guidance for Content Quality - Added to improve character depth and internal consistency.
+General Guidance for Content Quality:
+- Internal Consistency: Ensure the character's Background_Story clearly informs their Personality_Traits, Values_and_Beliefs, Motivations_Deep_Drive, and Goals.
+- World Alignment: Skills_and_Abilities and Special_Powers should be consistent with their Background_Story and the established Worldview Data provided in the Story Context. If listing powers, briefly note their origin or nature if unique.
+- Character Growth: For Character_Arc_Potential, describe a plausible growth trajectory or change this character might undergo, considering their stated strengths, weaknesses, and motivations.
+- Relational Potential: For Relationships_Initial_Notes, suggest how this character's personality and goals might lead to specific types of interactions (alliances, conflicts, friendships, rivalries) with other potential characters or story elements.
+- Overall: Create a character that is not only detailed but also feels internally consistent and has clear potential to contribute meaningfully to the provided Narrative Outline and Overall Plot Summary.
+
+Provide detailed and creative information for each field. Ensure all requested fields are present and adhere to the content quality guidance.
 """
         return prompt
 
@@ -73,7 +81,6 @@ Provide detailed and creative information for each field. Ensure all requested f
             return None # Return None if "None", "N/A", or empty, to distinguish from an empty list from empty value
 
         try:
-            # Ensure the entire profile block is captured first
             profile_block_match = re.search(r"BEGIN CHARACTER PROFILE:(.*?)END CHARACTER PROFILE:", llm_response, re.DOTALL | re.IGNORECASE)
             if not profile_block_match:
                 print(f"CharacterSculptorAgent: Error - Could not find 'BEGIN CHARACTER PROFILE:' and 'END CHARACTER PROFILE:' delimiters. Response: {llm_response[:500]}")
@@ -81,51 +88,99 @@ Provide detailed and creative information for each field. Ensure all requested f
 
             block_text = profile_block_match.group(1).strip()
 
-            profile = DetailedCharacterProfile(
+            # Initialize profile with defaults, including novel_id and creation_date
+            profile_data = DetailedCharacterProfile(
                 character_id=None, novel_id=novel_id, creation_date=datetime.now(timezone.utc).isoformat(),
                 name="Unknown", gender=None, age=None, race_or_species=None, appearance_summary=None,
                 clothing_style=None, background_story=None, personality_traits=None, values_and_beliefs=None,
-                strengths=None, weaknesses=None, quirks_or_mannerisms=None, catchphrase_or_verbal_style=None,
-                skills_and_abilities=None, special_powers=None, power_level_assessment=None,
+                strengths=[], weaknesses=[], quirks_or_mannerisms=[], catchphrase_or_verbal_style=None,
+                skills_and_abilities=[], special_powers=[], power_level_assessment=None,
                 motivations_deep_drive=None, goal_short_term=None, goal_long_term=None,
                 character_arc_potential=None, relationships_initial_notes=None, role_in_story="Unknown Role",
-                raw_llm_output_for_character=block_text
+                raw_llm_output_for_character=block_text # Store the raw block for debugging
             )
 
-            # Regex to capture field content: "FieldName:\s*(.*?)(?=\n[A-Z_][\w\s]+:|$)"
-            # This looks for "FieldName:", captures content (.*?), until a lookahead finds a newline,
-            # followed by another capitalized field name and colon, or end of string.
-            def get_field(field_name: str, text_block: str) -> Optional[str]:
-                match = re.search(rf"^{field_name}:\s*(.*?)(?=\n[A-Z_][\w\s()]*:|$)", text_block, re.IGNORECASE | re.DOTALL | re.MULTILINE)
-                return match.group(1).strip() if match else None
+            # Helper for flexible field extraction
+            def get_flexible_field(field_variations: List[str], text: str, is_list_field: bool = False) -> Optional[Any]:
+                # Pattern: (PRIMARY_HEADING|ALT_HEADING1|ALT_HEADING2):\s*(.*?)(?=\n\s*\w[\w\s()\-]*:|$)
+                # Captures content until the next potential field heading or end of string.
+                regex_str = r"^(?:" + "|".join(re.escape(v) for v in field_variations) + r"):\s*(.*?)(?=\n\s*\w[\w\s()\-]*:|$)"
+                match = re.search(regex_str, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
 
-            profile['name'] = get_field("Name", block_text) or profile['name']
-            profile['gender'] = get_field("Gender", block_text)
-            profile['age'] = get_field("Age", block_text)
-            profile['race_or_species'] = get_field("Race_or_Species", block_text)
-            profile['appearance_summary'] = get_field("Appearance_Summary", block_text)
-            profile['clothing_style'] = get_field("Clothing_Style", block_text)
-            profile['background_story'] = get_field("Background_Story", block_text)
-            profile['personality_traits'] = get_field("Personality_Traits", block_text) # Kept as string for now, can be list too
-            profile['values_and_beliefs'] = get_field("Values_and_Beliefs", block_text)
+                field_display_name = field_variations[0]
 
-            profile['strengths'] = parse_list_field(get_field("Strengths", block_text))
-            profile['weaknesses'] = parse_list_field(get_field("Weaknesses", block_text))
-            profile['quirks_or_mannerisms'] = parse_list_field(get_field("Quirks_or_Mannerisms", block_text))
+                if match:
+                    value = match.group(1).strip()
+                    if not value:
+                        print(f"CharacterSculptorAgent: Warning - Field '{field_display_name}' found but content is empty.")
+                        return [] if is_list_field else None
 
-            profile['catchphrase_or_verbal_style'] = get_field("Catchphrase_or_Verbal_Style", block_text)
-            profile['skills_and_abilities'] = parse_list_field(get_field("Skills_and_Abilities", block_text))
-            profile['special_powers'] = parse_list_field(get_field("Special_Powers", block_text))
-            profile['power_level_assessment'] = get_field("Power_Level_Assessment", block_text)
-            profile['motivations_deep_drive'] = get_field("Motivations_Deep_Drive", block_text)
-            profile['goal_short_term'] = get_field("Goal_Short_Term", block_text)
-            profile['goal_long_term'] = get_field("Goal_Long_Term", block_text)
-            profile['character_arc_potential'] = get_field("Character_Arc_Potential", block_text)
-            profile['relationships_initial_notes'] = get_field("Relationships_Initial_Notes", block_text)
-            profile['role_in_story'] = get_field("Role_in_Story", block_text) or profile['role_in_story']
+                    if is_list_field:
+                        if value.lower() in ["none", "n/a"]: return [] # Explicit "None" means empty list
 
-            if profile['name'] == "Unknown": # If name wasn't parsed, it's a critical failure
-                print(f"CharacterSculptorAgent: Critical parsing failure - Name not found. Block: {block_text[:200]}")
+                        # Attempt comma separation
+                        items = [s.strip() for s in value.split(',') if s.strip()]
+
+                        # If comma results in one item with newlines, try newline splitting
+                        if len(items) == 1 and '\n' in items[0]:
+                            print(f"CharacterSculptorAgent: Info - Field '{field_display_name}' has single comma-item with newlines, trying newline split.")
+                            newline_items = []
+                            for line_item in items[0].split('\n'):
+                                line_item_stripped = line_item.strip()
+                                # Remove leading bullets/numbers
+                                line_item_cleaned = re.sub(r"^\s*[-*\d]+\.?\s*", "", line_item_stripped)
+                                if line_item_cleaned:
+                                    newline_items.append(line_item_cleaned)
+                            if newline_items: return newline_items
+                            else: # Fallback to the single comma-item if newline split fails
+                                 print(f"CharacterSculptorAgent: Warning - Field '{field_display_name}' newline split for list resulted in no items. Original: '{items[0]}'")
+                                 return items if items[0] else []
+                        return items
+                    return value
+                else:
+                    print(f"CharacterSculptorAgent: Warning - Field '{field_display_name}' not found in profile block. Block snippet: '{text[:100]}...'")
+                    return [] if is_list_field else None
+
+            # Define field variations for parsing
+            field_map: Dict[str, List[str]] = {
+                'name': ["Name"],
+                'gender': ["Gender"],
+                'age': ["Age"],
+                'race_or_species': ["Race_or_Species", "Race/Species", "Species"],
+                'appearance_summary': ["Appearance_Summary", "Appearance"],
+                'clothing_style': ["Clothing_Style", "Attire"],
+                'background_story': ["Background_Story", "Background", "History", "Backstory"],
+                'personality_traits': ["Personality_Traits", "Personality"], # Will be treated as string, can be list in other contexts
+                'values_and_beliefs': ["Values_and_Beliefs", "Values", "Beliefs"],
+                'strengths': ["Strengths"], # List field
+                'weaknesses': ["Weaknesses"], # List field
+                'quirks_or_mannerisms': ["Quirks_or_Mannerisms", "Quirks", "Mannerisms"], # List field
+                'catchphrase_or_verbal_style': ["Catchphrase_or_Verbal_Style", "Verbal Style", "Catchphrase"],
+                'skills_and_abilities': ["Skills_and_Abilities", "Skills", "Abilities"], # List field
+                'special_powers': ["Special_Powers", "Powers"], # List field
+                'power_level_assessment': ["Power_Level_Assessment", "Power Level"],
+                'motivations_deep_drive': ["Motivations_Deep_Drive", "Motivation", "Core Drive"],
+                'goal_short_term': ["Goal_Short_Term", "Short-Term Goal"],
+                'goal_long_term': ["Goal_Long_Term", "Long-Term Goal"],
+                'character_arc_potential': ["Character_Arc_Potential", "Character Arc", "Potential Arc"],
+                'relationships_initial_notes': ["Relationships_Initial_Notes", "Relationships"],
+                'role_in_story': ["Role_in_Story", "Role"]
+            }
+
+            list_type_keys = ['strengths', 'weaknesses', 'quirks_or_mannerisms', 'skills_and_abilities', 'special_powers']
+
+            for key, variations in field_map.items():
+                is_list = key in list_type_keys
+                parsed_value = get_flexible_field(variations, block_text, is_list_field=is_list)
+                if parsed_value is not None: # Assign if not None (empty list is not None)
+                    profile_data[key] = parsed_value
+                elif is_list: # Ensure list fields are at least empty lists if not found
+                    profile_data[key] = []
+
+
+            # Final check for critical fields like name
+            if not profile_data.get('name') or profile_data['name'] == "Unknown":
+                print(f"CharacterSculptorAgent: Critical parsing failure - Name not found or is 'Unknown'. Block: {block_text[:200]}")
                 return None
 
             return profile
