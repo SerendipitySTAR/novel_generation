@@ -27,13 +27,40 @@ class LoreKeeperAgent:
     def _prepare_text_from_plot(self, plot: Plot) -> str:
         return f"Main Plot Points: {plot['plot_summary']}"
 
-    def _prepare_texts_from_characters(self, characters: List[Character]) -> List[str]:
-        return [
-            f"Character: {c['name']}. Description: {c['description']}. Role: {c['role_in_story']}"
-            for c in characters
-        ]
+    def _prepare_texts_from_characters(self, characters) -> List[str]:
+        """
+        Prepare text descriptions from characters.
+        Handles both Character (DB model) and DetailedCharacterProfile objects.
+        """
+        texts = []
+        for c in characters:
+            name = c.get('name', 'Unknown')
+            role = c.get('role_in_story', 'Unknown role')
 
-    def initialize_knowledge_base(self, novel_id: int, outline: Outline, worldview: WorldView, plot: Plot, characters: List[Character]) -> None:
+            # Handle DetailedCharacterProfile (from CharacterSculptorAgent)
+            if 'background_story' in c or 'personality_traits' in c:
+                # This is a DetailedCharacterProfile
+                description_parts = []
+                if c.get('appearance_summary'):
+                    description_parts.append(f"Appearance: {c['appearance_summary']}")
+                if c.get('background_story'):
+                    description_parts.append(f"Background: {c['background_story']}")
+                if c.get('personality_traits'):
+                    description_parts.append(f"Personality: {c['personality_traits']}")
+                if c.get('motivations_deep_drive'):
+                    description_parts.append(f"Motivation: {c['motivations_deep_drive']}")
+
+                description = ". ".join(description_parts) if description_parts else "Detailed character profile available."
+            else:
+                # This is a Character (DB model) with a simple description field
+                description = c.get('description', 'No description available.')
+
+            text = f"Character: {name}. Description: {description}. Role: {role}"
+            texts.append(text)
+
+        return texts
+
+    def initialize_knowledge_base(self, novel_id: int, outline: Outline, worldview: WorldView, plot: Plot, characters) -> None:
         all_texts: List[str] = []
         all_metadatas: List[Dict[str, any]] = [] # 'any' is more appropriate here than str for metadata values
 
@@ -77,13 +104,18 @@ class LoreKeeperAgent:
         character_texts = self._prepare_texts_from_characters(characters)
         for char_text, char_obj in zip(character_texts, characters):
             all_texts.append(char_text)
-            all_metadatas.append({'source': 'character_bio', 'character_id': char_obj['id'], 'character_name': char_obj['name']})
+
+            # Handle both Character (DB model) and DetailedCharacterProfile objects
+            char_id = char_obj.get('id') or char_obj.get('character_id')
+            char_name = char_obj.get('name', 'Unknown')
+
+            all_metadatas.append({'source': 'character_bio', 'character_id': char_id, 'character_name': char_name})
             self.db_manager.add_kb_entry(
                 novel_id=novel_id,
                 entry_type='character_bio',
                 content_text=char_text,
                 embedding=None,
-                related_entities=[char_obj['name']] # Store character name as related entity
+                related_entities=[char_name] # Store character name as related entity
             )
 
         if all_texts:

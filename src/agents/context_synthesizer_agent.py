@@ -146,7 +146,7 @@ if __name__ == "__main__":
             "raw_llm_output_for_chapter": "..."
         }
     ]
-    plot_id_test = db_mngr.add_plot(novel_id_test, json.dumps(sample_plot_details_list))
+    plot_id_test = db_mngr.add_plot(novel_id_test, json.dumps(sample_plot_details_list, ensure_ascii=False, indent=2))
 
     db_mngr.update_novel_active_outline(novel_id_test, outline_id_test)
     db_mngr.update_novel_active_worldview(novel_id_test, worldview_id_test)
@@ -155,12 +155,12 @@ if __name__ == "__main__":
     # Add Characters (now storing DetailedCharacterProfile as JSON in description)
     char1_profile = DetailedCharacterProfile(character_id=None, novel_id=novel_id_test, name="Kael", role_in_story="Protagonist", creation_date=datetime.now(timezone.utc).isoformat(),
                                            personality_traits="Brave, Resourceful", motivations_deep_drive="Protect his village", goal_short_term="Find the Sunstone")
-    char1_desc_json = json.dumps({k:v for k,v in char1_profile.items() if k not in ['character_id', 'novel_id', 'creation_date', 'name', 'role_in_story']})
+    char1_desc_json = json.dumps({k:v for k,v in char1_profile.items() if k not in ['character_id', 'novel_id', 'creation_date', 'name', 'role_in_story']}, ensure_ascii=False, indent=2)
     char1_id = db_mngr.add_character(novel_id_test, char1_profile['name'], char1_desc_json, char1_profile['role_in_story'])
 
     char2_profile = DetailedCharacterProfile(character_id=None, novel_id=novel_id_test, name="Elder Maeve", role_in_story="Mentor", creation_date=datetime.now(timezone.utc).isoformat(),
                                            personality_traits="Wise, Mysterious", motivations_deep_drive="Preserve ancient knowledge", goal_short_term="Guide Kael")
-    char2_desc_json = json.dumps({k:v for k,v in char2_profile.items() if k not in ['character_id', 'novel_id', 'creation_date', 'name', 'role_in_story']})
+    char2_desc_json = json.dumps({k:v for k,v in char2_profile.items() if k not in ['character_id', 'novel_id', 'creation_date', 'name', 'role_in_story']}, ensure_ascii=False, indent=2)
     char2_id = db_mngr.add_character(novel_id_test, char2_profile['name'], char2_desc_json, char2_profile['role_in_story'])
 
     db_mngr.add_chapter(novel_id_test, 1, "The Call", "Content of chapter 1...", "Kael accepts the quest.")

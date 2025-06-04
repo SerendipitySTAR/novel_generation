@@ -1,6 +1,7 @@
 import re # Added for parsing
 from typing import List # Added for type hinting
 from src.llm_abstraction.llm_client import LLMClient
+from src.utils.dynamic_token_config import get_dynamic_max_tokens, log_token_usage
 import os # For API key check in test block
 
 class NarrativePathfinderAgent:
@@ -80,15 +81,18 @@ Please generate {num_outlines} distinct core creative overviews now:
         print(f"NarrativePathfinderAgent: Sending prompt for {num_outlines} outlines for theme '{user_theme}' to LLM.")
 
         try:
-            # Each overview requested is ~300 words. 1 word ~ 1.33 tokens. So ~400 tokens per overview.
-            # Add buffer for prompt itself and LLM's formatting/control tokens.
-            estimated_tokens_per_outline = 600 # Increased from 500
-            total_max_tokens = (estimated_tokens_per_outline * num_outlines) + 300 # Increased buffer from 200
+            # Calculate dynamic max_tokens based on content and requirements
+            context = {
+                "theme": user_theme,
+                "style": style_preferences
+            }
+            max_tokens = get_dynamic_max_tokens("narrative_pathfinder", context)
+            log_token_usage("narrative_pathfinder", max_tokens, context)
 
             llm_response_text = self.llm_client.generate_text(
                 prompt=prompt,
-                model_name="gpt-3.5-turbo",
-                max_tokens=total_max_tokens
+                model_name="gpt-4o-2024-08-06",
+                max_tokens=max_tokens
             )
             print("NarrativePathfinderAgent: Received outlines from LLM.")
 

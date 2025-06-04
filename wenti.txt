@@ -1,0 +1,10 @@
+异常结束：
+“二傻，别废话了，快下去！”师父周不二在暗处扯...
+ChapterChroniclerAgent (Ch 4): Final Parse Path: Initial->TitleOK->ContentOK->SummaryOK
+Chapter '《垃圾山上的奶茶香气，炼丹场里的一锅大乱炖》' (Chapter 4) saved with ID 4 for Novel ID 1.
+Chapter 4 generated and saved.
+DEBUG: _check_node_output called (execution #1)
+Previous node successful. Routing to continue.
+Executing Node: Lore Keeper Update KB for Chapter 4
+WARNING: Lore Keeper not initialized, skipping KB update for Chapter 4.
+/media/sc/data/sc/novel_generation/start.sh: 第 1 行： 2119644 已杀死               /media/sc/data/conda_envs/novels/bin/python /media/sc/data/sc/novel_generation/main.py --theme "废柴少女修仙日记" --style "搞笑幽默" --chapters 4 --words-per-chapter 1200 --auto-mode

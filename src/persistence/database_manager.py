@@ -1,10 +1,10 @@
 import sqlite3
 import json # Added for JSON deserialization
 from datetime import datetime, timezone
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from src.core.models import (
     Novel, Outline, WorldView, Plot, Character, Chapter, KnowledgeBaseEntry,
-    DetailedCharacterProfile # Added DetailedCharacterProfile
+    DetailedCharacterProfile, PlotChapterDetail # Added DetailedCharacterProfile and PlotChapterDetail
 )
 
 class DatabaseManager:
@@ -271,6 +271,60 @@ class DatabaseManager:
             print(f"Error adding character for novel {novel_id}: {e}")
             raise
 
+    def delete_character(self, character_id: int) -> bool:
+        """删除指定的角色"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM characters WHERE id = ?", (character_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error deleting character: {e}")
+            return False
+
+    def update_character(self, character_id: int, name: str = None, description: str = None, role_in_story: str = None) -> bool:
+        """更新角色信息"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                updates = []
+                params = []
+
+                if name is not None:
+                    updates.append("name = ?")
+                    params.append(name)
+                if description is not None:
+                    updates.append("description = ?")
+                    params.append(description)
+                if role_in_story is not None:
+                    updates.append("role_in_story = ?")
+                    params.append(role_in_story)
+
+                if not updates:
+                    return False
+
+                params.append(character_id)
+                query = f"UPDATE characters SET {', '.join(updates)} WHERE id = ?"
+                cursor.execute(query, params)
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error updating character: {e}")
+            return False
+
+    def clear_characters_for_novel(self, novel_id: int) -> bool:
+        """清除指定小说的所有角色"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM characters WHERE novel_id = ?", (novel_id,))
+                conn.commit()
+                return True
+        except sqlite3.Error as e:
+            print(f"Error clearing characters for novel {novel_id}: {e}")
+            return False
+
     def get_character_by_id(self, character_id: int) -> Optional[DetailedCharacterProfile]:
         try:
             with self._get_connection() as conn:
@@ -508,7 +562,7 @@ if __name__ == "__main__":
     # The agent would prepare this JSON part.
     profile_json_data = {k: v for k, v in detailed_profile_content.items()
                          if k not in ['character_id', 'novel_id', 'name', 'role_in_story', 'creation_date']}
-    description_json_str = json.dumps(profile_json_data)
+    description_json_str = json.dumps(profile_json_data, ensure_ascii=False, indent=2)
 
     char_id = db_manager.add_character(novel_id, char_name, description_json_str, char_role)
     print(f"Added character '{char_name}' with ID: {char_id}")
@@ -531,7 +585,7 @@ if __name__ == "__main__":
 
 
     # Test get_characters_for_novel
-    db_manager.add_character(novel_id, "Silas the Sly", json.dumps({"name": "Silas the Sly", "age": "40s", "background_story": "A cunning thief."}), "Antagonist")
+    db_manager.add_character(novel_id, "Silas the Sly", json.dumps({"name": "Silas the Sly", "age": "40s", "background_story": "A cunning thief."}, ensure_ascii=False, indent=2), "Antagonist")
     all_novel_chars = db_manager.get_characters_for_novel(novel_id)
     assert len(all_novel_chars) == 2, f"Expected 2 characters, got {len(all_novel_chars)}"
     print(f"\nRetrieved {len(all_novel_chars)} characters for Novel ID {novel_id}:")
@@ -546,7 +600,7 @@ if __name__ == "__main__":
         PlotChapterDetail(chapter_number=1, title="The Beginning", estimated_words=1000, core_scene_summary="Intro", characters_present=["Jax"], key_events_and_plot_progression="Event A", goal_and_conflict="Goal A", turning_point="None", tone_and_style_notes="Fast", suspense_or_hook="Hook A", raw_llm_output_for_chapter="..."),
         PlotChapterDetail(chapter_number=2, title="The Middle", estimated_words=1500, core_scene_summary="Middle part", characters_present=["Jax", "Silas"], key_events_and_plot_progression="Event B", goal_and_conflict="Goal B", turning_point="Big one", tone_and_style_notes="Slow", suspense_or_hook="Hook B", raw_llm_output_for_chapter="...")
     ]
-    plot_id = db_manager.add_plot(novel_id, json.dumps(sample_plot_details))
+    plot_id = db_manager.add_plot(novel_id, json.dumps(sample_plot_details, ensure_ascii=False, indent=2))
     retrieved_plot_obj = db_manager.get_plot_by_id(plot_id)
     assert retrieved_plot_obj is not None
     print(f"\nRetrieved Plot ID {plot_id}. Summary (JSON string): {retrieved_plot_obj['plot_summary'][:100]}...")

@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from src.llm_abstraction.llm_client import LLMClient
 from src.persistence.database_manager import DatabaseManager
 from src.core.models import Chapter
+from src.utils.dynamic_token_config import get_dynamic_max_tokens, log_token_usage
 
 class ChapterChroniclerAgent:
     def __init__(self, db_name: str = "novel_mvp.db"):
@@ -21,42 +22,40 @@ class ChapterChroniclerAgent:
             raise
         self.db_manager = DatabaseManager(db_name=db_name)
 
-    def _construct_prompt(self, chapter_brief: str, current_chapter_plot_summary: str, style_preferences: str) -> str:
+    def _construct_prompt(self, chapter_brief: str, current_chapter_plot_summary: str, style_preferences: str, words_per_chapter: int = 1000) -> str:
         # Prompt refined to be more explicit about using the plot summary and brief,
         # and the RAG context if demarcated in the brief.
         prompt = f"""You are a novelist writing a chapter. Adhere to the style: {style_preferences}.
 
-        Chapter Brief (context, characters, lore):
-        --- BEGIN CHAPTER BRIEF ---
-        {chapter_brief}
-        --- END CHAPTER BRIEF ---
+Chapter Brief (context, characters, lore):
+--- BEGIN CHAPTER BRIEF ---
+{chapter_brief}
+--- END CHAPTER BRIEF ---
 
-        Specific Plot for THIS Chapter: {current_chapter_plot_summary}
+Specific Plot for THIS Chapter: {current_chapter_plot_summary}
 
-        Your primary goal for this chapter's content is to flesh out the 'Specific Plot for THIS Chapter'.
-        Use the 'Chapter Brief' for essential background, character states, and relevant lore to ensure consistency.
-        Weave these elements together to write a compelling narrative for this chapter.
-        Refer to any 'Relevant Lore and Context' (often demarcated by '--- RELEVANT LORE AND CONTEXT ---') provided in the brief.
+Your primary goal for this chapter's content is to flesh out the 'Specific Plot for THIS Chapter'.
+Use the 'Chapter Brief' for essential background, character states, and relevant lore to ensure consistency.
+Weave these elements together to write a compelling narrative for this chapter.
+Refer to any 'Relevant Lore and Context' (often demarcated by '--- RELEVANT LORE AND CONTEXT ---') provided in the brief.
 
-        Your output MUST be structured with these exact headings on new lines:
-        Title:
-        [A compelling title for this chapter. Single line.]
+IMPORTANT: Your response must follow this EXACT format. Do not include any other text or explanations:
 
-        # Instructions for Content generation - focused on improving narrative quality.
-        Content:
-        [The full chapter text. Aim for approximately 700-1000 words.
-        It is CRUCIAL that the Content directly enacts and expands upon the 'Specific Plot for THIS Chapter' provided.
-        - Show, Don't Tell: Focus on vivid descriptions of settings, character actions, and emotions.
-        - Dialogue: Incorporate meaningful dialogue that reveals character personality, motivations, and advances the plot.
-        - Character Consistency: Ensure character behaviors, decisions, and speech patterns are consistent with their detailed profiles and motivations as described in the 'Chapter Brief'.
-        - Utilize Context: If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly weave these details into the narrative where appropriate to enhance world-building and consistency. Avoid large blocks of exposition (info-dumping).
-        - Pacing and Flow: Maintain a good narrative pace suitable for the chapter's events and tone.]
+Title:
+[Write a compelling title for this chapter here]
 
-        Summary:
-        [A concise 2-3 sentence summary of the key plot advancements, character developments, and critical outcomes that occurred *within this chapter's Content only*.]
+Content:
+[Write the full chapter text here. Aim for approximately {words_per_chapter} words.
+- Show, Don't Tell: Focus on vivid descriptions of settings, character actions, and emotions.
+- Dialogue: Incorporate meaningful dialogue that reveals character personality, motivations, and advances the plot.
+- Character Consistency: Ensure character behaviors, decisions, and speech patterns are consistent with their detailed profiles and motivations as described in the 'Chapter Brief'.
+- Utilize Context: If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly weave these details into the narrative where appropriate to enhance world-building and consistency. Avoid large blocks of exposition (info-dumping).
+- Pacing and Flow: Maintain a good narrative pace suitable for the chapter's events and tone.]
 
-        Ensure "Title:", "Content:", and "Summary:" are on their own lines. Do not add any other text before "Title:", or after the "Summary:" text.
-        """
+Summary:
+[Write a concise 2-3 sentence summary of the key plot advancements, character developments, and critical outcomes that occurred within this chapter only]
+
+Remember: Start with "Title:" on the first line, then "Content:" on a new line, then "Summary:" on a new line. Do not add any other text before or after these sections."""
         return prompt
 
     def _parse_llm_response(self, llm_response: str, novel_id: int, chapter_number: int) -> Optional[Dict[str, Any]]:
@@ -67,17 +66,20 @@ class ChapterChroniclerAgent:
             summary = "Summary not generated."
             parse_path = "Initial" # To log parsing attempts
 
-            # Robust regex for Title, Content, Summary
-            # Allow for potential whitespace variations and ensure markers are at the start of a line.
-            # Capture content non-greedily.
-            title_regex = r"^\s*Title:(.*?)$"
-            # Content: captures everything until "Summary:" or end of string if "Summary:" is missing
-            content_regex = r"^\s*Content:(.*?)(?=(?:\n\s*Summary:)|$)"
-            summary_regex = r"^\s*Summary:(.*)$"
+            # Clean the response first
+            cleaned_response = llm_response.strip()
 
-            title_match = re.search(title_regex, llm_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
-            content_match = re.search(content_regex, llm_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
-            summary_match = re.search(summary_regex, llm_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
+            # More robust regex patterns
+            # Title: captures everything after "Title:" until next section or newline
+            title_regex = r"^\s*Title:\s*(.*?)(?=\n\s*Content:|\n\s*Summary:|$)"
+            # Content: captures everything after "Content:" until "Summary:" or end
+            content_regex = r"^\s*Content:\s*(.*?)(?=\n\s*Summary:|$)"
+            # Summary: captures everything after "Summary:" until end
+            summary_regex = r"^\s*Summary:\s*(.*?)$"
+
+            title_match = re.search(title_regex, cleaned_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
+            content_match = re.search(content_regex, cleaned_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
+            summary_match = re.search(summary_regex, cleaned_response, re.MULTILINE | re.IGNORECASE | re.DOTALL)
 
             if title_match:
                 title_text = title_match.group(1).strip()
@@ -115,35 +117,82 @@ class ChapterChroniclerAgent:
                 parse_path += "->SummaryFail"
                 print(f"{parsing_log_prefix} Warning - 'Summary:' marker not found or not at start of a line.")
 
-            # Desperate Parse Fallback Logic
-            if content == "Content not generated." and llm_response.strip():
-                parse_path += "->DesperateParse"
-                print(f"{parsing_log_prefix} Info - Content not found via primary parsing. Attempting desperate fallback.")
+            # Enhanced Fallback Logic
+            if content == "Content not generated." and cleaned_response.strip():
+                parse_path += "->EnhancedFallback"
+                print(f"{parsing_log_prefix} Info - Content not found via primary parsing. Attempting enhanced fallback.")
 
-                temp_content = llm_response # Start with the full response
+                # Try alternative parsing strategies
+                lines = cleaned_response.split('\n')
+                title_found = False
+                content_found = False
+                summary_found = False
+                current_section = None
+                temp_content_lines = []
+                temp_title = ""
+                temp_summary = ""
 
-                # If title was found, try to remove it and anything before it
-                if title_match and title_match.group(0) in temp_content:
-                    temp_content = temp_content.split(title_match.group(0), 1)[-1]
-                    parse_path += "->DP_TitleStrip"
+                for line in lines:
+                    line_stripped = line.strip()
 
-                # If summary was found, try to remove it and anything after it
-                # This is tricky if summary is embedded within content.
-                # We assume if Summary marker was found, it's *after* the main content.
-                if summary_match and summary_match.group(0) in temp_content:
-                    temp_content = temp_content.split(summary_match.group(0), 1)[0]
-                    parse_path += "->DP_SummaryStrip"
+                    # Check for section markers
+                    if re.match(r'^\s*title\s*:', line_stripped, re.IGNORECASE):
+                        current_section = 'title'
+                        title_found = True
+                        # Extract title from same line if present
+                        title_content = re.sub(r'^\s*title\s*:\s*', '', line_stripped, flags=re.IGNORECASE)
+                        if title_content:
+                            temp_title = title_content
+                        continue
+                    elif re.match(r'^\s*content\s*:', line_stripped, re.IGNORECASE):
+                        current_section = 'content'
+                        content_found = True
+                        # Extract content from same line if present
+                        content_line = re.sub(r'^\s*content\s*:\s*', '', line_stripped, flags=re.IGNORECASE)
+                        if content_line:
+                            temp_content_lines.append(content_line)
+                        continue
+                    elif re.match(r'^\s*summary\s*:', line_stripped, re.IGNORECASE):
+                        current_section = 'summary'
+                        summary_found = True
+                        # Extract summary from same line if present
+                        summary_content = re.sub(r'^\s*summary\s*:\s*', '', line_stripped, flags=re.IGNORECASE)
+                        if summary_content:
+                            temp_summary = summary_content
+                        continue
 
-                # Remove "Content:" marker itself if it's at the beginning of what's left
-                temp_content = re.sub(r"^\s*Content:\s*", "", temp_content.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+                    # Add content to current section
+                    if current_section == 'title' and line_stripped:
+                        temp_title = line_stripped
+                    elif current_section == 'content' and line_stripped:
+                        temp_content_lines.append(line)
+                    elif current_section == 'summary' and line_stripped:
+                        if temp_summary:
+                            temp_summary += " " + line_stripped
+                        else:
+                            temp_summary = line_stripped
 
-                if temp_content:
-                    content = temp_content
-                    parse_path += "->DP_ContentFound"
-                    print(f"{parsing_log_prefix} Info - Desperate parse assigned remaining text to content.")
-                else:
-                    parse_path += "->DP_ContentFail"
-                    print(f"{parsing_log_prefix} Error - Desperate parse for content also resulted in empty content.")
+                # Apply fallback results
+                if temp_title and not title_match:
+                    title = temp_title
+                    parse_path += "->FB_TitleFound"
+
+                if temp_content_lines:
+                    content = '\n'.join(temp_content_lines).strip()
+                    parse_path += "->FB_ContentFound"
+
+                if temp_summary and not summary_match:
+                    summary = temp_summary
+                    parse_path += "->FB_SummaryFound"
+
+                # Last resort: use entire response as content if nothing else worked
+                if content == "Content not generated." and cleaned_response:
+                    # Remove any section headers and use the rest
+                    clean_content = re.sub(r'^\s*(title|content|summary)\s*:\s*', '', cleaned_response, flags=re.IGNORECASE | re.MULTILINE)
+                    if clean_content.strip():
+                        content = clean_content.strip()
+                        parse_path += "->FB_LastResort"
+                        print(f"{parsing_log_prefix} Info - Using entire response as content (last resort).")
 
             # Final check: If title was NOT found, but content was (either normally or via desperate parse)
             if not title_match and content != "Content not generated.":
@@ -167,13 +216,22 @@ class ChapterChroniclerAgent:
             return None
 
     def generate_and_save_chapter(self, novel_id: int, chapter_number: int, chapter_brief: str,
-                                  current_chapter_plot_summary: str, style_preferences: str) -> Optional[Chapter]:
-        prompt = self._construct_prompt(chapter_brief, current_chapter_plot_summary, style_preferences)
+                                  current_chapter_plot_summary: str, style_preferences: str,
+                                  words_per_chapter: int = 1000) -> Optional[Chapter]:
+        prompt = self._construct_prompt(chapter_brief, current_chapter_plot_summary, style_preferences, words_per_chapter)
+
+        # Calculate dynamic max_tokens based on content and requirements
+        context = {
+            "brief": chapter_brief,
+            "words_per_chapter": words_per_chapter
+        }
+        max_tokens = get_dynamic_max_tokens("chapter_chronicler", context)
+        log_token_usage("chapter_chronicler", max_tokens, context)
 
         print(f"ChapterChroniclerAgent: Sending prompt for Chapter {chapter_number} to LLM.")
         try:
             llm_response_text = self.llm_client.generate_text(
-                prompt=prompt, model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=2000
+                prompt=prompt, model_name="gpt-4o-2024-08-06", temperature=0.7, max_tokens=max_tokens
             )
             print(f"ChapterChroniclerAgent: Received response from LLM for Chapter {chapter_number}.")
         except Exception as e:
@@ -183,6 +241,10 @@ class ChapterChroniclerAgent:
         if not llm_response_text:
             print(f"ChapterChroniclerAgent: LLM returned an empty response for Chapter {chapter_number}.")
             return None
+
+        # Debug: Log the raw response for troubleshooting
+        print(f"ChapterChroniclerAgent: Raw LLM response length: {len(llm_response_text)} characters")
+        print(f"ChapterChroniclerAgent: Response preview (first 200 chars): {llm_response_text[:200]}...")
 
         parsed_chapter_data = self._parse_llm_response(llm_response_text, novel_id, chapter_number)
 

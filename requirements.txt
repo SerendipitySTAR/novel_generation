@@ -7,3 +7,4 @@ uvicorn[standard]
 pydantic
 python-dotenv
 requests
+sentence-transformers

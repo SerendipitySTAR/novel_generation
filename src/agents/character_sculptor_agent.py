@@ -1,9 +1,10 @@
 import re
 import json # For serializing to DB
+import traceback
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from src.llm_abstraction.llm_client import LLMClient
-from src.core.models import Character, DetailedCharacterProfile # Updated imports
+from src.core.models import DetailedCharacterProfile # Updated imports
 from src.persistence.database_manager import DatabaseManager
 import os
 from dotenv import load_dotenv
@@ -81,9 +82,31 @@ Provide detailed and creative information for each field. Ensure all requested f
             return None # Return None if "None", "N/A", or empty, to distinguish from an empty list from empty value
 
         try:
-            profile_block_match = re.search(r"BEGIN CHARACTER PROFILE:(.*?)END CHARACTER PROFILE:", llm_response, re.DOTALL | re.IGNORECASE)
+            # Enhanced parsing with multiple fallback strategies
+            profile_block_match = None
+
+            # Strategy 1: Try with colon first, then without colon
+            profile_block_match = re.search(r"BEGIN CHARACTER PROFILE:(.*?)END CHARACTER PROFILE:?", llm_response, re.DOTALL | re.IGNORECASE)
+
+            # Strategy 2: Try without colon
             if not profile_block_match:
-                print(f"CharacterSculptorAgent: Error - Could not find 'BEGIN CHARACTER PROFILE:' and 'END CHARACTER PROFILE:' delimiters. Response: {llm_response[:500]}")
+                profile_block_match = re.search(r"BEGIN CHARACTER PROFILE(.*?)END CHARACTER PROFILE", llm_response, re.DOTALL | re.IGNORECASE)
+
+            # Strategy 3: Try with more flexible delimiters
+            if not profile_block_match:
+                profile_block_match = re.search(r"(?:BEGIN|START).*?CHARACTER.*?PROFILE.*?:(.*?)(?:END|FINISH).*?CHARACTER.*?PROFILE", llm_response, re.DOTALL | re.IGNORECASE)
+
+            # Strategy 4: Look for character profile content without strict delimiters
+            if not profile_block_match:
+                # Look for Name: field as a starting point
+                name_match = re.search(r"Name:\s*(.+)", llm_response, re.IGNORECASE)
+                if name_match:
+                    # Use the entire response as the block
+                    profile_block_match = type('Match', (), {'group': lambda _, n: llm_response if n == 1 else None})()
+                    print(f"CharacterSculptorAgent: Warning - Using fallback parsing without strict delimiters.")
+
+            if not profile_block_match:
+                print(f"CharacterSculptorAgent: Error - Could not find character profile content. Response: {llm_response[:500]}")
                 return None
 
             block_text = profile_block_match.group(1).strip()
@@ -183,7 +206,7 @@ Provide detailed and creative information for each field. Ensure all requested f
                 print(f"CharacterSculptorAgent: Critical parsing failure - Name not found or is 'Unknown'. Block: {block_text[:200]}")
                 return None
 
-            return profile
+            return profile_data
 
         except Exception as e:
             print(f"CharacterSculptorAgent: Exception during LLM response parsing - {e}. Response: {llm_response[:500]}")
@@ -197,12 +220,24 @@ Provide detailed and creative information for each field. Ensure all requested f
             prompt = self._construct_prompt(narrative_outline, worldview_data_core_concept, plot_summary_str, concept)
 
             try:
+                # Calculate dynamic max_tokens based on content and requirements
+                context = {
+                    "outline": narrative_outline,
+                    "worldview": worldview_data_core_concept,
+                    "plot": plot_summary_str,
+                    "num_characters": 1  # Single character per call
+                }
+                from src.utils.dynamic_token_config import get_dynamic_max_tokens, log_token_usage
+                max_tokens_to_use = get_dynamic_max_tokens("character_sculptor", context)
+                log_token_usage("character_sculptor", max_tokens_to_use, context)
+
                 llm_response_text = self.llm_client.generate_text(
                     prompt=prompt,
-                    model_name="gpt-3.5-turbo",
-                    max_tokens=2000 # Increased for detailed profile
+                    model_name="gpt-4o-2024-08-06",
+                    max_tokens=max_tokens_to_use
                 )
-                print(f"CharacterSculptorAgent: Received response from LLM for concept '{concept}'.")
+                print(f"CharacterSculptorAgent: Received response from LLM for concept '{concept}'. Response length: {len(llm_response_text)}")
+                print(f"CharacterSculptorAgent: Response ends with: ...{llm_response_text[-100:]}")
             except Exception as e:
                 print(f"CharacterSculptorAgent: Error during LLM call for concept '{concept}' - {e}")
                 continue # Skip to next concept
@@ -216,7 +251,7 @@ Provide detailed and creative information for each field. Ensure all requested f
             if parsed_profile:
                 # Serialize the detailed profile for the description field, excluding DB-managed fields
                 profile_to_serialize = {k: v for k, v in parsed_profile.items() if k not in ['character_id', 'novel_id', 'creation_date']}
-                description_json = json.dumps(profile_to_serialize)
+                description_json = json.dumps(profile_to_serialize, ensure_ascii=False, indent=2)
 
                 char_name = parsed_profile.get('name', 'Unnamed Character')
                 char_role = parsed_profile.get('role_in_story', 'Unknown Role')
