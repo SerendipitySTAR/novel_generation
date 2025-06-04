@@ -94,7 +94,7 @@ Begin your review now:
             # LLMClient default is 1500. Prompt includes the outline.
             # A 300-word outline is ~400 tokens. Review text is <100 tokens.
             # 500-700 should be safe for the response part.
-            response_text = self.llm_client.generate_text(prompt, max_tokens=700)
+            response_text = self.llm_client.generate_text(prompt, max_tokens=32768)
             print("QualityGuardianAgent: Received review response from LLM.")
         except Exception as e:
             print(f"QualityGuardianAgent: Error during LLM call for outline review - {e}")

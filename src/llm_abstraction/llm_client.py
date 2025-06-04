@@ -8,22 +8,36 @@ class LLMClient:
         self.api_key = os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY environment variable not found. Please ensure it is set.")
-        # Note: openai.api_key = self.api_key is for older versions.
-        # For openai > 1.0, the key is passed to the client instance.
-        # However, the current create call doesn't use an explicit client instance,
-        # relying on the global openai.api_key or environment variable.
-        # For clarity and future-proofing, it's better to instantiate a client if possible,
-        # but the existing code structure for openai.chat.completions.create() might implicitly use it.
-        # For now, let's ensure the global is set if that's what the library version expects.
+
+        # Support for local models
+        self.base_url = os.getenv("OPENAI_BASE_URL", "http://localhost:8321/v1")
+        self.use_local_model = os.getenv("USE_LOCAL_MODEL", "true").lower() == "true"
+
+        # Create OpenAI client with custom base URL for local models
+        if self.use_local_model:
+            self.client = openai.OpenAI(
+                api_key=self.api_key,  # Can be dummy for local models
+                base_url=self.base_url
+            )
+            print(f"LLMClient: Using local model at {self.base_url}")
+        else:
+            self.client = openai.OpenAI(api_key=self.api_key)
+            print("LLMClient: Using OpenAI API")
+
+        # For backward compatibility with older code that might use global openai.api_key
         openai.api_key = self.api_key
 
 
-    def generate_text(self, prompt: str, model_name: str = "gpt-3.5-turbo", temperature: float = 0.7, max_tokens: int = 1500) -> str:
+    def generate_text(self, prompt: str, model_name: str = "gpt-3.5-turbo", temperature: float = 0.7, max_tokens: int = 32768) -> str:
         """
-        Generates text using the specified OpenAI model.
+        Generates text using the specified model (local or OpenAI).
         """
         try:
-            response = openai.chat.completions.create(
+            # Use the local model name if using local model
+            if self.use_local_model:
+                model_name = "gpt-4o-2024-08-06"  # Your local model's served name
+
+            response = self.client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant for creative writing."}, # Updated system prompt

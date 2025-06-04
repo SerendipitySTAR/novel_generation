@@ -1,0 +1,1 @@
+/media/sc/data/conda_envs/novels/bin/python /media/sc/data/sc/novel_generation/main.py --theme "废柴少女修仙日记" --style "搞笑幽默" --chapters 4 --words-per-chapter 1200 --auto-mode

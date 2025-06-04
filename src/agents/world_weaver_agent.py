@@ -132,17 +132,12 @@ Please generate {num_worldviews} distinct worldview options now, following the s
         prompt = self._construct_prompt(narrative_outline, num_worldviews)
         print(f"WorldWeaverAgent: Sending prompt for {num_worldviews} worldview options to LLM.")
 
-        # Estimate tokens: Each worldview has ~4 fields. ~50-100 words per field for concept, less for others.
-        # Say average 150-200 words per worldview. 200 words * 1.33 tokens/word = ~270 tokens.
-        # For 2 worldviews: ~540 tokens. Add buffer.
-        estimated_tokens_per_worldview = 400
-        total_max_tokens = (estimated_tokens_per_worldview * num_worldviews) + 300 # Buffer for prompt + formatting
-
+        # Use large max_tokens for detailed worldview generation with reasoning models
         try:
             llm_response_text = self.llm_client.generate_text(
                 prompt=prompt,
-                model_name="gpt-3.5-turbo",
-                max_tokens=total_max_tokens
+                model_name="gpt-4o-2024-08-06",
+                max_tokens=32768
             )
             print("WorldWeaverAgent: Received worldview options text from LLM.")
 
@@ -189,7 +184,7 @@ if __name__ == "__main__":
         if worldviews:
             # Using json.dumps for a more readable structured output if available
             try:
-                print(json.dumps(worldviews, indent=2))
+                print(json.dumps(worldviews, ensure_ascii=False, indent=2))
             except ImportError: # Fallback if json is not available for some reason
                 for i, worldview_detail in enumerate(worldviews):
                     print(f"\n--- Worldview Option {i+1} ---")

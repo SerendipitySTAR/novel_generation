@@ -2,6 +2,7 @@ import re
 from typing import List, Optional, Dict, Any # Added Dict, Any
 from src.llm_abstraction.llm_client import LLMClient
 from src.core.models import PlotChapterDetail
+from src.utils.dynamic_token_config import get_dynamic_max_tokens, log_token_usage
 import os
 import json
 import traceback
@@ -97,12 +98,13 @@ Please generate the detailed plot for {num_chapters} chapters now, following the
             block_chapter_num: Optional[int] = None # For logging
             ) -> Optional[Any]:
 
-            # Construct a regex pattern for field variations.
+            # Construct a more flexible regex pattern for field variations.
             # Example: (?:Title|Chapter Title|Header):
             # Captures content until the next potential field heading or end of string.
             # The lookahead `(?=\n\s*\w[\w\s()]*:|$)` tries to stop before a line that looks like "AnotherField: ..."
             # or end of string if no such line is found.
-            pattern_str = r"^(?:" + "|".join(re.escape(variation) for variation in field_name_variations) + r"):\s*(.*?)(?=\n\s*\w[\w\s()\-]*:|$)"
+            # Made more flexible to handle various formatting
+            pattern_str = r"(?:^|\n)\s*(?:" + "|".join(re.escape(variation) for variation in field_name_variations) + r")\s*[:：]\s*(.*?)(?=\n\s*\w[\w\s()\-]*\s*[:：]|$)"
 
             match = re.search(pattern_str, text_block, re.IGNORECASE | re.MULTILINE | re.DOTALL)
 
@@ -232,30 +234,42 @@ Please generate the detailed plot for {num_chapters} chapters now, following the
                 else:
                     print(f"PlotArchitectAgent: Warning (Ch {chapter_num_from_block}) - No number found in estimated_words string: '{parsed_values['estimated_words_str']}'.")
 
-            details['core_scene_summary'] = parsed_values['core_scene_summary']
+            details['core_scene_summary'] = parsed_values['core_scene_summary'] or "Scene summary to be determined"
             details['characters_present'] = parsed_values['characters_present'] if parsed_values['characters_present'] is not None else []
-            details['key_events_and_plot_progression'] = parsed_values['key_events_and_plot_progression']
-            details['goal_and_conflict'] = parsed_values['goal_and_conflict']
-            details['turning_point'] = parsed_values['turning_point']
-            details['tone_and_style_notes'] = parsed_values['tone_and_style_notes']
-            details['suspense_or_hook'] = parsed_values['suspense_or_hook']
+            details['key_events_and_plot_progression'] = parsed_values['key_events_and_plot_progression'] or "Plot progression to be determined"
+            details['goal_and_conflict'] = parsed_values['goal_and_conflict'] or "Goals and conflicts to be determined"
+            details['turning_point'] = parsed_values['turning_point'] or "Turning point to be determined"
+            details['tone_and_style_notes'] = parsed_values['tone_and_style_notes'] or "Tone to be determined"
+            details['suspense_or_hook'] = parsed_values['suspense_or_hook'] or "Hook to be determined"
 
             chapters_details.append(details)
             parsed_chapters_count += 1
 
         if not chapters_details and llm_response.strip():
             # This case is less likely now with the fallback BEGIN CHAPTER split, but kept as a final safety net.
-            print(f"PlotArchitectAgent: Error - No chapter blocks parsed even with fallbacks. Treating response as single raw block for chapter 1. Response: {llm_response[:500]}")
-            # Create a default chapter detail if all parsing fails but there's content
-            default_chapter_detail = PlotChapterDetail(
-                chapter_number=1,
-                title="Chapter 1 (Global Parsing Error)",
-                raw_llm_output_for_chapter=llm_response.strip(),
-                estimated_words=None, core_scene_summary=None, characters_present=[],
-                key_events_and_plot_progression=None, goal_and_conflict=None,
-                turning_point=None, tone_and_style_notes=None, suspense_or_hook=None
-            )
-            chapters_details.append(default_chapter_detail)
+            print(f"PlotArchitectAgent: Error - No chapter blocks parsed even with fallbacks. Treating response as single raw block for chapter 1.")
+            print(f"PlotArchitectAgent: Raw response (first 500 chars): {llm_response[:500]}")
+            print(f"PlotArchitectAgent: Raw response (last 200 chars): ...{llm_response[-200:]}")
+
+            # Try a more aggressive fallback parsing
+            fallback_chapter_detail = self._create_fallback_chapter_from_response(llm_response.strip(), 1)
+            if fallback_chapter_detail:
+                chapters_details.append(fallback_chapter_detail)
+            else:
+                # Create a minimal default chapter detail if all parsing fails
+                default_chapter_detail = PlotChapterDetail(
+                    chapter_number=1,
+                    title="Chapter 1 (Parsing Failed)",
+                    raw_llm_output_for_chapter=llm_response.strip(),
+                    estimated_words=1500, core_scene_summary="Scene details to be determined",
+                    characters_present=["Main character"],
+                    key_events_and_plot_progression="Plot progression to be determined",
+                    goal_and_conflict="Goals and conflicts to be determined",
+                    turning_point="Turning point to be determined",
+                    tone_and_style_notes="Tone to be determined",
+                    suspense_or_hook="Hook to be determined"
+                )
+                chapters_details.append(default_chapter_detail)
 
         elif len(chapters_details) < num_chapters:
             print(f"PlotArchitectAgent: Warning - Expected {num_chapters} chapters, but only parsed {len(chapters_details)} structured blocks successfully.")
@@ -267,24 +281,87 @@ Please generate the detailed plot for {num_chapters} chapters now, following the
 
         return chapters_details
 
+    def _create_fallback_chapter_from_response(self, llm_response: str, chapter_number: int) -> Optional[PlotChapterDetail]:
+        """
+        Aggressive fallback parsing when structured parsing fails.
+        Tries to extract any useful information from the response.
+        """
+        try:
+            # Try to find any title-like content
+            title_patterns = [
+                r'title[:\s]*([^\n]+)',
+                r'chapter\s*\d+[:\s]*([^\n]+)',
+                r'^([^.\n]{10,50})',  # First line that looks like a title
+            ]
+
+            title = f"Chapter {chapter_number}"
+            for pattern in title_patterns:
+                match = re.search(pattern, llm_response, re.IGNORECASE | re.MULTILINE)
+                if match:
+                    potential_title = match.group(1).strip()
+                    if len(potential_title) > 5 and len(potential_title) < 100:
+                        title = potential_title
+                        break
+
+            # Try to extract any scene or plot information
+            scene_summary = "Scene details extracted from response"
+            plot_progression = "Plot progression extracted from response"
+
+            # Look for any substantial text blocks
+            lines = [line.strip() for line in llm_response.split('\n') if line.strip()]
+            substantial_lines = [line for line in lines if len(line) > 20]
+
+            if substantial_lines:
+                # Use the first substantial line as scene summary if it's not the title
+                if len(substantial_lines) > 1:
+                    scene_summary = substantial_lines[1][:200] + "..." if len(substantial_lines[1]) > 200 else substantial_lines[1]
+
+                # Use another line for plot progression
+                if len(substantial_lines) > 2:
+                    plot_progression = substantial_lines[2][:200] + "..." if len(substantial_lines[2]) > 200 else substantial_lines[2]
+
+            fallback_detail = PlotChapterDetail(
+                chapter_number=chapter_number,
+                title=title,
+                raw_llm_output_for_chapter=llm_response,
+                estimated_words=1500,
+                core_scene_summary=scene_summary,
+                characters_present=["Main character"],
+                key_events_and_plot_progression=plot_progression,
+                goal_and_conflict="Character goals and conflicts to be refined",
+                turning_point="Turning point to be determined",
+                tone_and_style_notes="Tone to be determined based on story context",
+                suspense_or_hook="Chapter hook to be developed"
+            )
+
+            print(f"PlotArchitectAgent: Created fallback chapter detail for Chapter {chapter_number} with title: '{title}'")
+            return fallback_detail
+
+        except Exception as e:
+            print(f"PlotArchitectAgent: Error in fallback parsing: {e}")
+            return None
+
     def generate_plot_points(self, narrative_outline: str, worldview_data: str, num_chapters: int = 3) -> List[PlotChapterDetail]:
         if not narrative_outline: raise ValueError("Narrative outline cannot be empty.")
         if not worldview_data: raise ValueError("Worldview data cannot be empty.")
         if num_chapters <= 0: raise ValueError("Number of chapters must be positive.")
+        if num_chapters > 15: raise ValueError("Number of chapters cannot exceed 15 for quality and performance reasons.")
 
         prompt = self._construct_prompt(narrative_outline, worldview_data, num_chapters)
         print(f"PlotArchitectAgent: Sending prompt for {num_chapters} detailed chapter structures to LLM.")
 
-        # max_tokens needs to be substantial to accommodate detailed output for multiple chapters.
-        # Estimate tokens: Each field might be 50-100 words. ~9 fields = 450-900 words per chapter.
-        # 900 words * 1.33 tokens/word = ~1200 tokens per chapter.
-        # For 3 chapters: ~3600 tokens. Add prompt and buffer.
-        estimated_tokens_per_detailed_chapter = 1200
-        total_max_tokens = (estimated_tokens_per_detailed_chapter * num_chapters) + 600
+        # Calculate dynamic max_tokens based on content and requirements
+        context = {
+            "outline": narrative_outline,
+            "worldview": worldview_data,
+            "num_chapters": num_chapters
+        }
+        max_tokens_to_use = get_dynamic_max_tokens("plot_architect", context)
+        log_token_usage("plot_architect", max_tokens_to_use, context)
 
         try:
             llm_response_text = self.llm_client.generate_text(
-                prompt=prompt, model_name="gpt-3.5-turbo", max_tokens=total_max_tokens
+                prompt=prompt, model_name="gpt-4o-2024-08-06", max_tokens=max_tokens_to_use
             )
             print("PlotArchitectAgent: Received detailed chapter structures text from LLM.")
             parsed_chapter_details = self._parse_llm_response_to_list(llm_response_text, num_chapters)

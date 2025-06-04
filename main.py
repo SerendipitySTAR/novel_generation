@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import os
+import json
 import argparse
 from dotenv import load_dotenv
 
 from src.orchestration.workflow_manager import WorkflowManager, NovelWorkflowState # Assuming NovelWorkflowState is importable
 from src.persistence.database_manager import DatabaseManager # For direct DB access in main for final output
+from src.utils.token_calculator import NovelGenerationCostEstimator
 
 def setup_dummy_api_key():
     """
@@ -42,8 +44,36 @@ def parse_arguments() -> dict:
     parser = argparse.ArgumentParser(description="Novel Generation CLI")
     parser.add_argument("--theme", type=str, required=True, help="The theme for your novel.")
     parser.add_argument("--style", type=str, default="general fiction", help="Style preferences (e.g., 'fantasy, dark humor'). Defaults to 'general fiction'.")
+    parser.add_argument("--chapters", type=int, default=3, help="Number of chapters to generate (default: 3, min: 1, max: 15).")
+    parser.add_argument("--words-per-chapter", type=int, default=1000, help="Target words per chapter (default: 1000, min: 300, max: 3000).")
+    parser.add_argument("--skip-cost-estimate", action="store_true", help="Skip the token cost estimation and proceed directly to generation.")
+    parser.add_argument("--auto-mode", action="store_true", help="Enable automatic mode: skip user interactions and use default selections.")
     args = parser.parse_args()
-    return {"theme": args.theme, "style_preferences": args.style}
+
+    # Validate chapters argument
+    if args.chapters < 1:
+        print("Error: Number of chapters must be at least 1.")
+        exit(1)
+    elif args.chapters > 15:
+        print("Error: Number of chapters cannot exceed 15 for quality and performance reasons.")
+        exit(1)
+
+    # Validate words per chapter argument
+    if args.words_per_chapter < 300:
+        print("Error: Words per chapter must be at least 300.")
+        exit(1)
+    elif args.words_per_chapter > 3000:
+        print("Error: Words per chapter cannot exceed 3000 for quality and performance reasons.")
+        exit(1)
+
+    return {
+        "theme": args.theme,
+        "style_preferences": args.style,
+        "chapters": args.chapters,
+        "words_per_chapter": args.words_per_chapter,
+        "skip_cost_estimate": args.skip_cost_estimate,
+        "auto_mode": args.auto_mode
+    }
 
 def main_cli():
     """Main CLI function using argparse."""
@@ -53,6 +83,39 @@ def main_cli():
     user_input_data = parse_arguments()
     print(f"Theme: {user_input_data['theme']}")
     print(f"Style: {user_input_data['style_preferences']}")
+    print(f"Chapters: {user_input_data['chapters']}")
+    print(f"Words per chapter: {user_input_data['words_per_chapter']}")
+
+    # Token cost estimation
+    if not user_input_data['skip_cost_estimate']:
+        print("\n--- Token Cost Estimation ---")
+        cost_estimator = NovelGenerationCostEstimator()
+        cost_breakdown = cost_estimator.estimate_full_workflow_cost(user_input_data)
+
+        print(f"Estimated total tokens: {cost_breakdown['total_tokens']:,}")
+        print(f"  - Input tokens: {cost_breakdown['total_input_tokens']:,}")
+        print(f"  - Output tokens: {cost_breakdown['total_output_tokens']:,}")
+        print(f"Estimated cost: ${cost_breakdown['estimated_cost_usd']:.2f} USD")
+
+        print("\nDetailed breakdown by operation:")
+        for estimate in cost_breakdown['estimates']:
+            print(f"  {estimate.operation_name}:")
+            print(f"    Tokens: {estimate.total_tokens:,} (${estimate.estimated_cost_usd:.2f})")
+
+        # Ask for user confirmation
+        print(f"\nThis will generate a {user_input_data['chapters']}-chapter novel with approximately {user_input_data['words_per_chapter']} words per chapter.")
+        print(f"Estimated token usage: {cost_breakdown['total_tokens']:,} tokens")
+        print(f"Estimated cost: ${cost_breakdown['estimated_cost_usd']:.2f} USD")
+
+        while True:
+            user_choice = input("\nDo you want to proceed? (y/n): ").lower().strip()
+            if user_choice in ['y', 'yes']:
+                break
+            elif user_choice in ['n', 'no']:
+                print("Novel generation cancelled by user.")
+                return
+            else:
+                print("Please enter 'y' for yes or 'n' for no.")
 
     print("\nInitializing WorkflowManager...")
     # Assuming default DB name is handled by WorkflowManager and DatabaseManager
@@ -75,8 +138,15 @@ def main_cli():
 
 
     print("\nStarting novel generation workflow...")
-    final_state: NovelWorkflowState = manager.run_workflow(user_input_data)
-    print("\n--- Novel Generation Workflow Complete ---")
+    try:
+        final_state: NovelWorkflowState = manager.run_workflow(user_input_data)
+        print("\n--- Novel Generation Workflow Complete ---")
+    except Exception as e:
+        print(f"\n--- Novel Generation Workflow Failed ---")
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return
 
     # Display Output
     print("\n--- Generated Novel ---")
