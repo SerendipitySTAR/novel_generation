@@ -5,3 +5,44 @@ venv/
 build/
 dist/
 *.egg-info
+
+# 数据库文件
+*.db
+*.sqlite3
+*.sqlite
+
+# ChromaDB数据目录
+chroma_db/
+!chroma_db/.gitkeep
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+temp/
+
+# 备份文件
+*.backup
+*_backup_*
+
+# 测试输出
+test_output/
+test_results/
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 环境变量备份
+.env.*
+!.env.example
+!.env.template

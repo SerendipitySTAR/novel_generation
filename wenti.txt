@@ -1,10 +1,35 @@
-异常结束：
-“二傻，别废话了，快下去！”师父周不二在暗处扯...
+我使用如下代码：
+/media/sc/data/conda_envs/novels/bin/python /media/sc/data/sc/novel_generation/main.py --theme "废柴少女修仙日记" --style "搞笑幽默" --chapters 4 --words-per-chapter 1200 --auto-mode
+但总在最后异常终止，然后报错如下：
+...(内容省略)
 ChapterChroniclerAgent (Ch 4): Final Parse Path: Initial->TitleOK->ContentOK->SummaryOK
-Chapter '《垃圾山上的奶茶香气，炼丹场里的一锅大乱炖》' (Chapter 4) saved with ID 4 for Novel ID 1.
+Chapter '垃圾场藏龙：当扫帚侠教主成了灵力提款机' (Chapter 4) saved with ID 4 for Novel ID 1.
 Chapter 4 generated and saved.
 DEBUG: _check_node_output called (execution #1)
 Previous node successful. Routing to continue.
+DEBUG: execute_lore_keeper_update_kb - Starting for Chapter 4
 Executing Node: Lore Keeper Update KB for Chapter 4
-WARNING: Lore Keeper not initialized, skipping KB update for Chapter 4.
-/media/sc/data/sc/novel_generation/start.sh: 第 1 行： 2119644 已杀死               /media/sc/data/conda_envs/novels/bin/python /media/sc/data/sc/novel_generation/main.py --theme "废柴少女修仙日记" --style "搞笑幽默" --chapters 4 --words-per-chapter 1200 --auto-mode
+WARNING: No cached LoreKeeperAgent instance found, creating new one
+Database 'main_novel_generation.db' initialized successfully. All tables are ready.
+KnowledgeBaseManager: Attempting to use local embedding model at /media/sc/AI/self-llm/embed_model/sentence-transformers/all-MiniLM-L6-v2
+KnowledgeBaseManager: Successfully initialized local embeddings
+Updating knowledge base for novel 1 with chapter 4.
+Added 1 texts to Chroma collection for novel_id 1. Persisted.
+Lore Keeper KB updated with Chapter 4.
+DEBUG: execute_lore_keeper_update_kb - Successfully completed for Chapter 4
+KnowledgeBaseManager: Cleaned up vector store cache
+DEBUG: _check_node_output called (execution #1)
+Previous node successful. Routing to continue.
+DEBUG: increment_chapter_number - current: 4 -> 5
+DEBUG: increment_chapter_number - iterations: 3 -> 4
+DEBUG: increment_chapter_number - progress: 4/4 chapters
+/media/sc/data/sc/novel_generation/start.sh: 第 1 行： 491268 已杀死               /media/sc/data/conda_envs/novels/bin/python /media/sc/data/sc/novel_generation/main.py --theme "废柴少女修仙日记" --style "搞笑幽默" --chapters 4 --words-per-chapter 1200 --auto-mode
+
+
+现在我明白问题了！从日志可以看出：
+increment_chapter_number 成功执行，显示了调试信息：
+current: 4 -> 5
+iterations: 3 -> 4
+progress: 4/4 chapters
+但是我们没有看到 _should_continue_chapter_loop 的调试输出，这说明问题出现在 LangGraph 的条件边缘路由过程中。
+问题在于 increment_chapter_number 函数没有返回 Incrementing chapter number from 4 to 5 (iteration 4) 这个历史记录的输出，这意味着 _log_and_update_history 函数可能有问题，或者返回的状态不完整。

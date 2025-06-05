@@ -102,20 +102,23 @@ def main_cli():
             print(f"  {estimate.operation_name}:")
             print(f"    Tokens: {estimate.total_tokens:,} (${estimate.estimated_cost_usd:.2f})")
 
-        # Ask for user confirmation
+        # Ask for user confirmation (unless in auto mode)
         print(f"\nThis will generate a {user_input_data['chapters']}-chapter novel with approximately {user_input_data['words_per_chapter']} words per chapter.")
         print(f"Estimated token usage: {cost_breakdown['total_tokens']:,} tokens")
         print(f"Estimated cost: ${cost_breakdown['estimated_cost_usd']:.2f} USD")
 
-        while True:
-            user_choice = input("\nDo you want to proceed? (y/n): ").lower().strip()
-            if user_choice in ['y', 'yes']:
-                break
-            elif user_choice in ['n', 'no']:
-                print("Novel generation cancelled by user.")
-                return
-            else:
-                print("Please enter 'y' for yes or 'n' for no.")
+        if user_input_data.get('auto_mode', False):
+            print("\nAuto mode enabled: Proceeding automatically without user confirmation.")
+        else:
+            while True:
+                user_choice = input("\nDo you want to proceed? (y/n): ").lower().strip()
+                if user_choice in ['y', 'yes']:
+                    break
+                elif user_choice in ['n', 'no']:
+                    print("Novel generation cancelled by user.")
+                    return
+                else:
+                    print("Please enter 'y' for yes or 'n' for no.")
 
     print("\nInitializing WorkflowManager...")
     # Assuming default DB name is handled by WorkflowManager and DatabaseManager
