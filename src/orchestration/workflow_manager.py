@@ -3,7 +3,16 @@ from typing import TypedDict, Any, List, Annotated, Dict, Optional
 import operator
 import os
 import json
+import gc
 from dotenv import load_dotenv
+
+# 尝试导入 psutil，如果不可用则使用基本的内存监控
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("WARNING: psutil not available, memory monitoring will be limited")
 
 # Agent Imports
 from src.agents.narrative_pathfinder_agent import NarrativePathfinderAgent
@@ -23,6 +32,7 @@ from src.core.models import PlotChapterDetail, Plot, Character, Chapter, Outline
 class UserInput(TypedDict):
     theme: str
     style_preferences: Optional[str]
+    chapters: Optional[int]  # 新增：用户指定的章节数
     words_per_chapter: Optional[int]
     auto_mode: Optional[bool]  # 新增：自动模式，跳过用户交互
 
@@ -59,16 +69,79 @@ class NovelWorkflowState(TypedDict):
     max_loop_iterations: int
     execution_count: int  # 新增：执行计数器防止无限循环
 
+# --- Utility Functions ---
+def _get_memory_usage() -> str:
+    """获取当前内存使用情况"""
+    if PSUTIL_AVAILABLE:
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            return f"{memory_mb:.1f}MB"
+        except Exception:
+            pass
+    return "N/A"
+
+def _log_memory_usage(context: str = ""):
+    """记录内存使用情况"""
+    memory_usage = _get_memory_usage()
+    print(f"DEBUG: Memory usage {context}: {memory_usage}")
+
+    # 如果内存使用超过阈值，强制垃圾回收
+    if PSUTIL_AVAILABLE:
+        try:
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            if memory_mb > 1000:  # 超过1GB时强制垃圾回收
+                print(f"WARNING: High memory usage ({memory_mb:.1f}MB), forcing garbage collection")
+                collected = gc.collect()
+                print(f"DEBUG: Garbage collected {collected} objects")
+
+                # 如果内存使用超过4GB，发出严重警告
+                if memory_mb > 4000:
+                    print(f"CRITICAL: Very high memory usage ({memory_mb:.1f}MB), system may be unstable")
+        except Exception:
+            pass
+
+def _aggressive_memory_cleanup():
+    """激进的内存清理"""
+    try:
+        import gc
+        # 强制垃圾回收
+        collected = gc.collect()
+        print(f"DEBUG: Aggressive cleanup collected {collected} objects")
+
+        # 清理未引用的循环
+        gc.set_debug(gc.DEBUG_UNCOLLECTABLE)
+        collected_cycles = gc.collect()
+        print(f"DEBUG: Cleaned up {collected_cycles} reference cycles")
+
+        return True
+    except Exception as e:
+        print(f"WARNING: Aggressive memory cleanup failed: {e}")
+        return False
+
 # --- Node Functions ---
 def _log_and_update_history(current_history: List[str], message: str, error: bool = False) -> List[str]:
+    # 限制历史记录长度以防止内存泄漏
+    MAX_HISTORY_LENGTH = 100  # 只保留最近100条记录
+
     updated_history = current_history + [message]
     if error: print(f"Error: {message}")
     else: print(message)
+
+    # 如果历史记录过长，只保留最近的记录
+    if len(updated_history) > MAX_HISTORY_LENGTH:
+        # 保留前10条（初始化信息）和最后90条（最近的操作）
+        updated_history = updated_history[:10] + ["... (历史记录已截断) ..."] + updated_history[-(MAX_HISTORY_LENGTH-11):]
+        print(f"DEBUG: History truncated to {len(updated_history)} entries to prevent memory leak")
+
     return updated_history
 
 def execute_narrative_pathfinder_agent(state: NovelWorkflowState) -> Dict[str, Any]:
     # 更新执行计数器
     execution_count = state.get("execution_count", 0) + 1
+    print(f"DEBUG: execute_narrative_pathfinder_agent - execution_count: {execution_count}")
 
     history = _log_and_update_history(state.get("history", []), "Executing Node: Narrative Pathfinder Agent")
     try:
@@ -82,21 +155,51 @@ def execute_narrative_pathfinder_agent(state: NovelWorkflowState) -> Dict[str, A
         )
         if all_outlines:
             history = _log_and_update_history(history, f"Successfully generated {len(all_outlines)} outlines.")
-            return {"all_generated_outlines": all_outlines, "history": history, "error_message": None, "execution_count": execution_count}
+            # 确保返回完整的状态更新，而不是部分更新
+            result = dict(state)  # 复制当前状态
+            result.update({
+                "all_generated_outlines": all_outlines,
+                "history": history,
+                "error_message": None,
+                "execution_count": execution_count
+            })
+            print(f"DEBUG: execute_narrative_pathfinder_agent - returning success with {len(all_outlines)} outlines")
+            return result
         else:
             msg = "Narrative Pathfinder Agent returned no outlines."
-            return {"error_message": msg, "history": _log_and_update_history(history, msg, True), "execution_count": execution_count}
+            result = dict(state)
+            result.update({
+                "error_message": msg,
+                "history": _log_and_update_history(history, msg, True),
+                "execution_count": execution_count
+            })
+            return result
     except Exception as e:
         msg = f"Error in Narrative Pathfinder Agent node: {e}"
-        return {"error_message": msg, "history": _log_and_update_history(history, msg, True), "execution_count": execution_count}
+        result = dict(state)
+        result.update({
+            "error_message": msg,
+            "history": _log_and_update_history(history, msg, True),
+            "execution_count": execution_count
+        })
+        return result
 
 def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
+    execution_count = state.get("execution_count", 0) + 1
+    print(f"DEBUG: present_outlines_for_selection_cli - execution_count: {execution_count}")
+
     history = _log_and_update_history(state.get("history", []), "Node: Present Outlines for Selection (CLI)")
     print("\n=== Outline Selection ===")
     all_outlines = state.get("all_generated_outlines")
     if not all_outlines:
         error_msg = "No outlines available for selection."
-        return {"error_message": error_msg, "history": _log_and_update_history(history, error_msg, True)}
+        result = dict(state)
+        result.update({
+            "error_message": error_msg,
+            "history": _log_and_update_history(history, error_msg, True),
+            "execution_count": execution_count
+        })
+        return result
 
     # 显示所有大纲选项
     for i, outline_text in enumerate(all_outlines):
@@ -134,9 +237,22 @@ def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
     history = _log_and_update_history(history, log_msg)
     selected_outline_text = all_outlines[selected_index]
     print(f"Proceeding with Outline {selected_index + 1}.")
-    return {"narrative_outline_text": selected_outline_text, "history": history, "error_message": None}
+
+    # 确保返回完整的状态更新
+    result = dict(state)
+    result.update({
+        "narrative_outline_text": selected_outline_text,
+        "history": history,
+        "error_message": None,
+        "execution_count": execution_count
+    })
+    print(f"DEBUG: present_outlines_for_selection_cli - returning success with selected outline")
+    return result
 
 def persist_novel_record_node(state: NovelWorkflowState) -> Dict[str, Any]:
+    execution_count = state.get("execution_count", 0) + 1
+    print(f"DEBUG: persist_novel_record_node - execution_count: {execution_count}")
+
     history = _log_and_update_history(state.get("history", []), "Executing Node: Persist Novel Record")
     try:
         user_input = state["user_input"]
@@ -144,10 +260,27 @@ def persist_novel_record_node(state: NovelWorkflowState) -> Dict[str, Any]:
         new_novel_id = db_manager.add_novel(user_theme=user_input["theme"], style_preferences=user_input.get("style_preferences", ""))
         novel_data = db_manager.get_novel_by_id(new_novel_id)
         history = _log_and_update_history(history, f"Novel record saved to DB with ID: {new_novel_id}.")
-        return {"novel_id": new_novel_id, "novel_data": novel_data, "history": history, "error_message": None}
+
+        # 确保返回完整的状态更新
+        result = dict(state)
+        result.update({
+            "novel_id": new_novel_id,
+            "novel_data": novel_data,
+            "history": history,
+            "error_message": None,
+            "execution_count": execution_count
+        })
+        print(f"DEBUG: persist_novel_record_node - returning success with novel_id: {new_novel_id}")
+        return result
     except Exception as e:
         msg = f"Error in Persist Novel Record node: {e}"
-        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        result = dict(state)
+        result.update({
+            "error_message": msg,
+            "history": _log_and_update_history(history, msg, True),
+            "execution_count": execution_count
+        })
+        return result
 
 def persist_initial_outline_node(state: NovelWorkflowState) -> Dict[str, Any]:
     history = _log_and_update_history(state.get("history", []), "Executing Node: Persist Initial Outline")
@@ -301,7 +434,14 @@ def execute_plot_architect_agent(state: NovelWorkflowState) -> Dict[str, Any]:
         worldview_text_for_plot = selected_worldview.get('core_concept', '')
         if not worldview_text_for_plot and selected_worldview.get('raw_llm_output_for_worldview'):
             worldview_text_for_plot = selected_worldview['raw_llm_output_for_worldview']
-        num_chapters_for_plot = state.get("total_chapters_to_generate", 3)
+        # 优先使用用户输入的章节数
+        user_input = state.get("user_input", {})
+        num_chapters_for_plot = user_input.get("chapters", 0) if user_input else 0
+
+        # 如果用户输入中没有章节数，尝试从state中获取（向后兼容）
+        if num_chapters_for_plot == 0:
+            num_chapters_for_plot = state.get("total_chapters_to_generate", 3)
+
         history = _log_and_update_history(history, f"Calling PlotArchitectAgent for {num_chapters_for_plot} detailed chapter structures.")
         agent = PlotArchitectAgent()
         detailed_plot_data_list = agent.generate_plot_points(
@@ -434,7 +574,13 @@ def prepare_for_chapter_loop(state: NovelWorkflowState) -> Dict[str, Any]:
         return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
     # 优先使用用户输入的章节数，而不是detailed_plot的长度
-    user_requested_chapters = state.get("total_chapters_to_generate", 0)
+    user_input = state.get("user_input", {})
+    user_requested_chapters = user_input.get("chapters", 0) if user_input else 0
+
+    # 如果用户输入中没有章节数，尝试从state中获取（向后兼容）
+    if user_requested_chapters == 0:
+        user_requested_chapters = state.get("total_chapters_to_generate", 0)
+
     plot_chapters_count = len(detailed_plot)
 
     if plot_chapters_count == 0:
@@ -597,6 +743,7 @@ def execute_chapter_chronicler_agent(state: NovelWorkflowState) -> Dict[str, Any
 
 def execute_lore_keeper_update_kb(state: NovelWorkflowState) -> Dict[str, Any]:
     current_chapter_num = state['current_chapter_number']
+    print(f"DEBUG: execute_lore_keeper_update_kb - Starting for Chapter {current_chapter_num}")
     history = _log_and_update_history(state.get("history", []), f"Executing Node: Lore Keeper Update KB for Chapter {current_chapter_num}")
 
     # 检查知识库是否已初始化
@@ -604,6 +751,7 @@ def execute_lore_keeper_update_kb(state: NovelWorkflowState) -> Dict[str, Any]:
         warning_msg = f"Lore Keeper not initialized, skipping KB update for Chapter {current_chapter_num}."
         print(f"WARNING: {warning_msg}")
         history = _log_and_update_history(history, warning_msg)
+        print(f"DEBUG: execute_lore_keeper_update_kb - Completed (skipped) for Chapter {current_chapter_num}")
         return {"history": history, "error_message": None}  # 继续工作流程
 
     try:
@@ -625,7 +773,34 @@ def execute_lore_keeper_update_kb(state: NovelWorkflowState) -> Dict[str, Any]:
 
             lore_keeper.update_knowledge_base_with_chapter(novel_id, last_chapter)
             history = _log_and_update_history(history, f"Lore Keeper KB updated with Chapter {last_chapter['chapter_number']}.")
-            return {"history": history, "error_message": None}
+            print(f"DEBUG: execute_lore_keeper_update_kb - Successfully completed for Chapter {current_chapter_num}")
+
+            # 强制清理向量存储缓存以释放内存
+            if hasattr(lore_keeper, 'kb_manager') and hasattr(lore_keeper.kb_manager, 'cleanup_resources'):
+                try:
+                    lore_keeper.kb_manager.cleanup_resources()
+                    print(f"DEBUG: execute_lore_keeper_update_kb - Cleaned up KB manager resources")
+                except Exception as cleanup_error:
+                    print(f"WARNING: Failed to cleanup KB manager resources: {cleanup_error}")
+
+            # 清理向量存储缓存
+            if hasattr(lore_keeper, 'kb_manager') and hasattr(lore_keeper.kb_manager, '_vector_store_cache'):
+                try:
+                    lore_keeper.kb_manager._vector_store_cache.clear()
+                    print(f"DEBUG: execute_lore_keeper_update_kb - Cleared vector store cache")
+                except Exception as cache_error:
+                    print(f"WARNING: Failed to clear vector store cache: {cache_error}")
+
+            # 强制垃圾回收
+            import gc
+            collected = gc.collect()
+            print(f"DEBUG: execute_lore_keeper_update_kb - Garbage collected {collected} objects")
+            _log_memory_usage("after lore_keeper_update_kb cleanup")
+
+            print(f"DEBUG: execute_lore_keeper_update_kb - About to return result")
+            result = {"history": history, "error_message": None}
+            print(f"DEBUG: execute_lore_keeper_update_kb - Returning: {list(result.keys())}")
+            return result
         except Exception as kb_error:
             # 如果知识库更新失败，记录警告但继续工作流程
             warning_msg = f"Warning: Failed to update knowledge base for Chapter {current_chapter_num} ({kb_error}), continuing workflow."
@@ -638,37 +813,82 @@ def execute_lore_keeper_update_kb(state: NovelWorkflowState) -> Dict[str, Any]:
         return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
 def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
+    # 记录内存使用情况
+    _log_memory_usage("before increment_chapter_number")
+
     current_num = state.get("current_chapter_number", 0)
-    new_num = current_num + 1
+    total_chapters = state.get("total_chapters_to_generate", 0)
+    generated_chapters = state.get("generated_chapters", [])
 
     # 增加循环计数器以防止无限循环
     current_iterations = state.get("loop_iteration_count", 0)
     new_iterations = current_iterations + 1
 
+    print(f"DEBUG: increment_chapter_number - current: {current_num}")
+    print(f"DEBUG: increment_chapter_number - iterations: {current_iterations} -> {new_iterations}")
+    print(f"DEBUG: increment_chapter_number - progress: {len(generated_chapters)}/{total_chapters} chapters")
+
+    # 关键修复：在递增章节号之前检查是否已经完成所有章节
+    if len(generated_chapters) >= total_chapters:
+        print(f"DEBUG: increment_chapter_number - All chapters completed ({len(generated_chapters)}/{total_chapters}), NOT incrementing chapter number")
+        history = _log_and_update_history(state.get("history", []), f"All {total_chapters} chapters completed. Ready to end loop (iteration {new_iterations})")
+
+        # 不递增章节号，但更新迭代计数器
+        result = {
+            "current_chapter_number": current_num,  # 保持当前章节号不变
+            "loop_iteration_count": new_iterations,
+            "history": history,
+            "error_message": None
+        }
+        print(f"DEBUG: increment_chapter_number - Returning without incrementing: current_chapter_number={current_num}")
+        _log_memory_usage("after increment_chapter_number")
+        return result
+
+    # 如果还需要生成更多章节，则递增章节号
+    new_num = current_num + 1
+    print(f"DEBUG: increment_chapter_number - More chapters needed, incrementing: {current_num} -> {new_num}")
+
     history = _log_and_update_history(state.get("history", []), f"Incrementing chapter number from {current_num} to {new_num} (iteration {new_iterations})")
 
-    return {
+    print(f"DEBUG: increment_chapter_number - About to return state update")
+    print(f"DEBUG: increment_chapter_number - new_chapter_number: {new_num}")
+    print(f"DEBUG: increment_chapter_number - new_iterations: {new_iterations}")
+    print(f"DEBUG: increment_chapter_number - history length: {len(history)}")
+
+    # 确保返回完整的状态更新，包括所有必要的字段
+    result = {
         "current_chapter_number": new_num,
         "loop_iteration_count": new_iterations,
         "history": history,
         "error_message": None
     }
 
+    print(f"DEBUG: increment_chapter_number - Returning result with keys: {list(result.keys())}")
+    _log_memory_usage("after increment_chapter_number")
+    return result
+
 def cleanup_resources(state: NovelWorkflowState) -> Dict[str, Any]:
     """清理工作流程资源"""
+    print("DEBUG: cleanup_resources - Starting cleanup process")
     history = _log_and_update_history(state.get("history", []), "Executing Node: Cleanup Resources")
 
     try:
+        # 打印最终状态信息
+        total_chapters = state.get("total_chapters_to_generate", 0)
+        generated_chapters = state.get("generated_chapters", [])
+        print(f"DEBUG: cleanup_resources - Final status: {len(generated_chapters)}/{total_chapters} chapters generated")
+
         # 清理 LoreKeeperAgent 实例
         lore_keeper = state.get("lore_keeper_instance")
         if lore_keeper and hasattr(lore_keeper, 'kb_manager'):
             if hasattr(lore_keeper.kb_manager, 'cleanup_resources'):
                 lore_keeper.kb_manager.cleanup_resources()
-                print("Cleaned up LoreKeeperAgent resources")
+                print("DEBUG: cleanup_resources - Cleaned up LoreKeeperAgent resources")
 
         # 清理其他可能的资源
         # 可以在这里添加更多清理逻辑
 
+        print("DEBUG: cleanup_resources - Cleanup completed successfully")
         history = _log_and_update_history(history, "Resources cleaned up successfully")
         return {"history": history, "error_message": None}
 
@@ -684,51 +904,107 @@ def _check_node_output(state: NovelWorkflowState) -> str:
     max_executions = 100  # 设置最大执行次数
 
     print(f"DEBUG: _check_node_output called (execution #{execution_count})")
+    _log_memory_usage("in _check_node_output")
+
+    # 检查状态完整性
+    if not isinstance(state, dict):
+        print(f"ERROR: _check_node_output - Invalid state type: {type(state)}")
+        return "stop_on_error"
+
+    print(f"DEBUG: _check_node_output - State keys: {list(state.keys())}")
 
     if execution_count > max_executions:
         print(f"SAFETY: Maximum executions ({max_executions}) reached. Forcing workflow end.")
         return "stop_on_error"
 
-    if state.get("error_message"):
-        print(f"Error detected in previous node. Routing to END. Error: {state.get('error_message')}")
+    # 检查是否有错误消息
+    error_message = state.get("error_message")
+    if error_message:
+        print(f"DEBUG: _check_node_output - Found error_message: {error_message}")
         return "stop_on_error"
-    else:
-        print("Previous node successful. Routing to continue.")
-        return "continue"
+
+    # 确保状态更新正确传递
+    print(f"DEBUG: _check_node_output - No errors found, continuing workflow")
+    return "continue"
 
 def _should_continue_chapter_loop(state: NovelWorkflowState) -> str:
-    if state.get("error_message"):
-        print(f"Error detected before loop condition. Routing to END. Error: {state.get('error_message')}")
+    print("DEBUG: _should_continue_chapter_loop - Function called")
+    _log_memory_usage("in _should_continue_chapter_loop")
+
+    try:
+        # 添加状态完整性检查
+        if not isinstance(state, dict):
+            print(f"ERROR: _should_continue_chapter_loop - Invalid state type: {type(state)}")
+            return "end_loop_on_error"
+
+        print(f"DEBUG: _should_continue_chapter_loop - State keys: {list(state.keys())}")
+
+        if state.get("error_message"):
+            print(f"Error detected before loop condition. Routing to END. Error: {state.get('error_message')}")
+            return "end_loop_on_error"
+
+        current_chapter = state.get("current_chapter_number", 1)
+        total_chapters = state.get("total_chapters_to_generate", 0)
+        generated_chapters = state.get("generated_chapters", [])
+
+        print(f"DEBUG: _should_continue_chapter_loop - Received state values:")
+        print(f"DEBUG: _should_continue_chapter_loop - current_chapter: {current_chapter}")
+        print(f"DEBUG: _should_continue_chapter_loop - total_chapters: {total_chapters}")
+        print(f"DEBUG: _should_continue_chapter_loop - generated_chapters count: {len(generated_chapters) if generated_chapters else 0}")
+
+        # 验证关键值的有效性
+        if total_chapters <= 0:
+            print(f"ERROR: _should_continue_chapter_loop - Invalid total_chapters: {total_chapters}")
+            return "end_loop_on_error"
+
+        if not isinstance(generated_chapters, list):
+            print(f"ERROR: _should_continue_chapter_loop - Invalid generated_chapters type: {type(generated_chapters)}")
+            return "end_loop_on_error"
+
+        # 安全检查：防止无限循环
+        max_iterations = state.get("max_loop_iterations", total_chapters * 2)  # 允许一些重试
+        current_iterations = state.get("loop_iteration_count", 0)
+
+        print(f"DEBUG: _should_continue_chapter_loop - current_chapter: {current_chapter}, total_chapters: {total_chapters}, generated_chapters: {len(generated_chapters)}, iterations: {current_iterations}/{max_iterations}")
+
+        # 检查是否超过最大迭代次数
+        if current_iterations >= max_iterations:
+            print(f"SAFETY: Maximum loop iterations ({max_iterations}) reached. Forcing loop end to prevent infinite loop.")
+            return "end_loop_on_safety"
+
+        # 检查是否有异常的状态
+        if current_chapter > total_chapters + 5:  # 允许一些容错
+            print(f"SAFETY: Current chapter number ({current_chapter}) is abnormally high. Forcing loop end.")
+            return "end_loop_on_safety"
+
+        # 修复后的逻辑：基于已生成章节数量判断是否继续循环
+        # 如果已生成的章节数量少于目标数量，继续循环
+        if len(generated_chapters) < total_chapters:
+            print(f"Chapter loop: Generated {len(generated_chapters)}/{total_chapters} chapters. Need to generate chapter {current_chapter}. Continuing loop.")
+
+            # 在继续循环前进行内存清理
+            if PSUTIL_AVAILABLE:
+                try:
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / 1024 / 1024
+                    if memory_mb > 2000:  # 超过2GB时进行激进清理
+                        print(f"DEBUG: High memory usage before continuing loop ({memory_mb:.1f}MB), performing cleanup")
+                        _aggressive_memory_cleanup()
+                except Exception:
+                    pass
+
+            return "continue_loop"
+        else:
+            # 已生成的章节数量达到或超过目标数量，结束循环
+            print(f"Chapter loop: Generated {len(generated_chapters)}/{total_chapters} chapters. All chapters complete. Ending loop.")
+            print(f"DEBUG: _should_continue_chapter_loop - Final decision: END LOOP")
+            return "end_loop"
+
+    except Exception as e:
+        print(f"CRITICAL ERROR in _should_continue_chapter_loop: {e}")
+        import traceback
+        traceback.print_exc()
         return "end_loop_on_error"
-
-    current_chapter = state.get("current_chapter_number", 1)
-    total_chapters = state.get("total_chapters_to_generate", 0)
-    generated_chapters = state.get("generated_chapters", [])
-
-    # 安全检查：防止无限循环
-    max_iterations = state.get("max_loop_iterations", total_chapters * 2)  # 允许一些重试
-    current_iterations = state.get("loop_iteration_count", 0)
-
-    print(f"DEBUG: _should_continue_chapter_loop - current_chapter: {current_chapter}, total_chapters: {total_chapters}, generated_chapters: {len(generated_chapters)}, iterations: {current_iterations}/{max_iterations}")
-
-    # 检查是否超过最大迭代次数
-    if current_iterations >= max_iterations:
-        print(f"SAFETY: Maximum loop iterations ({max_iterations}) reached. Forcing loop end to prevent infinite loop.")
-        return "end_loop_on_safety"
-
-    # 检查是否有异常的状态
-    if current_chapter > total_chapters + 5:  # 允许一些容错
-        print(f"SAFETY: Current chapter number ({current_chapter}) is abnormally high. Forcing loop end.")
-        return "end_loop_on_safety"
-
-    # The logic should be: if we have generated fewer chapters than required, continue
-    # current_chapter is incremented AFTER each chapter is generated, so it represents the NEXT chapter to generate
-    if len(generated_chapters) < total_chapters:
-        print(f"Chapter loop: Generated {len(generated_chapters)}/{total_chapters} chapters. Need to generate chapter {current_chapter}. Continuing loop.")
-        return "continue_loop"
-    else:
-        print(f"Chapter loop: Generated {len(generated_chapters)}/{total_chapters} chapters. All chapters complete. Ending loop.")
-        return "end_loop"
 
 class WorkflowManager:
     def __init__(self, db_name="novel_mvp.db"):
@@ -804,6 +1080,7 @@ class WorkflowManager:
             user_input=UserInput(
                 theme=user_input_data.get("theme","A default theme if none provided"),
                 style_preferences=user_input_data.get("style_preferences"),
+                chapters=num_chapters,  # 新增：传递用户指定的章节数
                 words_per_chapter=words_per_chapter,
                 auto_mode=user_input_data.get("auto_mode", False)  # 新增：自动模式支持
             ),
@@ -836,10 +1113,19 @@ class WorkflowManager:
         recursion_limit = max(50, 15 + (4 * num_chapters) + 10)
         print(f"INFO: Setting recursion limit to {recursion_limit} for {num_chapters} chapters")
 
-        final_state = self.app.invoke(initial_state, {"recursion_limit": recursion_limit})
-        if final_state.get('error_message'):
-             print(f"Workflow error: {final_state.get('error_message')}")
-        return final_state
+        try:
+            print(f"DEBUG: Starting workflow execution with recursion_limit={recursion_limit}")
+            final_state = self.app.invoke(initial_state, {"recursion_limit": recursion_limit})
+            print(f"DEBUG: Workflow execution completed successfully")
+            if final_state.get('error_message'):
+                 print(f"Workflow error: {final_state.get('error_message')}")
+            return final_state
+        except Exception as e:
+            print(f"CRITICAL: Workflow execution failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
+            # 返回一个包含错误信息的状态
+            return initial_state.copy().update({"error_message": f"Workflow execution failed: {e}"}) or initial_state
 
 if __name__ == "__main__":
     print("--- Workflow Manager Full Integration Test ---")
