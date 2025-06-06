@@ -25,6 +25,8 @@ from src.agents.context_synthesizer_agent import ContextSynthesizerAgent
 from src.agents.chapter_chronicler_agent import ChapterChroniclerAgent
 from src.agents.quality_guardian_agent import QualityGuardianAgent # Import added
 from src.agents.content_integrity_agent import ContentIntegrityAgent
+from src.agents.conflict_detection_agent import ConflictDetectionAgent
+from src.llm_abstraction.llm_client import LLMClient # Ensure LLMClient is imported
 
 # Persistence and Core Models
 from src.persistence.database_manager import DatabaseManager
@@ -68,7 +70,9 @@ class NovelWorkflowState(TypedDict):
     db_name: Optional[str] # Add db_name field
     current_chapter_review: Optional[Dict[str, Any]]
     current_chapter_quality_passed: Optional[bool]
+    current_chapter_conflicts: Optional[List[Dict[str, Any]]]
     auto_decision_engine: Optional[AutoDecisionEngine] # New field
+    knowledge_graph_data: Optional[Dict[str, Any]]
     # 循环安全参数
     loop_iteration_count: int
     max_loop_iterations: int
@@ -929,6 +933,140 @@ def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
     _log_memory_usage("after increment_chapter_number")
     return result
 
+def generate_kb_visualization_data(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Executing Node: Generate KB Visualization Data")
+    print("Executing Node: Generate KB Visualization Data")
+
+    novel_id = state.get("novel_id")
+    if novel_id is None:
+        msg = "Novel ID not found, cannot generate KB visualization data."
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+    try:
+        # LoreKeeperAgent might have been initialized and cached in the state earlier
+        # For simplicity, we'll assume it can be instantiated here if needed,
+        # or that this node runs where 'lore_keeper_instance' is available.
+        # If 'lore_keeper_instance' is reliably in state from 'lore_keeper_initialize':
+        # lore_keeper = state.get("lore_keeper_instance")
+        # if not lore_keeper:
+        #    lore_keeper = LoreKeeperAgent(db_name=state.get("db_name", "novel_mvp.db"))
+        # else:
+        #    print("Using cached LoreKeeperAgent instance for KB viz data.")
+
+        # For this subtask, let's instantiate it directly.
+        # Ensure db_name is correctly passed if not using a cached instance.
+        db_name = state.get("db_name", "novel_mvp.db")
+        lore_keeper = LoreKeeperAgent(db_name=db_name) # Requires LLMClient for full init
+
+        graph_data = lore_keeper.get_knowledge_graph_data(novel_id)
+        history = _log_and_update_history(history, f"Successfully generated knowledge graph data. Nodes: {len(graph_data.get('nodes',[]))}, Edges: {len(graph_data.get('edges',[]))}")
+
+        result = dict(state)
+        result.update({
+            "knowledge_graph_data": graph_data,
+            "history": history,
+            "error_message": None
+        })
+        return result
+
+    except Exception as e:
+        msg = f"Error in Generate KB Visualization Data node: {e}"
+        print(f"ERROR: {msg}")
+        result = dict(state)
+        result.update({
+            "error_message": None, # Let workflow continue
+            "history": _log_and_update_history(history, msg, True),
+            "knowledge_graph_data": {"nodes": [], "edges": [], "error": msg}
+        })
+        return result
+
+def execute_conflict_detection(state: NovelWorkflowState) -> Dict[str, Any]:
+    current_chapter_num = state.get('current_chapter_number', 'Unknown')
+    history = _log_and_update_history(state.get("history", []), f"Executing Node: Conflict Detection for Chapter {current_chapter_num}")
+    print(f"Executing Node: Conflict Detection for Chapter {current_chapter_num}")
+
+    generated_chapters = state.get("generated_chapters", [])
+    if not generated_chapters:
+        msg = "No generated chapters found for conflict detection."
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+    last_chapter = generated_chapters[-1]
+    chapter_content = last_chapter.get("content")
+    chapter_title = last_chapter.get("title", f"Chapter {last_chapter.get('chapter_number', current_chapter_num)}")
+
+    if not chapter_content:
+        msg = f"Content for chapter '{chapter_title}' (Num: {current_chapter_num}) is missing for conflict detection."
+        return {
+            "history": _log_and_update_history(history, msg, True),
+            "current_chapter_conflicts": [{"error": msg, "description": msg}],
+            "error_message": None # Allow workflow to continue
+        }
+
+    try:
+        # Initialize LLMClient if not already available in a shared way
+        # For now, ConflictDetectionAgent can initialize its own if none is passed.
+        # A shared LLMClient instance passed via state would be more efficient.
+        llm_client_instance = LLMClient() # Or get from state if available
+
+        # LoreKeeperAgent instance might be needed. For now, agent handles it being None.
+        # lore_keeper_instance = state.get("lore_keeper_instance")
+
+        agent = ConflictDetectionAgent(llm_client=llm_client_instance) # Pass llm_client
+        history = _log_and_update_history(history, f"ConflictDetectionAgent instantiated for chapter '{chapter_title}'.")
+
+        # Prepare context for conflict detection (simplified for now)
+        # previous_chapters_summary = [...] # This would need to be built up
+        novel_ctx = {
+            "theme": state.get("user_input", {}).get("theme"),
+            "style": state.get("user_input", {}).get("style_preferences"),
+            "worldview_description": state.get("selected_worldview_detail", {}).get("core_concept")
+                                     if state.get("selected_worldview_detail") else
+                                     state.get("worldview_data", {}).get("description"),
+        }
+
+        conflicts = agent.detect_conflicts(
+            current_chapter_text=chapter_content,
+            current_chapter_number=last_chapter.get('chapter_number', 0),
+            # previous_chapters_summary=previous_chapters_summary, # Future enhancement
+            novel_context=novel_ctx
+        )
+        history = _log_and_update_history(history, f"Conflict detection completed for chapter '{chapter_title}'. Found {len(conflicts)} conflicts.")
+
+        print(f"--- Conflict Detection Report: Chapter '{chapter_title}' ---")
+        if conflicts:
+            for idx, conflict in enumerate(conflicts):
+                print(f"  Conflict {idx+1}: [{conflict.get('severity')}] {conflict.get('type')} - {conflict.get('description')}")
+        else:
+            print("  No conflicts detected.")
+        print("----------------------------------------------------")
+
+        auto_mode = state.get("user_input", {}).get("auto_mode", False)
+        if conflicts and auto_mode:
+            history = _log_and_update_history(history, "Auto-Mode: Conflicts detected. Phase 2: Placeholder for auto-resolution attempt.")
+            print("INFO: Auto-Mode: Conflicts detected. Placeholder for auto-resolution attempt.")
+        elif conflicts and not auto_mode:
+            history = _log_and_update_history(history, "Human-Mode: Conflicts detected. User review would be needed.")
+            print("INFO: Human-Mode: Conflicts detected. User review would be needed.")
+
+        result = dict(state)
+        result.update({
+            "current_chapter_conflicts": conflicts,
+            "history": history,
+            "error_message": None
+        })
+        return result
+
+    except Exception as e:
+        msg = f"Error in Conflict Detection node for chapter '{chapter_title}': {e}"
+        print(f"ERROR: {msg}")
+        result = dict(state)
+        result.update({
+            "error_message": None,
+            "history": _log_and_update_history(history, msg, True),
+            "current_chapter_conflicts": [{"error": msg, "description": msg}]
+        })
+        return result
+
 def execute_content_integrity_review(state: NovelWorkflowState) -> Dict[str, Any]:
     current_chapter_num = state.get('current_chapter_number', 'Unknown')
     history = _log_and_update_history(state.get("history", []), f"Executing Node: Content Integrity Review for Chapter {current_chapter_num}")
@@ -1210,8 +1348,10 @@ class WorkflowManager:
         self.workflow.add_node("chapter_chronicler", execute_chapter_chronicler_agent)
         self.workflow.add_node("content_integrity_review", execute_content_integrity_review)
         self.workflow.add_node("lore_keeper_update_kb", execute_lore_keeper_update_kb)
+        self.workflow.add_node("conflict_detection", execute_conflict_detection)
         self.workflow.add_node("increment_chapter_number", increment_chapter_number)
         self.workflow.add_node("cleanup_resources", cleanup_resources)
+        self.workflow.add_node("generate_kb_visualization_data", generate_kb_visualization_data)
 
         self.workflow.set_entry_point("narrative_pathfinder")
         self.workflow.add_conditional_edges("narrative_pathfinder", _check_node_output, {"continue": "present_outlines_cli", "stop_on_error": END})
@@ -1232,7 +1372,8 @@ class WorkflowManager:
         self.workflow.add_conditional_edges("context_synthesizer", _check_node_output, {"continue": "chapter_chronicler", "stop_on_error": END})
         self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "content_integrity_review", "stop_on_error": END})
         self.workflow.add_conditional_edges("content_integrity_review", _check_node_output, {"continue": "lore_keeper_update_kb", "stop_on_error": END})
-        self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
+        self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "conflict_detection", "stop_on_error": END})
+        self.workflow.add_conditional_edges("conflict_detection", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
         self.workflow.add_conditional_edges(
             "increment_chapter_number", _should_continue_chapter_loop,
             {
@@ -1242,7 +1383,11 @@ class WorkflowManager:
                 "end_loop_on_safety": "cleanup_resources"  # 新增安全退出条件
             }
         )
-        self.workflow.add_conditional_edges("cleanup_resources", _check_node_output, {"continue": END, "stop_on_error": END})
+        self.workflow.add_conditional_edges("cleanup_resources", _check_node_output,
+                                           {"continue": "generate_kb_visualization_data",
+                                            "stop_on_error": "generate_kb_visualization_data"}) # Try to generate data even if cleanup had issues
+        self.workflow.add_conditional_edges("generate_kb_visualization_data", _check_node_output,
+                                           {"continue": END, "stop_on_error": END})
         print("Workflow graph built.")
 
     def run_workflow(self, user_input_data: Dict[str, Any]) -> NovelWorkflowState:
@@ -1281,7 +1426,9 @@ class WorkflowManager:
             db_name=self.db_name,  # Add db_name to state
             current_chapter_review=None,
             current_chapter_quality_passed=None,
+            current_chapter_conflicts=None,
             auto_decision_engine=self.auto_decision_engine, # Add this line
+            knowledge_graph_data=None,
             # 循环安全参数
             loop_iteration_count=0,
             max_loop_iterations=max(10, num_chapters * 3),  # 设置合理的最大迭代次数
@@ -1354,6 +1501,30 @@ if __name__ == "__main__":
                     print(f"  - {item_summary} (details in full state if needed)")
             elif value and isinstance(value[0], str):
                  for i, item_str in enumerate(value): print(f"  - Outline {i+1} Snippet: {item_str[:70]}...")
+        elif key == "knowledge_graph_data" and value:
+            print("Knowledge Graph Data:")
+            if isinstance(value, dict):
+                print(f"  Nodes found: {len(value.get('nodes', []))}")
+                print(f"  Edges found: {len(value.get('edges', []))}")
+                if value.get("error"):
+                    print(f"  Error generating graph data: {value['error']}")
+                # Optionally print a few nodes/edges if needed for quick check
+                # for node_item in value.get('nodes', [])[:2]:
+                #     print(f"    Sample Node: {node_item.get('id')} - {node_item.get('label')}")
+            else:
+                print(f"  Unexpected graph data format: {value}")
+        elif key == "current_chapter_conflicts" and value:
+            print("Last Chapter Conflicts:")
+            if isinstance(value, list) and value:
+                if len(value) == 1 and value[0].get("error"):
+                     print(f"  Error in conflict detection: {value[0]['error']}")
+                else:
+                    for idx, conflict in enumerate(value):
+                        print(f"  Conflict {idx+1}: Type: {conflict.get('type')}, Severity: {conflict.get('severity')}, Desc: {conflict.get('description')}")
+            elif not value:
+                print("  No conflicts detected or reported.")
+            else: # Should be a list or None
+                print(f"  Unexpected conflict data: {value}")
         elif key == "current_chapter_review" and value: # For the last chapter processed
             print("Last Chapter Review:")
             if isinstance(value, dict):

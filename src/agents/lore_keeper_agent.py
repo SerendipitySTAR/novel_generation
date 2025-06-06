@@ -1,7 +1,8 @@
 import os
 from dotenv import load_dotenv
-from typing import List, Dict, Optional # Added Optional
+from typing import List, Dict, Optional, Any # Added Optional and Any
 from datetime import datetime, timezone
+import uuid # Added import
 
 from src.knowledge_base.knowledge_base_manager import KnowledgeBaseManager
 from src.persistence.database_manager import DatabaseManager
@@ -168,6 +169,104 @@ class LoreKeeperAgent:
         print(f"Retrieved context string (length: {len(context_string)} chars)")
         return f"Context for your writing:\n{context_string}"
 
+    def get_knowledge_graph_data(self, novel_id: int) -> Dict[str, Any]:
+        """
+        Extracts data from the knowledge base suitable for graph visualization.
+        This is a basic implementation focusing on characters and their mentions for Phase 2.
+        Future enhancements could include relationships, plot event connections, etc.
+
+        Args:
+            novel_id: The ID of the novel to extract KB data for.
+
+        Returns:
+            A dictionary containing lists of nodes (e.g., characters, events)
+            and edges (relationships, interactions).
+        """
+        print(f"LoreKeeperAgent: Generating knowledge graph data for novel_id {novel_id}")
+        nodes = []
+        edges = []
+
+        # Ensure DBManager is available (it's part of __init__)
+        if not self.db_manager:
+            print("LoreKeeperAgent: DBManager not initialized, cannot fetch graph data.")
+            return {"nodes": [], "edges": [], "error": "DBManager not initialized"}
+
+        # 1. Get Characters as Nodes
+        try:
+            # Corrected method name to match DatabaseManager
+            characters_db = self.db_manager.get_characters_for_novel(novel_id)
+            for char_db in characters_db:
+                # characters_db from get_characters_for_novel returns List[DetailedCharacterProfile] (dicts)
+                # Ensure we are accessing fields correctly (e.g., char_db['character_id'] or char_db.get('character_id'))
+                # The DetailedCharacterProfile TypedDict uses 'character_id', 'name', 'description', 'role_in_story'
+                # The actual DB columns are 'id', 'name', 'description', 'role_in_story'
+                # The get_characters_for_novel method maps DB 'id' to 'character_id' in the DetailedCharacterProfile
+                nodes.append({
+                    "id": f"char_{char_db['character_id']}", # Use character_id from DetailedCharacterProfile
+                    "label": char_db['name'],
+                    "type": "character",
+                    "properties": {
+                        # 'description' in DetailedCharacterProfile is the full JSON string.
+                        # We might want a summary here, or specific fields from it.
+                        # For now, let's use the 'appearance_summary' if available, or a generic note.
+                        "description": char_db.get('appearance_summary') or char_db.get('background_story', 'No detailed description available in graph properties.'),
+                        "role": char_db.get('role_in_story', '')
+                    }
+                })
+
+            # 2. Basic Edges: Co-occurrence in chapters (placeholder for actual relationship extraction)
+            # This is a very simplified approach. True relationship extraction is complex.
+            # For now, we're not adding edges to keep it simple for Phase 2 backend support.
+            # A more advanced version would parse chapter contents or use LLM to find interactions.
+            # Example of how one might add edges if relationships were known:
+            # if len(characters_db) >= 2:
+            #     edges.append({
+            #         "id": f"edge_{nodes[0]['id']}_{nodes[1]['id']}",
+            #         "source": nodes[0]['id'],
+            #         "target": nodes[1]['id'],
+            #         "label": "related_to", # Or "interacted_in_chapter_X"
+            #         "properties": {"type": "generic_relation"}
+            #     })
+            print(f"LoreKeeperAgent: Added {len(characters_db)} character nodes.")
+
+        except Exception as e:
+            print(f"LoreKeeperAgent: Error fetching character data for graph: {e}")
+            # Continue if possible, or return error if critical
+
+        # 3. Get Plot Events as Nodes (Simplified from PlotChapterDetail)
+        try:
+            novel = self.db_manager.get_novel_by_id(novel_id)
+            plot = None
+            if novel and novel.get('active_plot_id') is not None: # Check if 'active_plot_id' exists and is not None
+                plot = self.db_manager.get_plot_by_id(novel['active_plot_id'])
+
+            if plot and plot.get('plot_summary'):
+                # Assuming plot_summary is JSON string of List[PlotChapterDetail]
+                import json # Import json here, as it's used locally
+                try:
+                    plot_details_list = json.loads(plot['plot_summary']) # This is List[Dict] matching PlotChapterDetail
+                    for p_detail_dict in plot_details_list:
+                        chapter_num = p_detail_dict.get('chapter_number', 'Unknown')
+                        event_summary = p_detail_dict.get('key_events_and_plot_progression', p_detail_dict.get('title', 'Unnamed Event'))
+                        nodes.append({
+                            "id": f"event_ch{chapter_num}_{str(uuid.uuid4())[:4]}",
+                            "label": f"Ch{chapter_num}: {event_summary[:50]}...",
+                            "type": "plot_event",
+                            "properties": {
+                                "chapter": chapter_num,
+                                "full_summary": event_summary,
+                                "characters_present": p_detail_dict.get("characters_present", [])
+                            }
+                        })
+                    print(f"LoreKeeperAgent: Added {len(plot_details_list)} plot event nodes.")
+                except json.JSONDecodeError as je:
+                    print(f"LoreKeeperAgent: Error decoding plot_summary JSON: {je}")
+                except Exception as ex: # Catch other errors during plot processing
+                    print(f"LoreKeeperAgent: Error processing plot details for graph: {ex}")
+        except Exception as e:
+            print(f"LoreKeeperAgent: Error fetching plot data for graph: {e}")
+
+        return {"nodes": nodes, "edges": edges}
 
 if __name__ == "__main__":
     print("--- Testing LoreKeeperAgent ---")
