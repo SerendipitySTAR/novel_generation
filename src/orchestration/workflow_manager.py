@@ -5,6 +5,7 @@ import os
 import json
 import gc
 from dotenv import load_dotenv
+from src.core.auto_decision_engine import AutoDecisionEngine
 
 # 尝试导入 psutil，如果不可用则使用基本的内存监控
 try:
@@ -23,6 +24,7 @@ from src.agents.lore_keeper_agent import LoreKeeperAgent
 from src.agents.context_synthesizer_agent import ContextSynthesizerAgent
 from src.agents.chapter_chronicler_agent import ChapterChroniclerAgent
 from src.agents.quality_guardian_agent import QualityGuardianAgent # Import added
+from src.agents.content_integrity_agent import ContentIntegrityAgent
 
 # Persistence and Core Models
 from src.persistence.database_manager import DatabaseManager
@@ -64,6 +66,9 @@ class NovelWorkflowState(TypedDict):
     current_plot_focus_for_chronicler: Optional[str] # Added missing field
     chapter_brief: Optional[str]
     db_name: Optional[str] # Add db_name field
+    current_chapter_review: Optional[Dict[str, Any]]
+    current_chapter_quality_passed: Optional[bool]
+    auto_decision_engine: Optional[AutoDecisionEngine] # New field
     # 循环安全参数
     loop_iteration_count: int
     max_loop_iterations: int
@@ -206,36 +211,69 @@ def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
         print(f"\n--- Outline {i + 1} ---\n{outline_text}\n--------------------")
 
     selected_index = 0
-    choice_int = 0
+    # choice_int = 0 # No longer needed here due to new logic structure
 
-    # 检查是否在自动模式或非交互式环境中
     auto_mode = state.get("user_input", {}).get("auto_mode", False)
+    auto_engine = state.get("auto_decision_engine")
 
-    if auto_mode:
-        print("Auto mode enabled: Automatically selecting Outline 1.")
-        log_msg = "Auto mode: Selected Outline 1."
-    else:
+    if auto_mode and auto_engine: # Check for engine presence
+        print("Auto mode enabled: Making automatic outline selection.")
+        # Ensure all_outlines is not empty before calling decide
+        if not all_outlines: # This check was already there, just ensuring context
+            error_msg = "No outlines available for automatic selection."
+            # The existing error handling for empty all_outlines will be hit before this,
+            # but as a safeguard if structure changes:
+            result = dict(state)
+            result.update({
+                "error_message": error_msg,
+                "history": _log_and_update_history(history, error_msg, True),
+                "execution_count": execution_count
+            })
+            return result
+        else:
+            selected_outline_text = auto_engine.decide(all_outlines, context={"decision_type": "outline_selection"})
+            # Find index for logging, assuming decide returns the item itself
+            try:
+                selected_index = all_outlines.index(selected_outline_text)
+                log_msg = f"Auto mode: Selected Outline {selected_index + 1} via AutoDecisionEngine."
+            except ValueError:
+                # Should not happen if engine.decide returns an element from all_outlines
+                selected_index = 0 # Fallback, though problematic
+                selected_outline_text = all_outlines[selected_index] # Ensure selected_outline_text is set
+                log_msg = f"Auto mode: Selected an outline via AutoDecisionEngine (index unknown, defaulted to 1)."
+    elif auto_mode and not auto_engine:
+        print("Auto mode enabled, but AutoDecisionEngine not found in state. Defaulting to Outline 1.")
+        log_msg = "Auto mode (engine missing): Defaulting to Outline 1."
+        selected_index = 0 # Default behavior
+        selected_outline_text = all_outlines[selected_index]
+    else: # Human interaction mode
         try:
             import sys
-            # 检查是否在交互式环境中
             if not sys.stdin.isatty():
                 print("Non-interactive environment detected: Automatically selecting Outline 1.")
                 log_msg = "Non-interactive environment: Selected Outline 1."
+                selected_index = 0
             else:
                 choice_str = input(f"Please select an outline by number (1-{len(all_outlines)}) or type '0' to default to Outline 1: ")
-                choice_int = int(choice_str)
+                choice_int = int(choice_str) # choice_int defined here now
                 if 0 < choice_int <= len(all_outlines):
                     selected_index = choice_int - 1
-                log_msg = f"User selected Outline {selected_index + 1}." if selected_index != 0 or choice_int != 0 else "User defaulted to Outline 1."
+                    log_msg = f"User selected Outline {selected_index + 1}."
+                else:
+                    selected_index = 0 # Default to first if input is invalid
+                    log_msg = f"Invalid input or '0', defaulted to Outline 1."
         except (ValueError, EOFError, KeyboardInterrupt) as e:
             print(f"Input error ({e}), defaulting to Outline 1.")
             log_msg = f"Input error ({type(e).__name__}), defaulting to Outline 1."
-        except Exception as e:
+            selected_index = 0
+        except Exception as e: # Catch any other unexpected errors during input
             print(f"Unexpected error during input ({e}), defaulting to Outline 1.")
             log_msg = f"Unexpected error during input, defaulting to Outline 1."
+            selected_index = 0
+        selected_outline_text = all_outlines[selected_index]
 
     history = _log_and_update_history(history, log_msg)
-    selected_outline_text = all_outlines[selected_index]
+    # selected_outline_text is now set either by auto_engine or user/default
     print(f"Proceeding with Outline {selected_index + 1}.")
 
     # 确保返回完整的状态更新
@@ -369,36 +407,60 @@ def present_worldviews_for_selection_cli(state: NovelWorkflowState) -> dict:
         print("--------------------")
 
     selected_index = 0
-    choice_int = 0
+    # choice_int = 0 # No longer needed here
 
-    # 检查是否在自动模式或非交互式环境中
     auto_mode = state.get("user_input", {}).get("auto_mode", False)
+    auto_engine = state.get("auto_decision_engine")
 
-    if auto_mode:
-        print("Auto mode enabled: Automatically selecting Worldview 1.")
-        log_msg = "Auto mode: Selected Worldview 1."
-    else:
+    if auto_mode and auto_engine: # Check for engine presence
+        print("Auto mode enabled: Making automatic worldview selection.")
+        if not all_worldviews: # This check was already there
+            error_msg = "No worldviews available for automatic selection."
+            # Error handling for empty all_worldviews is already present and will be hit first.
+            # This is a safeguard:
+            return {"error_message": error_msg, "history": _log_and_update_history(history, error_msg, True)}
+        else:
+            selected_wv_detail = auto_engine.decide(all_worldviews, context={"decision_type": "worldview_selection"})
+            try:
+                selected_index = all_worldviews.index(selected_wv_detail)
+                log_msg = f"Auto mode: Selected Worldview {selected_index + 1} ('{selected_wv_detail.get('world_name', 'N/A')}') via AutoDecisionEngine."
+            except ValueError:
+                selected_index = 0 # Fallback
+                selected_wv_detail = all_worldviews[selected_index] # Ensure selected_wv_detail is set
+                log_msg = f"Auto mode: Selected a worldview via AutoDecisionEngine (index unknown, defaulted to 1)."
+    elif auto_mode and not auto_engine:
+        print("Auto mode enabled, but AutoDecisionEngine not found in state. Defaulting to Worldview 1.")
+        log_msg = "Auto mode (engine missing): Defaulting to Worldview 1."
+        selected_index = 0
+        selected_wv_detail = all_worldviews[selected_index]
+    else: # Human interaction mode
         try:
             import sys
-            # 检查是否在交互式环境中
             if not sys.stdin.isatty():
                 print("Non-interactive environment detected: Automatically selecting Worldview 1.")
                 log_msg = "Non-interactive environment: Selected Worldview 1."
+                selected_index = 0
             else:
                 choice_str = input(f"Please select a worldview by number (1-{len(all_worldviews)}) or type '0' to default to Option 1: ")
-                choice_int = int(choice_str)
+                choice_int = int(choice_str) # choice_int defined here
                 if 0 < choice_int <= len(all_worldviews):
                     selected_index = choice_int - 1
-                log_msg = f"User selected Worldview {selected_index + 1}." if selected_index != 0 or choice_int != 0 else "User defaulted to Worldview 1."
+                    log_msg = f"User selected Worldview {selected_index + 1}."
+                else:
+                    selected_index = 0
+                    log_msg = f"Invalid input or '0', defaulted to Worldview 1."
         except (ValueError, EOFError, KeyboardInterrupt) as e:
             print(f"Input error ({e}), defaulting to Worldview 1.")
             log_msg = f"Input error ({type(e).__name__}), defaulting to Worldview 1."
-        except Exception as e:
+            selected_index = 0
+        except Exception as e: # Catch any other unexpected errors during input
             print(f"Unexpected error during input ({e}), defaulting to Worldview 1.")
             log_msg = f"Unexpected error during input, defaulting to Worldview 1."
+            selected_index = 0
+        selected_wv_detail = all_worldviews[selected_index]
 
     history = _log_and_update_history(history, log_msg)
-    selected_wv_detail = all_worldviews[selected_index]
+    # selected_wv_detail is now set
     print(f"Proceeding with Worldview {selected_index + 1} ('{selected_wv_detail.get('world_name', 'N/A')}')")
     return {"selected_worldview_detail": selected_wv_detail, "history": history, "error_message": None}
 
@@ -867,6 +929,83 @@ def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
     _log_memory_usage("after increment_chapter_number")
     return result
 
+def execute_content_integrity_review(state: NovelWorkflowState) -> Dict[str, Any]:
+    current_chapter_num = state.get('current_chapter_number', 'Unknown')
+    history = _log_and_update_history(state.get("history", []), f"Executing Node: Content Integrity Review for Chapter {current_chapter_num}")
+    print(f"Executing Node: Content Integrity Review for Chapter {current_chapter_num}")
+
+    generated_chapters = state.get("generated_chapters", [])
+    if not generated_chapters:
+        msg = "No generated chapters found for content integrity review."
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+    last_chapter = generated_chapters[-1]
+    chapter_content = last_chapter.get("content")
+    # Corrected: Use chapter_title after definition
+    chapter_title = last_chapter.get("title", f"Chapter {last_chapter.get('chapter_number', current_chapter_num)}")
+
+    if not chapter_content:
+        # Corrected: Use chapter_title in the message
+        msg = f"Content for chapter '{chapter_title}' (Num: {current_chapter_num}) is missing for review."
+        return {
+            "history": _log_and_update_history(history, msg, True),
+            "current_chapter_review": {"error": msg, "overall_score": 0.0},
+            "current_chapter_quality_passed": False,
+            "error_message": None # Allow workflow to continue, but mark as failed quality
+        }
+
+    try:
+        agent = ContentIntegrityAgent() # LLMClient initialized by agent
+        history = _log_and_update_history(history, f"ContentIntegrityAgent instantiated for chapter '{chapter_title}'.")
+
+        review_results = agent.review_content(chapter_content, content_type=f"Chapter {current_chapter_num}: {chapter_title}")
+        history = _log_and_update_history(history, f"Content review completed for chapter '{chapter_title}'.")
+
+        print(f"--- Content Integrity Review: Chapter '{chapter_title}' ---")
+        if review_results.get("error"):
+            print(f"  Error during review: {review_results['error']}")
+        print(f"  Overall Score: {review_results.get('overall_score')}")
+        print(f"  Justification: {review_results.get('justification')}")
+        print(f"  Individual Scores: {review_results.get('scores')}")
+        print("----------------------------------------------------")
+
+        auto_mode = state.get("user_input", {}).get("auto_mode", False)
+        quality_threshold = 8.5 if auto_mode else 7.0
+
+        overall_score = review_results.get("overall_score", 0.0)
+        passed_quality_check = overall_score >= quality_threshold
+
+        if passed_quality_check:
+            history = _log_and_update_history(history, f"Chapter '{chapter_title}' PASSED quality check (Score: {overall_score} >= Threshold: {quality_threshold}).")
+            print(f"INFO: Chapter '{chapter_title}' PASSED quality check (Score: {overall_score} >= Threshold: {quality_threshold}).")
+        else:
+            history = _log_and_update_history(history, f"Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}). For Phase 1, workflow continues.")
+            print(f"WARNING: Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}). Phase 1: Workflow continues, no retry.")
+
+        # Update state
+        result = dict(state)
+        result.update({
+            "current_chapter_review": review_results,
+            "current_chapter_quality_passed": passed_quality_check,
+            "history": history,
+            "error_message": None # Do not stop workflow on failed quality for Phase 1
+        })
+        return result
+
+    except Exception as e:
+        # Corrected: Use chapter_title in the message
+        msg = f"Error in Content Integrity Review node for chapter '{chapter_title}': {e}"
+        print(f"ERROR: {msg}")
+        # Still try to return a valid state structure
+        result = dict(state)
+        result.update({
+            "error_message": None, # Let workflow continue but log issue
+            "history": _log_and_update_history(history, msg, True),
+            "current_chapter_review": {"error": msg, "overall_score": 0.0},
+            "current_chapter_quality_passed": False
+        })
+        return result
+
 def cleanup_resources(state: NovelWorkflowState) -> Dict[str, Any]:
     """清理工作流程资源"""
     print("DEBUG: cleanup_resources - Starting cleanup process")
@@ -1007,13 +1146,51 @@ def _should_continue_chapter_loop(state: NovelWorkflowState) -> str:
         return "end_loop_on_error"
 
 class WorkflowManager:
-    def __init__(self, db_name="novel_mvp.db"):
+    def __init__(self, db_name="novel_mvp.db", mode="human"):
         self.db_name = db_name
+        self.mode = mode
+        self.auto_decision_engine = AutoDecisionEngine() if self.mode == "auto" else None
+        print(f"WorkflowManager initialized in '{self.mode}' mode. AutoDecisionEngine {'enabled' if self.auto_decision_engine else 'disabled'}.")
+        # Ensure self.initial_history reflects this
+        self.initial_history = [f"WorkflowManager initialized (DB: {self.db_name}, Mode: {self.mode}) and graph compiled."]
         self.workflow = StateGraph(NovelWorkflowState)
         self._build_graph()
         self.app = self.workflow.compile()
-        print(f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled.")
-        self.initial_history = [f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled."]
+        # print(f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled.") # Original print removed, covered by new one
+
+    def _should_prompt_user(self, decision_point: Optional[str] = None) -> bool:
+        """
+        Determines if the user should be prompted for a decision based on the current mode.
+
+        Args:
+            decision_point: An optional string identifying the decision point (for logging/future use).
+
+        Returns:
+            True if in "human" mode, False otherwise.
+        """
+        if decision_point:
+            print(f"Decision point '{decision_point}': _should_prompt_user called in '{self.mode}' mode. Returning {self.mode == 'human'}")
+        return self.mode == "human"
+
+    def _make_auto_decision(self, options: List[Any], context: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Makes an automated decision using the AutoDecisionEngine.
+
+        Args:
+            options: A list of options to choose from.
+            context: Optional context for the decision.
+
+        Returns:
+            The selected option.
+
+        Raises:
+            RuntimeError: If called when AutoDecisionEngine is not available (i.e., not in 'auto' mode).
+        """
+        if not self.auto_decision_engine:
+            raise RuntimeError("AutoDecisionEngine is not available in the current mode.")
+
+        print(f"Making auto decision with context: {context.get('decision_type', 'N/A') if context else 'N/A'}")
+        return self.auto_decision_engine.decide(options, context)
 
     def _build_graph(self):
         self.workflow.add_node("narrative_pathfinder", execute_narrative_pathfinder_agent)
@@ -1031,6 +1208,7 @@ class WorkflowManager:
         self.workflow.add_node("prepare_for_chapter_loop", prepare_for_chapter_loop)
         self.workflow.add_node("context_synthesizer", execute_context_synthesizer_agent)
         self.workflow.add_node("chapter_chronicler", execute_chapter_chronicler_agent)
+        self.workflow.add_node("content_integrity_review", execute_content_integrity_review)
         self.workflow.add_node("lore_keeper_update_kb", execute_lore_keeper_update_kb)
         self.workflow.add_node("increment_chapter_number", increment_chapter_number)
         self.workflow.add_node("cleanup_resources", cleanup_resources)
@@ -1052,7 +1230,8 @@ class WorkflowManager:
         self.workflow.add_conditional_edges("lore_keeper_initialize", _check_node_output, {"continue": "prepare_for_chapter_loop", "stop_on_error": END})
         self.workflow.add_conditional_edges("prepare_for_chapter_loop", _check_node_output, {"continue": "context_synthesizer", "stop_on_error": END})
         self.workflow.add_conditional_edges("context_synthesizer", _check_node_output, {"continue": "chapter_chronicler", "stop_on_error": END})
-        self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "lore_keeper_update_kb", "stop_on_error": END})
+        self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "content_integrity_review", "stop_on_error": END})
+        self.workflow.add_conditional_edges("content_integrity_review", _check_node_output, {"continue": "lore_keeper_update_kb", "stop_on_error": END})
         self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
         self.workflow.add_conditional_edges(
             "increment_chapter_number", _should_continue_chapter_loop,
@@ -1100,6 +1279,9 @@ class WorkflowManager:
             current_plot_focus_for_chronicler=None, # New key
             chapter_brief=None,
             db_name=self.db_name,  # Add db_name to state
+            current_chapter_review=None,
+            current_chapter_quality_passed=None,
+            auto_decision_engine=self.auto_decision_engine, # Add this line
             # 循环安全参数
             loop_iteration_count=0,
             max_loop_iterations=max(10, num_chapters * 3),  # 设置合理的最大迭代次数
@@ -1147,10 +1329,12 @@ if __name__ == "__main__":
     if os.path.exists(default_db_name): os.remove(default_db_name)
     if os.path.exists(default_chroma_dir): shutil.rmtree(default_chroma_dir)
     _ = DatabaseManager(db_name=default_db_name)
-    manager = WorkflowManager(db_name=default_db_name)
+    manager = WorkflowManager(db_name=default_db_name, mode="auto") # Specify mode
     sample_user_input = {
         "theme": "a detective investigating anomalies in a city where time flows differently in various districts",
-        "style_preferences": "chronopunk mystery with noir elements"
+        "style_preferences": "chronopunk mystery with noir elements",
+        "auto_mode": True, # Ensure this is set for nodes that check it
+        "chapters": 2 # Shorten for faster testing
     }
     print(f"\nRunning workflow with: {sample_user_input}")
     final_result_state = manager.run_workflow(sample_user_input)
@@ -1170,6 +1354,20 @@ if __name__ == "__main__":
                     print(f"  - {item_summary} (details in full state if needed)")
             elif value and isinstance(value[0], str):
                  for i, item_str in enumerate(value): print(f"  - Outline {i+1} Snippet: {item_str[:70]}...")
+        elif key == "current_chapter_review" and value: # For the last chapter processed
+            print("Last Chapter Review:")
+            if isinstance(value, dict):
+                print(f"  Overall Score: {value.get('overall_score')}")
+                print(f"  Justification: {value.get('justification')}")
+                if value.get('scores'):
+                    for r_key, r_value in value['scores'].items():
+                        print(f"    {r_key.replace('_',' ').capitalize()}: {r_value}")
+                if value.get('error'):
+                    print(f"  Error: {value.get('error')}")
+            else:
+                print(f"  {value}")
+        elif key == "current_chapter_quality_passed" and value is not None:
+            print(f"Last Chapter Quality Passed: {value}")
         elif isinstance(value, dict):
             print(f"{key.capitalize()}:")
             for k_item, v_item in value.items(): print(f"  {k_item}: {str(v_item)[:100]}{'...' if len(str(v_item)) > 100 else ''}")
