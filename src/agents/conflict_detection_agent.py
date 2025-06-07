@@ -2,162 +2,401 @@ from typing import Dict, Any, List, Optional
 import uuid
 
 # Placeholder for LoreKeeperAgent and LLMClient to avoid circular dependencies
-# In a real setup, these would be proper imports if directly used,
-# or interfaces would be defined.
-# from src.agents.lore_keeper_agent import LoreKeeperAgent # Example
-# from src.llm_abstraction.llm_client import LLMClient # Example
+import re
+from src.agents.lore_keeper_agent import LoreKeeperAgent
+# from src.llm_abstraction.llm_client import LLMClient # Already effectively imported via Optional[Any] type hint
 
 class ConflictDetectionAgent:
     """
-    Agent responsible for detecting inconsistencies and contradictions in novel content.
+    Agent responsible for detecting inconsistencies and contradictions in novel content,
+    leveraging Knowledge Base context.
     """
 
-    def __init__(self, llm_client: Optional[Any] = None, lore_keeper: Optional[Any] = None):
+    def __init__(self, llm_client: Optional[Any] = None, lore_keeper: Optional[Any] = None, db_name: Optional[str] = None):
         """
         Initializes the ConflictDetectionAgent.
 
         Args:
             llm_client: An instance of LLMClient or a similar interface for LLM interaction.
-            lore_keeper: An instance of LoreKeeperAgent or a similar interface for knowledge base access.
+            lore_keeper: An instance of LoreKeeperAgent. If not provided, one might be instantiated if db_name is given.
+            db_name: Database name, used for instantiating LoreKeeperAgent if `lore_keeper` is None.
         """
         self.llm_client = llm_client
-        self.lore_keeper = lore_keeper
+        self.lore_keeper = lore_keeper # This can be a pre-initialized LoreKeeperAgent instance
+        self.db_name = db_name # Store db_name for on-demand LoreKeeper instantiation
+
         if self.llm_client:
             print("ConflictDetectionAgent initialized with LLMClient.")
         if self.lore_keeper:
-            print("ConflictDetectionAgent initialized with LoreKeeper.")
+            print("ConflictDetectionAgent initialized with a pre-existing LoreKeeper instance.")
+        elif self.db_name:
+            print(f"ConflictDetectionAgent initialized with db_name='{self.db_name}'. LoreKeeper will be instantiated on demand if needed.")
 
         if not self.llm_client:
             print("ConflictDetectionAgent: Warning - LLMClient not provided. Detection capabilities will be limited.")
+        if not self.lore_keeper and not self.db_name:
+            print("ConflictDetectionAgent: Warning - Neither LoreKeeper instance nor db_name provided. KB context will be unavailable.")
+
+
+    def _construct_conflict_prompt(self, chapter_number: int, chapter_text: str, kb_context_str: str, novel_theme_style: Optional[Dict[str, Any]]) -> str:
+        theme_style_info = ""
+        if novel_theme_style:
+            theme = novel_theme_style.get('theme', 'Not specified')
+            style = novel_theme_style.get('style_preferences', 'Not specified')
+            theme_style_info = f"Novel Theme: {theme}\nNovel Style: {style}\n"
+
+        prompt = f"""You are an expert content reviewer for novels. Your task is to identify conflicts and inconsistencies in the provided chapter text.
+Review Chapter {chapter_number} for:
+1. Internal inconsistencies within the chapter itself.
+2. Contradictions or inconsistencies when compared against the provided Knowledge Base Context.
+Consider the overall novel theme and style for context.
+
+{theme_style_info}
+Knowledge Base Context:
+---
+{kb_context_str}
+---
+
+Chapter {chapter_number} Text:
+---
+{chapter_text}
+---
+
+For each conflict found, provide the following details in the specified format:
+Conflict X:
+  Description: [A clear explanation of the conflict.]
+  Excerpt: [The specific excerpt from the chapter text that is problematic. Quote it directly.]
+  KB_Reference (Optional): [Specific part of KB context that it conflicts with, if applicable. Quote it or summarize.]
+  Conflict_Type: [Categorize from: "Plot Contradiction", "Character Inconsistency", "Timeline Error", "World Rule Violation", "Factual Inconsistency with KB", "Internal Inconsistency"]
+  Severity: [Assess as: "Low", "Medium", "High"]
+---
+
+If no significant conflicts are detected, respond ONLY with the phrase: "No significant conflicts detected."
+Do not add any preamble or explanation if no conflicts are found.
+List all conflicts you find.
+"""
+        return prompt
+
+    def _parse_conflict_response(self, response_text: str, chapter_number: int) -> List[Dict[str, Any]]:
+        conflicts: List[Dict[str, Any]] = []
+        if "no significant conflicts detected" in response_text.lower() and not response_text.strip().startswith("Conflict"):
+            return conflicts
+
+        # Split conflicts by "---" separator, handling potential empty strings from split
+        conflict_blocks = [block.strip() for block in response_text.split("---") if block.strip()]
+
+        for block in conflict_blocks:
+            conflict_data: Dict[str, Any] = {"chapter_source": chapter_number, "kb_reference": None} # Default kb_reference
+
+            # Attempt to extract conflict ID (e.g., "Conflict 1:")
+            id_match = re.search(r"Conflict\s*\d+:", block, re.IGNORECASE)
+            if id_match:
+                # We generate our own UUID, so this is mostly for parsing structure
+                block_content_after_id = block[id_match.end():].strip()
+            else:
+                block_content_after_id = block # Assume block starts directly with fields if no "Conflict X:"
+
+            conflict_data["conflict_id"] = str(uuid.uuid4())
+
+            fields_map = {
+                "Description": None, "Excerpt": None, "KB_Reference": None,
+                "Conflict_Type": None, "Severity": None
+            }
+
+            # Use regex to find each field. This is more robust to ordering and missing fields.
+            for field_name in fields_map.keys():
+                # Regex to find "Field_Name: value" and capture value. Handles multiline values for Description, Excerpt, KB_Reference.
+                # For KB_Reference, make it optional in the pattern.
+                # Pattern tries to capture until the next field name or end of block.
+                pattern = rf"{field_name.replace('_', r'[\s_]*')}\s*:\s*(.*?)(?=\n\s*(?:Description|Excerpt|KB_Reference|Conflict_Type|Severity)\s*:|\Z)"
+                match = re.search(pattern, block_content_after_id, re.IGNORECASE | re.DOTALL)
+                if match:
+                    value = match.group(1).strip()
+                    # Clean up common LLM artifacts like "Optional):" from the value if necessary
+                    value = re.sub(r"^\(Optional\)\s*:\s*", "", value, flags=re.IGNORECASE).strip()
+                    fields_map[field_name] = value
+
+            conflict_data.update({k.lower().replace(" ", "_"): v for k, v in fields_map.items() if v is not None})
+
+            # Ensure essential fields have at least a placeholder if not found
+            if not conflict_data.get("description"):
+                conflict_data["description"] = "Description not clearly parsed from LLM output."
+            if not conflict_data.get("type"): # Mapped from Conflict_Type
+                 conflict_data["type"] = "Uncategorized"
+            if not conflict_data.get("severity"):
+                 conflict_data["severity"] = "Unknown"
+
+
+            # Only add if a description was found or if other key fields are present
+            if conflict_data.get("description") != "Description not clearly parsed from LLM output." or \
+               conflict_data.get("excerpt") or conflict_data.get("type") != "Uncategorized":
+                conflicts.append(conflict_data)
+            elif not conflicts and block: # If it's the only block and something is there but not parsed
+                print(f"ConflictDetectionAgent: Could not parse any structured fields from block: '{block[:100]}...' - adding as generic conflict.")
+                conflicts.append({
+                    "conflict_id": str(uuid.uuid4()),
+                    "type": "Parsing Error",
+                    "description": f"Could not parse LLM response block: {block}",
+                    "severity": "Low",
+                    "chapter_source": chapter_number,
+                })
+
+
+        if not conflicts and response_text.strip() and "no significant conflicts detected" not in response_text.lower():
+            print(f"ConflictDetectionAgent: LLM response was not 'no conflicts' but parser found none. Adding raw response as generic conflict. Response: {response_text[:200]}")
+            conflicts.append({
+                "conflict_id": str(uuid.uuid4()),
+                "type": "Unparsed LLM Output",
+                "description": f"LLM flagged potential issues, but they could not be parsed: {response_text}",
+                "severity": "Medium", # Needs review
+                "chapter_source": chapter_number,
+            })
+
+        return conflicts
 
 
     def detect_conflicts(
         self,
+        novel_id: int,
         current_chapter_text: str,
         current_chapter_number: int,
-        previous_chapters_summary: Optional[List[Dict[str, str]]] = None,
-        novel_context: Optional[Dict[str, Any]] = None
+        novel_context: Optional[Dict[str, Any]] = None # theme, style
     ) -> List[Dict[str, Any]]:
         """
-        Detects conflicts in the current chapter based on provided context.
+        Detects conflicts in the current chapter using KB context and LLM analysis.
 
         Args:
+            novel_id: The ID of the current novel.
             current_chapter_text: The text of the most recently generated chapter.
             current_chapter_number: The number of the current chapter.
-            previous_chapters_summary: A list of summaries from previous chapters.
-            novel_context: General novel information (theme, style, overall outline).
+            novel_context: General novel information (theme, style).
 
         Returns:
             A list of dictionaries, where each dictionary represents a detected conflict.
             Returns an empty list if no conflicts are detected.
         """
-        print(f"ConflictDetectionAgent: Starting conflict detection for Chapter {current_chapter_number}.")
-        conflicts: List[Dict[str, Any]] = []
+        print(f"ConflictDetectionAgent: Starting enhanced conflict detection for Novel ID {novel_id}, Chapter {current_chapter_number}.")
 
         if not current_chapter_text:
             print("ConflictDetectionAgent: Current chapter text is empty, cannot detect conflicts.")
-            return conflicts
+            return []
 
-        # --- Phase 2: Basic Heuristic / Simple LLM Call ---
-        # This is a very basic placeholder for conflict detection logic.
-        # A real implementation would involve more sophisticated rule-based checks,
-        # KB queries, and advanced LLM prompting.
+        if not self.llm_client:
+            print("ConflictDetectionAgent: LLMClient not available. Cannot perform conflict detection.")
+            return [{"conflict_id": str(uuid.uuid4()), "type": "Setup Error", "description": "LLMClient not configured for ConflictDetectionAgent.", "severity": "High", "chapter_source": current_chapter_number}]
 
-        # Example Heuristic: Check for a very obvious self-contradiction (placeholder)
-        if "Character A is dead." in current_chapter_text and "Character A smiled." in current_chapter_text:
-            conflicts.append({
-                "conflict_id": str(uuid.uuid4()),
-                "type": "Plot Contradiction",
-                "description": "Character A is stated to be dead but later performs an action (smiled).",
-                "severity": "High",
-                "chapter_source": current_chapter_number,
-                "references": [],
-                "problematic_excerpt": "Character A is dead. ... Character A smiled.",
-                "suggested_resolution_type": "Rewrite Section"
-            })
-
-        # Example LLM-based check (conceptual, requires self.llm_client to be set up)
-        if self.llm_client:
-            # This is a simplified prompt. A more robust solution would involve
-            # providing more context (previous summaries, KB facts).
-            prompt = (
-                f"Review the following text from Chapter {current_chapter_number} for any obvious internal contradictions "
-                f"or inconsistencies with common sense, given a general fantasy setting. "
-                f"If a clear contradiction is found, describe it briefly. If not, say 'No clear conflicts found'.\n\n"
-                    f"Chapter Text Snippet:\n{current_chapter_text[:1000]}...\n\n"
-                f"Potential Conflict Description:"
-            )
+        # Instantiate LoreKeeperAgent if necessary
+        lore_keeper_instance = self.lore_keeper
+        if not lore_keeper_instance and self.db_name:
             try:
-                # Use the actual llm_client if available
-                response_text = self.llm_client.generate_text(prompt, max_tokens=150)
-
-                # The specific simulation for "magic suddenly failed" can be removed
-                # if the tests/mock LLM are configured to produce desired outputs.
-                # For now, let's keep the test's mock simple and rely on its default_response.
-                # The agent's internal simulation logic is removed to allow the mock to work.
-
-                if response_text and "no clear conflicts found" not in response_text.lower():
-                    conflicts.append({
-                        "conflict_id": str(uuid.uuid4()),
-                        "type": "Potential LLM-flagged Inconsistency",
-                        "description": response_text,
-                        "severity": "Medium",
-                        "chapter_source": current_chapter_number,
-                        "references": [{"type": "novel_context", "details": "General LLM review based on chapter text and brief."}],
-                        "problematic_excerpt": current_chapter_text[:200] + "...", # First 200 chars
-                        "suggested_resolution_type": "Review and Clarify"
-                    })
-                    print(f"ConflictDetectionAgent: Potential conflict flagged by LLM: {response_text}")
+                lore_keeper_instance = LoreKeeperAgent(db_name=self.db_name, llm_client=self.llm_client) # Pass LLM if needed by LKA's init or methods
+                print("ConflictDetectionAgent: Dynamically instantiated LoreKeeperAgent.")
             except Exception as e:
-                print(f"ConflictDetectionAgent: Error during conceptual LLM call: {e}")
+                print(f"ConflictDetectionAgent: Error instantiating LoreKeeperAgent: {e}. Proceeding without KB context.")
+                lore_keeper_instance = None
+        elif not lore_keeper_instance and not self.db_name:
+             print("ConflictDetectionAgent: Warning - db_name not set, cannot initialize LoreKeeperAgent. Proceeding without KB context.")
+             lore_keeper_instance = None
+
+
+        # Retrieve Knowledge Base Context
+        retrieved_kb_context_str = "Knowledge Base context not available."
+        if lore_keeper_instance:
+            try:
+                print(f"ConflictDetectionAgent: Querying Knowledge Base for context related to Chapter {current_chapter_number} content.")
+                # Using a segment of chapter text for broader context query
+                query_text = current_chapter_text[:1500] # Query with start of chapter
+
+                # Add specific entity queries if identifiable, for now broad query
+                # Example: Extract character names from chapter text and query for their KB entries.
+
+                kb_results = lore_keeper_instance.kb_manager.query_knowledge_base(novel_id, query_text, n_results=7) # Increased n_results for broader context
+
+                if kb_results:
+                    formatted_results = []
+                    for doc, score in kb_results:
+                        # Simple formatting, could be more sophisticated (e.g. add source if available)
+                        formatted_results.append(f"- {doc} (Similarity: {score:.2f})")
+                    retrieved_kb_context_str = "\n".join(formatted_results)
+                    print(f"ConflictDetectionAgent: Retrieved {len(kb_results)} item(s) from KB.")
+                else:
+                    retrieved_kb_context_str = "No specific information retrieved from Knowledge Base for this chapter context."
+                    print("ConflictDetectionAgent: No items retrieved from KB for the query.")
+            except Exception as e:
+                print(f"ConflictDetectionAgent: Error querying Knowledge Base: {e}. Proceeding with limited context.")
+                retrieved_kb_context_str = f"Error accessing Knowledge Base: {e}"
+
+        # Construct and Execute LLM Prompt
+        prompt = self._construct_conflict_prompt(current_chapter_number, current_chapter_text, retrieved_kb_context_str, novel_context)
+
+        print("ConflictDetectionAgent: Sending prompt to LLM for conflict analysis...")
+        try:
+            llm_response_text = self.llm_client.generate_text(prompt, max_tokens=1000) # Increased max_tokens for potentially many conflicts
+        except Exception as e:
+            print(f"ConflictDetectionAgent: Error during LLM call for conflict analysis: {e}")
+            return [{"conflict_id": str(uuid.uuid4()), "type": "LLM Error", "description": f"LLM call failed: {e}", "severity": "High", "chapter_source": current_chapter_number}]
+
+        print("ConflictDetectionAgent: Received LLM response. Parsing conflicts...")
+        # Parse LLM Response
+        parsed_conflicts = self._parse_conflict_response(llm_response_text, current_chapter_number)
+
+        if parsed_conflicts:
+            print(f"ConflictDetectionAgent: Detected {len(parsed_conflicts)} conflict(s) in Chapter {current_chapter_number} after LLM analysis.")
         else:
-            print("ConflictDetectionAgent: LLMClient not available, skipping LLM-based checks.")
+            print(f"ConflictDetectionAgent: No conflicts detected in Chapter {current_chapter_number} by LLM or parser found none from response: '{llm_response_text[:100]}...'")
 
+        return parsed_conflicts
 
-        if conflicts:
-            print(f"ConflictDetectionAgent: Detected {len(conflicts)} potential conflict(s) in Chapter {current_chapter_number}.")
-        else:
-            print(f"ConflictDetectionAgent: No obvious conflicts detected in Chapter {current_chapter_number} with basic checks.")
-
-        return conflicts
 
 if __name__ == '__main__':
     # Basic test for the shell
     # A mock LLM client for testing purposes
     class MockLLMClientForConflict:
+        def __init__(self, fixed_response=None):
+            self.fixed_response = fixed_response
+
         def generate_text(self, prompt: str, max_tokens: int) -> str:
-            if "Character A is dead" in prompt and "Character A smiled" in prompt: # Unlikely to be in same prompt snippet
-                return "Character A is mentioned as dead and then alive."
-            if "magic suddenly failed" in prompt:
-                return "Magic failing in a magic-dependent world is a conflict."
-            return "No clear conflicts found by mock LLM."
+            if self.fixed_response:
+                return self.fixed_response
+            # Simple rule-based responses for testing different scenarios
+            if "Character Z is blue" in prompt and "Character Z is red" in prompt:
+                return """Conflict 1:
+  Description: Character Z is described as blue in KB but red in chapter.
+  Excerpt: Character Z is red.
+  KB_Reference: Character Z is blue
+  Conflict_Type: Factual Inconsistency with KB
+  Severity: Medium
+---"""
+            if "magic suddenly failed" in prompt: # Old test case, adapt if needed
+                return """Conflict 1:
+  Description: Magic failing abruptly in a world where it's fundamental might be a plot hole if not explained.
+  Excerpt: magic suddenly failed for no reason
+  KB_Reference: World rules state magic is ever-present.
+  Conflict_Type: World Rule Violation
+  Severity: High
+---"""
+            return "No significant conflicts detected."
 
-    agent_with_llm = ConflictDetectionAgent(llm_client=MockLLMClientForConflict())
-    agent_no_llm = ConflictDetectionAgent()
+    # Mock LoreKeeper and its KnowledgeBaseManager
+    class MockKnowledgeBaseManager:
+        def query_knowledge_base(self, novel_id: int, query_text: str, n_results: int = 3) -> List[tuple[str, float]]:
+            print(f"MockKBManager: Querying for novel {novel_id} with text '{query_text[:50]}...' (n_results={n_results})")
+            if "blue" in query_text.lower(): # Simulate finding relevant KB entry
+                return [("Character Z is blue. Fairies are real.", 0.95)]
+            if "hero" in query_text.lower():
+                return [("The prophecy states only the chosen hero can defeat the dragon.", 0.88),
+                        ("Heroes in this land are always male.", 0.75)]
+            return []
 
-    print("\n--- Test Case 1: Obvious Contradiction (Heuristic) ---")
-    test_text_1 = "The battle was fierce. Character A is dead. Later, Character A smiled at the victory."
-    conflicts_1 = agent_with_llm.detect_conflicts(test_text_1, 1)
-    print(f"Found conflicts: {len(conflicts_1)}")
-    if conflicts_1: print(conflicts_1[0]['description'])
+    class MockLoreKeeperAgent:
+        def __init__(self, db_name: Optional[str] = None, llm_client: Optional[Any] = None):
+            self.kb_manager = MockKnowledgeBaseManager()
+            print(f"MockLoreKeeperAgent initialized (db_name='{db_name}')")
 
-    print("\n--- Test Case 2: LLM-flagged Contradiction ---")
-    novel_ctx = {"worldview_description": "In this world, everything runs on magic."}
-    test_text_2 = "The hero fought bravely. But then magic suddenly failed for no reason, and his sword went dark."
-    # This test relies on the simulated LLM response logic within detect_conflicts
-    conflicts_2 = agent_with_llm.detect_conflicts(test_text_2, 2, novel_context=novel_ctx)
-    print(f"Found conflicts: {len(conflicts_2)}")
-    if conflicts_2:
-        for c in conflicts_2:
-            if c['type'] == "Potential LLM-flagged Inconsistency": print(c['description'])
+    # Test Case 1: Contradiction with KB
+    print("\n--- Test Case 1: Contradiction with KB ---")
+    llm_client_kb_conflict = MockLLMClientForConflict(fixed_response="""Conflict 1:
+  Description: Character Z is described as blue in the Knowledge Base, but the chapter states they are red.
+  Excerpt: "Character Z, who was famously red, entered the room."
+  KB_Reference: "Character Z is blue."
+  Conflict_Type: Factual Inconsistency with KB
+  Severity: Medium
+---""")
+    agent1 = ConflictDetectionAgent(llm_client=llm_client_kb_conflict, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
+    novel_context1 = {"theme": "Fantasy", "style_preferences": "Epic"}
+    chapter_text1 = "Character Z, who was famously red, entered the room. Fairies danced around."
+    conflicts1 = agent1.detect_conflicts(novel_id=1, current_chapter_text=chapter_text1, current_chapter_number=1, novel_context=novel_context1)
+    print(f"Found conflicts: {len(conflicts1)}")
+    for conflict in conflicts1: print(conflict)
+
+    # Test Case 2: No conflicts
+    print("\n--- Test Case 2: No Conflicts ---")
+    llm_client_no_conflict = MockLLMClientForConflict(fixed_response="No significant conflicts detected.")
+    agent2 = ConflictDetectionAgent(llm_client=llm_client_no_conflict, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
+    chapter_text2 = "The weather was pleasant, and everyone had a good day."
+    conflicts2 = agent2.detect_conflicts(novel_id=1, current_chapter_text=chapter_text2, current_chapter_number=2, novel_context=novel_context1)
+    print(f"Found conflicts: {len(conflicts2)}")
+    for conflict in conflicts2: print(conflict)
+
+    # Test Case 3: Internal Inconsistency
+    print("\n--- Test Case 3: Internal Inconsistency ---")
+    llm_client_internal_conflict = MockLLMClientForConflict(fixed_response="""Conflict 1:
+  Description: The character is stated to be alone, but then speaks to another character.
+  Excerpt: "He was utterly alone in the vast chamber. 'Are you there?' he whispered to Maria."
+  Conflict_Type: Internal Inconsistency
+  Severity: High
+---""")
+    agent3 = ConflictDetectionAgent(llm_client=llm_client_internal_conflict, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
+    chapter_text3 = "He was utterly alone in the vast chamber. 'Are you there?' he whispered to Maria."
+    conflicts3 = agent3.detect_conflicts(novel_id=1, current_chapter_text=chapter_text3, current_chapter_number=3)
+    print(f"Found conflicts: {len(conflicts3)}")
+    for conflict in conflicts3: print(conflict)
+
+    # Test Case 4: Unparseable but not "no conflicts"
+    print("\n--- Test Case 4: Unparseable response ---")
+    llm_client_unparseable = MockLLMClientForConflict(fixed_response="Something seems off with the timeline, check dates.")
+    agent4 = ConflictDetectionAgent(llm_client=llm_client_unparseable, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
+    chapter_text4 = "It was Monday, then it was Friday."
+    conflicts4 = agent4.detect_conflicts(novel_id=1, current_chapter_text=chapter_text4, current_chapter_number=4)
+    print(f"Found conflicts: {len(conflicts4)}")
+    for conflict in conflicts4: print(conflict)
+
+    # Test Case 5: No LLM Client
+    print("\n--- Test Case 5: No LLM Client ---")
+    agent5 = ConflictDetectionAgent(llm_client=None, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
+    conflicts5 = agent5.detect_conflicts(novel_id=1, current_chapter_text=chapter_text1, current_chapter_number=5)
+    print(f"Found conflicts: {len(conflicts5)}")
+    for conflict in conflicts5: print(conflict)
+
+    # Test Case 6: Dynamic LoreKeeper instantiation
+    print("\n--- Test Case 6: Dynamic LoreKeeper with db_name ---")
+    # This test relies on the actual LoreKeeperAgent and its dependencies (like ChromaDB)
+    # being available if db_name is used for real. For a unit test, MockLoreKeeperAgent should be used.
+    # We can simulate this by checking if the dynamic instantiation path is taken.
+    # For true unit testing of this path, we'd mock LoreKeeperAgent itself when imported.
+    agent6 = ConflictDetectionAgent(llm_client=llm_client_no_conflict, db_name="mock_dynamic.db") # lore_keeper is None
+    # To truly test dynamic instantiation, we'd need to ensure LoreKeeperAgent import works
+    # and possibly mock its constructor if it does heavy lifting.
+    # For this test, the print statements in the constructor will indicate if it tries.
+    # The kb_results will be empty because MockLoreKeeperAgent is not globally patched here.
+    conflicts6 = agent6.detect_conflicts(novel_id=2, current_chapter_text="The hero arrived.", current_chapter_number=1)
+    print(f"Found conflicts for agent6: {len(conflicts6)}")
 
 
-    print("\n--- Test Case 3: No Obvious Contradiction ---")
-    test_text_3 = "The sun set, and the moon rose. The characters went to sleep."
-    conflicts_3 = agent_with_llm.detect_conflicts(test_text_3, 3)
-    print(f"Found conflicts: {len(conflicts_3)}")
+    # Test Case 7: Multi-field parsing
+    print("\n--- Test Case 7: Multi-field conflict parsing ---")
+    multi_field_response = """Conflict 1:
+  Description: Character Anna is stated to have green eyes in the KB, but the chapter says her eyes are blue.
+  Excerpt: "Anna's blue eyes sparkled."
+  KB_Reference: "Anna (Eyes: Green, Hair: Blonde)"
+  Conflict_Type: Factual Inconsistency with KB
+  Severity: Medium
+---
+Conflict 2:
+  Description: The scene is set during a harsh winter, but the character is wearing summer clothes.
+  Excerpt: "She wore a light cotton sundress despite the blizzard."
+  Conflict_Type: Internal Inconsistency
+  Severity: High
+---
+Conflict 3:
+  Description: Timeline issue. Event A is said to happen before Event B in KB, but chapter implies reverse.
+  Excerpt: "After Event B, they prepared for Event A."
+  KB_Reference: "Timeline: Event A -> Event C -> Event B"
+  Conflict_Type: Timeline Error
+  Severity: Medium
+"""
+    llm_client_multi = MockLLMClientForConflict(fixed_response=multi_field_response)
+    agent7 = ConflictDetectionAgent(llm_client=llm_client_multi, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
+    chapter_text7 = "Anna's blue eyes sparkled. She wore a light cotton sundress despite the blizzard. After Event B, they prepared for Event A."
+    conflicts7 = agent7.detect_conflicts(novel_id=3, current_chapter_text=chapter_text7, current_chapter_number=1)
+    print(f"Found conflicts: {len(conflicts7)}")
+    assert len(conflicts7) == 3
+    for i, c in enumerate(conflicts7):
+        print(f"  Conflict {i+1}:")
+        for k,v in c.items(): print(f"    {k}: {v}")
+    assert conflicts7[0]['type'] == "Factual Inconsistency with KB"
+    assert "Anna's blue eyes sparkled." in conflicts7[0]['excerpt']
+    assert conflicts7[1]['severity'] == "High"
+    assert conflicts7[2]['kb_reference'] is not None
 
-    print("\n--- Test Case 4: Agent without LLM ---")
-    conflicts_4 = agent_no_llm.detect_conflicts(test_text_1, 4) # Should only find heuristic one
-    print(f"Found conflicts: {len(conflicts_4)}")
-    if conflicts_4: print(conflicts_4[0]['description'])
+    print("Done with ConflictDetectionAgent tests.")

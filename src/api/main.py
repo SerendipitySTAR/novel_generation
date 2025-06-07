@@ -1,46 +1,76 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 import uvicorn
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional # Ensure Optional is imported
-import uuid # Added for conflict report endpoint
+from typing import List, Dict, Any, Optional
+import uuid
+from datetime import datetime
+import json # Required for selected_worldview_detail in deprecated endpoint
 
-from src.orchestration.workflow_manager import WorkflowManager
-# UserInput from workflow_manager is not directly used here if new Pydantic models are made
-
-# Potentially for type hinting or direct use in a full implementation
-# from src.core.models import Chapter
-# from src.agents.content_integrity_agent import ContentIntegrityAgent
-# from src.agents.conflict_detection_agent import ConflictDetectionAgent
+from src.orchestration.workflow_manager import WorkflowManager, NovelWorkflowState # Added NovelWorkflowState for typing
+from src.persistence.database_manager import DatabaseManager # Added DatabaseManager
+from src.agents.lore_keeper_agent import LoreKeeperAgent # Added for Knowledge Graph endpoint
 
 
 # --- Pydantic Models for API Request and Response ---
 
-class NarrativeRequestPayload(BaseModel):
+class NarrativeRequestPayload(BaseModel): # Kept for existing endpoint
     theme: str
     style_preferences: Optional[str] = "general fiction"
 
-class NarrativeResponse(BaseModel): # Updated model
+class NarrativeResponse(BaseModel): # Kept for existing endpoint
     narrative_id: Optional[int] = None
     narrative_outline: Optional[str] = None
-    worldview_data: Optional[str] = None # Added worldview_data
+    worldview_data: Optional[str] = None
     error_message: Optional[str] = None
     history: Optional[List[str]] = None
 
-# New Pydantic Models
+# --- New/Updated Pydantic Models for Novel Generation ---
+
 class NovelGenerationRequest(BaseModel):
     theme: str
     style_preferences: Optional[str] = "general fiction"
-    chapters: int = 3 # Default to 3 chapters
+    chapters: Optional[int] = 3
     words_per_chapter: Optional[int] = 1000
-    mode: Optional[str] = "human" # "human" or "auto"
+    mode: Optional[str] = "auto" # Defaulting to auto for background tasks
 
-class NovelGenerationResponse(BaseModel):
-    novel_id: Optional[int] = None # Would be the ID from the database
-    message: str
-    status_url: Optional[str] = None # For async polling in a real app
+class NovelMetadataResponse(BaseModel):
+    novel_id: int
+    theme: str
+    status: str
+    created_at: datetime # Store as ISO string, FastAPI handles conversion
+
+class NovelStatusResponse(BaseModel):
+    novel_id: int
+    status: str
+    current_step: Optional[str] = None # e.g., "generating_outline", "writing_chapter_2"
+    last_history_entry: Optional[str] = None
     error_message: Optional[str] = None
+    # Potentially add: created_at, last_updated_at
 
-class ChapterContentResponse(BaseModel):
+# --- Pydantic Models for Human Decision Endpoints ---
+class DecisionOption(BaseModel):
+    id: str # Could be a numerical index as string, or a specific hash/ID
+    text_summary: str
+    full_data: Optional[Any] = None
+
+class DecisionPromptResponse(BaseModel):
+    novel_id: int
+    decision_type: Optional[str] = None
+    prompt_message: Optional[str] = None
+    options: Optional[List[DecisionOption]] = None
+    workflow_status: str # e.g. "paused_for_outline_selection", "running", "completed"
+
+class DecisionSubmissionRequest(BaseModel):
+    selected_option_id: Optional[str] = None
+    custom_data: Optional[Dict[str, Any]] = None # For more complex inputs
+
+class ResumeWorkflowResponse(BaseModel):
+    novel_id: int
+    message: str
+    status_after_resume_trigger: str
+
+
+class ChapterContentResponse(BaseModel): # Kept for existing endpoint
     novel_id: int
     chapter_number: int
     title: Optional[str] = "N/A"
@@ -48,13 +78,13 @@ class ChapterContentResponse(BaseModel):
     review: Optional[Dict[str, Any]] = None # From ContentIntegrityAgent
     error_message: Optional[str] = None
 
-class ConflictReportResponse(BaseModel):
+class ConflictReportResponse(BaseModel): # Kept for existing endpoint
     novel_id: int
     chapter_number: int
     conflicts: Optional[List[Dict[str, Any]]] = []
     error_message: Optional[str] = None
 
-class KnowledgeGraphResponse(BaseModel):
+class KnowledgeGraphResponse(BaseModel): # Kept for existing endpoint
     novel_id: int
     graph_data: Optional[Dict[str, Any]] = {"nodes": [], "edges": []}
     error_message: Optional[str] = None
@@ -63,8 +93,60 @@ class KnowledgeGraphResponse(BaseModel):
 app = FastAPI(
     title="Automatic Novel Generator API",
     description="API for managing and interacting with the novel generation process.",
-    version="0.1.1", # Incremented version
+    version="0.2.0", # Incremented version for new features
 )
+
+# --- Database and Workflow Manager Initialization ---
+# For simplicity in this example, using a global DB name.
+# In a real app, this might come from config.
+DB_FILE_NAME = "novel_api_main.db"
+
+# This function will run in the background
+def run_novel_workflow_task(novel_id: int, user_input_data: dict, db_name_for_task: str):
+    print(f"Background task started for novel_id: {novel_id} with db: {db_name_for_task}")
+    db_manager_task = DatabaseManager(db_name=db_name_for_task)
+    db_manager_task.update_novel_status(novel_id, workflow_status="processing", current_step_details="Workflow started.")
+
+    try:
+        # WorkflowManager's mode is now primarily driven by user_input_data's interaction_mode and auto_mode
+        manager = WorkflowManager(db_name=db_name_for_task)
+        user_input_data_for_wf = user_input_data.copy()
+        # Ensure interaction_mode is set if API is used, default to "api" if this task is called by API.
+        # However, this task is generic; the caller (API endpoint) should set interaction_mode.
+        # For POST /novels/, if mode is "human", interaction_mode should be "api".
+        if user_input_data_for_wf.get("mode") == "human" and not user_input_data_for_wf.get("interaction_mode"):
+            user_input_data_for_wf["interaction_mode"] = "api"
+
+        final_state: NovelWorkflowState = manager.run_workflow(user_input_data_for_wf)
+
+        final_workflow_status = final_state.get("workflow_status", "unknown_completion")
+        final_error_message = final_state.get("error_message")
+
+        # Serialize final state for storage if needed, especially if paused.
+        # Simplified serialization:
+        final_state_json = json.dumps({
+            k: v for k, v in final_state.items()
+            if isinstance(v, (type(None), str, int, float, bool, list, dict))
+        })
+
+        if final_error_message:
+            print(f"Background task for novel_id {novel_id} completed with error: {final_error_message}")
+            db_manager_task.update_novel_status_after_resume(novel_id, "failed", final_state_json) # Use a method that also saves state
+        elif final_workflow_status.startswith("paused_for_"):
+            # The decision node itself should have saved its pause state via update_novel_pause_state.
+            # No further action needed here on status, assuming decision node did its job.
+            print(f"Background task for novel_id {novel_id} paused: {final_workflow_status}")
+        else:
+            print(f"Background task for novel_id {novel_id} completed successfully. Status: {final_workflow_status}")
+            db_manager_task.update_novel_status_after_resume(novel_id, final_workflow_status, final_state_json)
+
+    except Exception as e:
+        print(f"Critical error in background task run_novel_workflow_task for novel_id {novel_id}: {e}")
+        import traceback; traceback.print_exc()
+        db_manager_task.update_novel_status(novel_id, workflow_status="system_error", error_message=str(e))
+    finally:
+        print(f"Background task run_novel_workflow_task finished for novel_id: {novel_id}")
+
 
 @app.get("/")
 async def root():
@@ -74,152 +156,368 @@ async def root():
 async def health_check():
     return {"status": "ok", "message": "API is healthy"}
 
-
-@app.post("/generate/narrative_outline", response_model=NarrativeResponse)
-async def generate_narrative_outline_endpoint(payload: NarrativeRequestPayload):
-    print(f"API: Received request to generate narrative outline for theme: '{payload.theme}'")
+# --- New Endpoints ---
+@app.post("/novels/", response_model=NovelMetadataResponse, status_code=202) # 202 Accepted for background tasks
+async def create_novel_generation_task(
+    payload: NovelGenerationRequest,
+    background_tasks: BackgroundTasks,
+    request: Request # To construct full URL
+):
+    print(f"API: Received request to generate novel: Theme='{payload.theme}', Mode='{payload.mode}'")
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME) # Use the global DB name
 
     try:
-        manager = WorkflowManager()
-        workflow_input = {
+        # Add novel to DB with initial "pending" status
+        # Assuming add_novel is adapted or a new method add_novel_with_status exists
+        # For now, we'll use add_novel and conceptually update status later or assume it adds a default status
+        novel_id = db_manager.add_novel(
+            user_theme=payload.theme,
+            style_preferences=payload.style_preferences or "general fiction"
+            # status="pending" # Conceptual
+        )
+        # db_manager.update_novel_status(novel_id, "pending", "Awaiting workflow start") # Conceptual
+
+        novel_record = db_manager.get_novel_by_id(novel_id)
+        if not novel_record:
+            raise HTTPException(status_code=500, detail="Failed to create novel record in database.")
+
+        user_input_for_workflow = {
             "theme": payload.theme,
-            "style_preferences": payload.style_preferences
+            "style_preferences": payload.style_preferences,
+            "chapters": payload.chapters,
+            "words_per_chapter": payload.words_per_chapter,
+            "auto_mode": payload.mode == "auto" # WorkflowManager expects auto_mode boolean
         }
 
-        final_state = manager.run_workflow(workflow_input)
+        background_tasks.add_task(run_novel_workflow_task, novel_id, user_input_for_workflow, DB_FILE_NAME)
 
-        # Construct response, now including worldview_data
+        return NovelMetadataResponse(
+            novel_id=novel_id,
+            theme=novel_record['user_theme'], # Use validated data from DB
+            status="pending", # Initial status returned
+            created_at=datetime.fromisoformat(novel_record['creation_date']) # Convert from ISO string
+        )
+    except Exception as e:
+        # import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to start novel generation: {e}")
+
+
+@app.get("/novels/{novel_id}/status", response_model=NovelStatusResponse)
+async def get_novel_status(novel_id: int):
+    print(f"API: Request for status of Novel ID {novel_id}")
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel_record = db_manager.get_novel_by_id(novel_id)
+
+    if not novel_record:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    # Conceptual: Fetch these from the novel_record if the DB schema were updated
+    db_data = db_manager.load_workflow_snapshot_and_decision_info(novel_id) # This now fetches all relevant fields
+
+    workflow_status = db_data.get("workflow_status", "unknown") if db_data else "unknown"
+    current_step = None
+    last_history_entry = None # Placeholder, could parse from full_workflow_state_json if needed
+    error_msg = db_data.get("error_message") if db_data else None # Assuming error_message is a direct column or part of state
+
+    if db_data:
+        # If there's a pending decision, that's the most current step/status detail
+        if db_data.get("pending_decision_type"):
+            current_step = f"Awaiting decision for: {db_data['pending_decision_type']}"
+            # workflow_status might already be "paused_for_..." which is good.
+        elif workflow_status.startswith("resuming_") or workflow_status.startswith("running_"):
+             current_step = "Workflow in progress..."
+        elif workflow_status == "pending" and not db_data.get("pending_decision_type"): # Initial state before first run
+            current_step = "Workflow is pending initiation."
+        # Add more specific current_step details based on workflow_status if it's more granular like "outline_generated"
+        elif workflow_status == "outline_generated":
+            current_step = "Outline generation complete."
+        elif workflow_status == "chapters_generated":
+            # This is a fallback, ideally status from workflow run is more descriptive
+            chapters = db_manager.get_chapters_for_novel(novel_id) # Query only if needed
+            current_step = f"Chapter {len(chapters)} generated."
+        elif workflow_status in ["completed", "failed", "system_error", "system_error_resuming_task", "resumption_critical_error"]:
+            current_step = f"Workflow ended with status: {workflow_status}"
+            if error_msg:
+                 current_step += f" Error: {error_msg}"
+
+
+        # Attempt to get last history entry from snapshot if available
+        full_state_json = db_data.get("full_workflow_state_json")
+        if full_state_json:
+            try:
+                state_dict = json.loads(full_state_json)
+                if state_dict.get("history") and isinstance(state_dict["history"], list) and state_dict["history"]:
+                    last_history_entry = str(state_dict["history"][-1]) # Ensure it's a string
+            except json.JSONDecodeError:
+                print(f"Warning: Could not parse full_workflow_state_json for novel {novel_id} in status check for history.")
+
+
+    return NovelStatusResponse(
+        novel_id=novel_id,
+        status=workflow_status,
+        current_step=current_step,
+        last_history_entry=last_history_entry,
+        error_message=error_msg
+    )
+
+# --- Human Decision Endpoints ---
+@app.get("/novels/{novel_id}/decisions/next", response_model=DecisionPromptResponse)
+async def get_next_human_decision(novel_id: int):
+    print(f"API: Request for next human decision for Novel ID {novel_id}")
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    decision_info = db_manager.load_workflow_snapshot_and_decision_info(novel_id)
+
+    if not decision_info:
+        novel_check = db_manager.get_novel_by_id(novel_id)
+        if not novel_check:
+            raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+        return DecisionPromptResponse(
+            novel_id=novel_id,
+            decision_type=None,
+            prompt_message="No pending human decision found or novel not in a pausable state.",
+            options=[],
+            workflow_status=novel_check.get("workflow_status", "unknown") # type: ignore
+        )
+
+    workflow_status = decision_info.get("workflow_status", "running")
+    pending_decision_type = decision_info.get("pending_decision_type")
+    options_json = decision_info.get("pending_decision_options_json")
+    prompt_message = decision_info.get("pending_decision_prompt")
+
+    options_list: Optional[List[DecisionOption]] = None
+    if options_json:
+        try:
+            options_data = json.loads(options_json)
+            options_list = [DecisionOption(**opt) for opt in options_data]
+        except json.JSONDecodeError:
+            print(f"API Error: Could not parse decision options JSON for novel {novel_id}")
+            raise HTTPException(status_code=500, detail="Error processing decision options for novel.")
+
+    if workflow_status and workflow_status.startswith("paused_for_") and pending_decision_type and options_list is not None: # Ensure options_list is not None if expected
+        return DecisionPromptResponse(
+            novel_id=novel_id,
+            decision_type=pending_decision_type,
+            prompt_message=prompt_message or f"Please make a selection for {pending_decision_type}.",
+            options=options_list,
+            workflow_status=workflow_status
+        )
+    else:
+        # If it's not specifically "paused_for_", or if options/type are missing when they shouldn't be.
+        return DecisionPromptResponse(
+            novel_id=novel_id,
+            decision_type=None,
+            prompt_message="No active human decision currently pending for this novel.",
+            options=[],
+            workflow_status=workflow_status
+        )
+
+def resume_novel_workflow_task(novel_id: int, decision_type: str, decision_payload_dict: dict, db_name_for_task: str):
+    print(f"Background task to RESUME workflow for novel_id: {novel_id}, decision: {decision_type}")
+    db_manager_task = DatabaseManager(db_name=db_name_for_task)
+
+    try:
+        manager = WorkflowManager(db_name=db_name_for_task)
+        final_state_after_resume = manager.resume_workflow(novel_id, decision_type, decision_payload_dict)
+
+        final_status = final_state_after_resume.get("workflow_status", "unknown_after_resume")
+
+        if not final_status.startswith("paused_for_"):
+            # If it's not paused again, then it either completed, failed, or hit an unexpected state.
+            # The resume_workflow method itself now handles saving the final state snapshot.
+            print(f"Novel {novel_id} workflow after resume: Final status '{final_status}'. State saved by resume_workflow.")
+        else:
+            # If it paused again, the pause state (including snapshot) was already saved by the decision node
+            # from within the resume_workflow -> self.app.invoke() call.
+            print(f"Novel {novel_id} workflow paused again after resume for: {final_status}. State saved by decision node.")
+
+    except Exception as e:
+        print(f"Critical error in resume_novel_workflow_task for novel_id {novel_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Ensure the DB reflects this task-level error.
+        db_manager_task.update_novel_status(novel_id, workflow_status="system_error_resuming_task", error_message=str(e))
+    finally:
+        print(f"Background task for resuming novel_id {novel_id} finished.")
+
+
+@app.post("/novels/{novel_id}/decisions/{decision_type_param}", response_model=ResumeWorkflowResponse)
+async def submit_human_decision(
+    novel_id: int,
+    decision_type_param: str, # From path
+    payload: DecisionSubmissionRequest,
+    background_tasks: BackgroundTasks
+):
+    print(f"API: Received decision for Novel ID {novel_id}, Type: {decision_type_param}, Payload: {payload.model_dump_json(exclude_none=True)}")
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+
+    # Validate if the novel is actually awaiting this decision
+    decision_info = db_manager.load_workflow_snapshot_and_decision_info(novel_id)
+    if not decision_info:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found or has no workflow state.")
+
+    current_workflow_status = decision_info.get("workflow_status")
+    current_pending_decision_type = decision_info.get("pending_decision_type")
+
+    if not current_workflow_status or not current_workflow_status.startswith("paused_for_") or current_pending_decision_type != decision_type_param:
+        raise HTTPException(status_code=409, # Conflict
+                            detail=f"Novel {novel_id} is not awaiting a decision of type '{decision_type_param}'. "
+                                   f"Current status: '{current_workflow_status}', awaiting: '{current_pending_decision_type}'.")
+
+    user_decision_payload_json = payload.model_dump_json(exclude_none=True)
+    new_db_status = f"resuming_with_decision_{decision_type_param}"
+
+    try:
+        db_manager.record_user_decision(novel_id, decision_type_param, user_decision_payload_json, new_workflow_status=new_db_status)
+    except Exception as e:
+        # Handle potential DB error during recording decision
+        raise HTTPException(status_code=500, detail=f"Failed to record decision in database: {e}")
+
+    decision_data_for_workflow = payload.model_dump() # Pass the dict to the task
+
+    background_tasks.add_task(resume_novel_workflow_task, novel_id, decision_type_param, decision_data_for_workflow, DB_FILE_NAME)
+
+    return ResumeWorkflowResponse(
+        novel_id=novel_id,
+        message=f"Decision for '{decision_type_param}' received. Workflow resumption triggered.",
+        status_after_resume_trigger=new_db_status
+    )
+
+
+# --- Existing Endpoints (Kept for now) ---
+@app.post("/generate/narrative_outline", response_model=NarrativeResponse, deprecated=True)
+async def generate_narrative_outline_endpoint(payload: NarrativeRequestPayload):
+    """
+    Generates a narrative outline and worldview.
+    **Deprecated**: Use `POST /novels/` and then retrieve components.
+    """
+    print(f"API: Received request to generate narrative outline for theme: '{payload.theme}'")
+    try:
+        manager = WorkflowManager(db_name=DB_FILE_NAME) # Use global DB name
+        workflow_input = {
+            "theme": payload.theme,
+            "style_preferences": payload.style_preferences,
+            "chapters": 1, # Minimal for outline/worldview
+            "auto_mode": True # Assume auto for this older endpoint
+        }
+        final_state = manager.run_workflow(workflow_input)
         response_data = {
-            "narrative_id": final_state.get("narrative_id"),
-            "narrative_outline": final_state.get("narrative_outline"),
-            "worldview_data": final_state.get("worldview_data"), # Include worldview_data
+            "narrative_id": final_state.get("novel_id"), # Changed from narrative_id to novel_id
+            "narrative_outline": final_state.get("narrative_outline_text"), # Key name change
+            "worldview_data": json.dumps(final_state.get("selected_worldview_detail")) if final_state.get("selected_worldview_detail") else None,
             "error_message": final_state.get("error_message"),
             "history": final_state.get("history")
         }
-
-        if final_state.get("error_message") and not final_state.get("narrative_id"):
-            print(f"API: Workflow completed with error: {final_state.get('error_message')}")
-        elif final_state.get("narrative_id"):
-            print(f"API: Workflow successful. Narrative ID: {final_state.get('narrative_id')}")
-
+        if final_state.get("error_message"):
+            print(f"API: Workflow (narrative_outline) completed with error: {final_state.get('error_message')}")
         return NarrativeResponse(**response_data)
-
     except Exception as e:
-        print(f"API: Unexpected error in generate_narrative_outline_endpoint: {e}")
-        # In a real app, log the full traceback e.g. using logging module
-        # import traceback; traceback.print_exc();
-        raise HTTPException(status_code=500, detail=f"An unexpected API error occurred.") # Generic message to client
+        # import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An unexpected API error occurred: {e}")
 
-# --- New Placeholder Endpoints ---
 
-@app.post("/generate/full_novel", response_model=NovelGenerationResponse)
-async def start_full_novel_generation(payload: NovelGenerationRequest):
-    print(f"API: Received request to generate full novel: Theme='{payload.theme}', Mode='{payload.mode}'")
-    # Placeholder logic:
-    # In a real app, this would:
-    # 1. Validate input
-    # 2. Create a new novel record in the DB to get a novel_id
-    # 3. Initiate the WorkflowManager.run_workflow in a background task (e.g., Celery)
-    # 4. Return the novel_id and a way to check status.
-
-    # For this placeholder, we'll simulate a synchronous start and immediate (mocked) response.
-    # We won't actually run the full workflow here as it can be long.
-    mock_novel_id = 123 # Simulate a new novel ID
-
-    # Simulate passing relevant parts to WorkflowManager if it were run
-    user_input_for_workflow = {
-        "theme": payload.theme,
-        "style_preferences": payload.style_preferences,
-        "chapters": payload.chapters,
-        "words_per_chapter": payload.words_per_chapter,
-        "auto_mode": payload.mode == "auto"
-    }
-    print(f"API: Placeholder - Would run workflow with: {user_input_for_workflow}")
-
-    # This is where you would call manager.run_workflow(user_input_for_workflow)
-    # For now, just return a success message.
-    return NovelGenerationResponse(
-        novel_id=mock_novel_id,
-        message=f"Placeholder: Novel generation started for theme '{payload.theme}' with ID {mock_novel_id}. Check status for actual progress.",
-        status_url=f"/novels/{mock_novel_id}/status" # Example status URL
-    )
-
-@app.get("/novels/{novel_id}/chapters/{chapter_number}", response_model=ChapterContentResponse)
+@app.get("/novels/{novel_id}/chapters/{chapter_number}", response_model=ChapterContentResponse, deprecated=True)
 async def get_chapter_content(novel_id: int, chapter_number: int):
+    """
+    Retrieves content for a specific chapter.
+    **Deprecated**: More specific component endpoints might be added or status endpoint might provide paths.
+    """
     print(f"API: Request for content of Novel ID {novel_id}, Chapter {chapter_number}")
-    # Placeholder logic:
-    # 1. Query DatabaseManager for the chapter content and its review.
-    # db_manager = DatabaseManager() # Assuming a way to get a DB manager instance
-    # chapter_data = db_manager.get_chapter(novel_id, chapter_number)
-    # review_data = db_manager.get_chapter_review(novel_id, chapter_number) # Hypothetical
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    chapter_obj = db_manager.get_chapters_for_novel(novel_id) # Gets all, find specific one
+    target_chapter = next((c for c in chapter_obj if c['chapter_number'] == chapter_number), None)
 
-    # Mocked response for placeholder:
-    if novel_id == 123 and chapter_number == 1:
+    if target_chapter:
+        # Conceptual: Fetch review data if stored separately
+        # review_data = db_manager.get_chapter_review(target_chapter['id'])
         return ChapterContentResponse(
             novel_id=novel_id,
             chapter_number=chapter_number,
-            title="The Beginning (Mocked)",
-            content="Once upon a time, in a mocked land...",
-            review={"overall_score": 8.0, "justification": "This is a mocked review."}
+            title=target_chapter['title'],
+            content=target_chapter['content'],
+            # review=review_data # Add if available
         )
-    return ChapterContentResponse(
-        novel_id=novel_id,
-        chapter_number=chapter_number,
-        error_message="Placeholder: Chapter not found or functionality not implemented."
-    )
+    raise HTTPException(status_code=404, detail=f"Chapter {chapter_number} for novel {novel_id} not found.")
 
-@app.get("/novels/{novel_id}/chapters/{chapter_number}/conflicts", response_model=ConflictReportResponse)
+
+@app.get("/novels/{novel_id}/chapters/{chapter_number}/conflicts", response_model=ConflictReportResponse, deprecated=True)
 async def get_chapter_conflict_report(novel_id: int, chapter_number: int):
+    """
+    Retrieves conflict report for a specific chapter.
+    **Deprecated**: This information might be part of a broader status or quality report.
+    """
     print(f"API: Request for conflict report of Novel ID {novel_id}, Chapter {chapter_number}")
-    # Placeholder logic:
-    # 1. Query DatabaseManager or workflow state storage for conflict data.
-    # conflict_data = db_manager.get_conflicts_for_chapter(novel_id, chapter_number) # Hypothetical
-
-    # Mocked response:
-    if novel_id == 123 and chapter_number == 1:
-        # Simulate a conflict found by ConflictDetectionAgent
-        mock_conflicts = [{
-            "conflict_id": str(uuid.uuid4()), # Requires import uuid
-            "type": "Plot Contradiction (Mocked)",
-            "description": "A character was said to be asleep but was also flying a kite.",
-            "severity": "Medium",
-            "chapter_source": chapter_number,
-            "problematic_excerpt": "He was fast asleep. Outside, he flew his kite."
-        }]
-        return ConflictReportResponse(novel_id=novel_id, chapter_number=chapter_number, conflicts=mock_conflicts)
-
+    # This endpoint is harder to implement correctly without the workflow actively storing this
+    # specific data point per chapter in an easily queryable way by the DB.
+    # The current workflow state (`current_chapter_conflicts`) is transient.
+    # For now, returning a placeholder.
+    # A real implementation would require DB schema changes or a log/event store.
     return ConflictReportResponse(
         novel_id=novel_id,
         chapter_number=chapter_number,
-        error_message="Placeholder: Conflict report not available or functionality not implemented."
+        conflicts=[], # Placeholder
+        error_message="Conflict reporting per chapter is conceptual and not fully implemented for direct query."
     )
 
 @app.get("/novels/{novel_id}/knowledge_graph", response_model=KnowledgeGraphResponse)
 async def get_novel_knowledge_graph(novel_id: int):
+    """
+    Retrieves the knowledge graph for a novel.
+    This endpoint attempts to generate/retrieve the KG data on-demand.
+    """
     print(f"API: Request for knowledge graph of Novel ID {novel_id}")
-    # Placeholder logic:
-    # 1. Call LoreKeeperAgent.get_knowledge_graph_data(novel_id)
-    # This might involve running a mini-workflow or directly calling the agent method
-    # if the agent can be instantiated with just a novel_id or db access.
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel_record = db_manager.get_novel_by_id(novel_id)
 
-    # Mocked response:
-    if novel_id == 123:
-        mock_graph_data = {
-            "nodes": [
-                {"id": "char_1", "label": "Hero (Mocked)", "type": "character"},
-                {"id": "event_1", "label": "The Quest Begins (Mocked)", "type": "plot_event"}
-            ],
-            "edges": []
-        }
-        return KnowledgeGraphResponse(novel_id=novel_id, graph_data=mock_graph_data)
+    if not novel_record:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
 
-    return KnowledgeGraphResponse(
-        novel_id=novel_id,
-        error_message="Placeholder: Knowledge graph data not available or functionality not implemented."
-    )
+    # Optional: Check novel status if desired (e.g., only allow if "completed")
+    # For now, we proceed if the novel exists.
+
+    try:
+        agent = LoreKeeperAgent(db_name=DB_FILE_NAME)
+        # Assuming get_knowledge_graph_data is designed to be called post-generation
+        # and can derive the graph from persisted KB entries.
+        graph_data = agent.get_knowledge_graph_data(novel_id=novel_id)
+
+        if graph_data and ("nodes" in graph_data or "edges" in graph_data): # Basic check for valid graph structure
+            # Check if the agent itself reported an error within the graph_data
+            if isinstance(graph_data.get("error"), str):
+                 print(f"API: LoreKeeperAgent reported an error for KG novel {novel_id}: {graph_data['error']}")
+                 return KnowledgeGraphResponse(
+                    novel_id=novel_id,
+                    graph_data={"nodes": graph_data.get("nodes",[]), "edges": graph_data.get("edges",[])}, # return partial data if available
+                    error_message=f"Error from knowledge graph generation: {graph_data['error']}"
+                )
+            return KnowledgeGraphResponse(novel_id=novel_id, graph_data=graph_data)
+        else:
+            # This case handles if graph_data is None or not in the expected format
+            print(f"API: Knowledge graph data for novel {novel_id} was empty or invalid from LoreKeeperAgent.")
+            return KnowledgeGraphResponse(
+                novel_id=novel_id,
+                graph_data={"nodes": [], "edges": []}, # Return empty graph
+                error_message="Knowledge graph data is empty or could not be generated."
+            )
+    except ImportError as ie: # Catch specific error if LoreKeeperAgent or its deps are missing
+        print(f"API: ImportError during LoreKeeperAgent instantiation for KG novel {novel_id}: {ie}")
+        # import traceback; traceback.print_exc(); # For server logs
+        raise HTTPException(status_code=501, detail=f"Knowledge Graph feature is not fully available due to missing dependencies: {ie}")
+    except Exception as e:
+        print(f"API: Error retrieving knowledge graph for novel {novel_id}: {e}")
+        # import traceback; traceback.print_exc(); # For server logs
+        # Consider if this should be a 500 or a specific response indicating KG failure
+        return KnowledgeGraphResponse(
+            novel_id=novel_id,
+            graph_data=None,
+            error_message=f"An unexpected error occurred while generating the knowledge graph: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
+    # Create a default DB if it doesn't exist for local testing
+    print(f"Initializing database '{DB_FILE_NAME}' for API...")
+    _ = DatabaseManager(db_name=DB_FILE_NAME) # This will create tables if they don't exist
+
     print("Starting FastAPI server with Uvicorn...")
-    print("Run with: uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000")
+    print(f"Run with: uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000")
     uvicorn.run("src.api.main:app", host="0.0.0.0", port=8000, reload=True)

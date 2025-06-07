@@ -33,6 +33,12 @@ class DatabaseManager:
                         active_outline_id INTEGER,
                         active_worldview_id INTEGER,
                         active_plot_id INTEGER,
+                        workflow_status TEXT DEFAULT 'pending',
+                        pending_decision_type TEXT DEFAULT NULL,
+                        pending_decision_options_json TEXT DEFAULT NULL,
+                        pending_decision_prompt TEXT DEFAULT NULL,
+                        full_workflow_state_json TEXT DEFAULT NULL,
+                        user_made_decision_payload_json TEXT DEFAULT NULL,
                         FOREIGN KEY (active_outline_id) REFERENCES outlines(id) ON DELETE SET NULL,
                         FOREIGN KEY (active_worldview_id) REFERENCES worldviews(id) ON DELETE SET NULL,
                         FOREIGN KEY (active_plot_id) REFERENCES plots(id) ON DELETE SET NULL
@@ -478,6 +484,113 @@ class DatabaseManager:
                 return [Chapter(**dict(row)) for row in cur.fetchall()]
         except sqlite3.Error as e: print(f"Error retrieving chapters for novel {novel_id}: {e}"); return []
 
+    def update_novel_status(self, novel_id: int, workflow_status: str, current_step_details: Optional[str] = None, error_message: Optional[str] = None, history_log_json: Optional[str] = None):
+        """
+        Updates the status and other operational fields of a novel.
+        Conceptual: This would be expanded to use specific columns if they existed.
+        For now, it might only update workflow_status if that's the only new column.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # Assuming 'workflow_status' is a column. Add other fields if columns exist.
+                # For example, if 'current_step_details_col' exists:
+                # query = "UPDATE novels SET workflow_status = ?, current_step_details_col = ? WHERE id = ?"
+                # params = (workflow_status, current_step_details, novel_id)
+                query = "UPDATE novels SET workflow_status = ? WHERE id = ?"
+                params = (workflow_status, novel_id)
+                cursor.execute(query, params)
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error updating novel {novel_id} status: {e}")
+            raise
+
+    def update_novel_pause_state(self, novel_id: int, workflow_status: str,
+                                 pending_decision_type: Optional[str],
+                                 pending_decision_options_json: Optional[str],
+                                 pending_decision_prompt: Optional[str],
+                                 full_workflow_state_json: str) -> None:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE novels SET
+                        workflow_status = ?,
+                        pending_decision_type = ?,
+                        pending_decision_options_json = ?,
+                        pending_decision_prompt = ?,
+                        full_workflow_state_json = ?,
+                        user_made_decision_payload_json = NULL
+                    WHERE id = ?
+                """, (workflow_status, pending_decision_type, pending_decision_options_json,
+                      pending_decision_prompt, full_workflow_state_json, novel_id))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error updating novel pause state for novel_id {novel_id}: {e}")
+            raise
+
+    def load_workflow_snapshot_and_decision_info(self, novel_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT workflow_status, pending_decision_type, pending_decision_options_json,
+                           pending_decision_prompt, full_workflow_state_json, user_made_decision_payload_json
+                    FROM novels WHERE id = ?
+                """, (novel_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except sqlite3.Error as e:
+            print(f"Error loading workflow snapshot for novel_id {novel_id}: {e}")
+            return None
+
+    def record_user_decision(self, novel_id: int, decision_type: str, user_made_decision_payload_json: str,
+                             new_workflow_status: str = "resuming_with_decision") -> None:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE novels SET
+                        workflow_status = ?,
+                        pending_decision_type = NULL, /* Clear pending type as it's being processed */
+                        user_made_decision_payload_json = ?
+                    WHERE id = ? AND pending_decision_type = ?
+                """, (new_workflow_status, user_made_decision_payload_json, novel_id, decision_type))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                if cursor.rowcount == 0:
+                    print(f"Warning: No novel found for ID {novel_id} awaiting decision type '{decision_type}' when recording decision.")
+        except sqlite3.Error as e:
+            print(f"Error recording user decision for novel_id {novel_id}: {e}")
+            raise
+
+    def update_novel_status_after_resume(self, novel_id: int, new_workflow_status: str,
+                                         full_workflow_state_json_after_resume: Optional[str] = None) -> None:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if full_workflow_state_json_after_resume is not None:
+                    cursor.execute("""
+                        UPDATE novels SET
+                            workflow_status = ?,
+                            user_made_decision_payload_json = NULL, /* Clear processed decision */
+                            full_workflow_state_json = ?
+                        WHERE id = ?
+                    """, (new_workflow_status, full_workflow_state_json_after_resume, novel_id))
+                else:
+                    cursor.execute("""
+                        UPDATE novels SET
+                            workflow_status = ?,
+                            user_made_decision_payload_json = NULL
+                        WHERE id = ?
+                    """, (new_workflow_status, novel_id))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error updating novel status after resume for novel_id {novel_id}: {e}")
+            raise
 
     # --- KnowledgeBaseEntry Methods ---
     # ... (add_kb_entry, get_kb_entry_by_id, get_kb_entries_for_novel remain the same)
@@ -485,8 +598,8 @@ class DatabaseManager:
                      embedding: Optional[List[float]] = None,
                      related_entities: Optional[List[str]] = None) -> int:
         ts = datetime.now(timezone.utc).isoformat()
-        emb_blob = sqlite3.Binary(str(embedding).encode()) if embedding else None
-        rel_ent_json = str(related_entities) if related_entities else None
+        emb_blob = sqlite3.Binary(str(embedding).encode()) if embedding else None # type: ignore
+        rel_ent_json = str(related_entities) if related_entities else None # type: ignore
         try:
             with self._get_connection() as conn:
                 cur = conn.cursor()
