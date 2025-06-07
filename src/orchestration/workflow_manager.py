@@ -1557,26 +1557,51 @@ def prepare_conflict_review_for_api(state: NovelWorkflowState) -> Dict[str, Any]
 
     history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Preparing conflicts for API review.")
 
-    # Check if resuming after a decision was made for conflict_review by resume_workflow
-    # The user_made_decision_payload will contain the action chosen by the user.
-    decision_payload_for_current_node = state.get("user_made_decision_payload")
-    if decision_payload_for_current_node and decision_payload_for_current_node.get("source_decision_type") == "conflict_review":
-        action_taken = decision_payload_for_current_node.get("action", "unknown_action_processed")
-        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Conflict review decision '{action_taken}' processed by resume_workflow. Proceeding.")
+    history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Preparing conflicts for API review.")
 
-        # Clear the payload as it's been processed by resume_workflow's specific logic for this type
-        state["user_made_decision_payload"] = None
-        state["workflow_status"] = f"running_after_conflict_review_decision" # Generic running status
-        # Ensure other pending fields are also clear, though resume_workflow should have done this.
-        state["pending_decision_type"] = None
-        state["pending_decision_options"] = None
-        state["pending_decision_prompt"] = None
-        # original_chapter_content_for_conflict_review was handled by resume_workflow
+    decision_payload_processed_by_resume = state.get("user_made_decision_payload", {}).get("action_taken_in_resume")
 
-        state["history"] = history
-        return state # This will go to _check_workflow_pause_status, which should return "continue_workflow"
+    if decision_payload_processed_by_resume:
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: An action '{decision_payload_processed_by_resume}' was processed by resume_workflow.")
+        # Check if all conflicts are resolved or ignored
+        # pending_decision_options in the state should have been updated by resume_workflow if an action was taken on one.
+        # Or, current_chapter_conflicts might have been cleared if a global action like rewrite_all was done.
 
-    # If not resuming, proceed to pause for decision
+        # Re-evaluate remaining conflicts from state["pending_decision_options"] (which should reflect latest conflict statuses)
+        # If a specific conflict was handled (e.g. applied_suggestion, ignored_by_user),
+        # its status in pending_decision_options would be updated by resume_workflow before re-invoke.
+
+        # The critical part is if resume_workflow decided to clear all pending items (e.g. on proceed_with_remaining)
+        # or if it modified the list of pending_decision_options to only contain unresolved ones.
+        # For now, assume resume_workflow sets user_made_decision_payload if global action,
+        # and updates pending_decision_options for individual actions.
+
+        unresolved_conflicts_in_options = []
+        if state.get("pending_decision_options"):
+            for c in state.get("pending_decision_options", []):
+                if not c.get("full_data", {}).get("resolution_status"): # Check resolution_status in the full_data
+                    unresolved_conflicts_in_options.append(c)
+
+        if not unresolved_conflicts_in_options or \
+           decision_payload_processed_by_resume in ["rewrite_all_auto_remaining", "proceed_with_remaining"]:
+            history = _log_and_update_history(history, f"Chapter {current_chapter_num}: All conflicts processed or global action taken. Proceeding.")
+            state["user_made_decision_payload"] = None
+            state["workflow_status"] = "running_after_conflict_review_all_resolved_or_ignored"
+            state["pending_decision_type"] = None
+            state["pending_decision_options"] = None
+            state["pending_decision_prompt"] = None
+            state["original_chapter_content_for_conflict_review"] = None
+            state["current_chapter_conflicts"] = [] # Clear if all resolved/ignored/proceeded
+            state["history"] = history
+            return state # To _check_workflow_pause_status -> "continue_workflow"
+        else:
+            # Still unresolved conflicts, re-pause with the remaining ones
+            state["pending_decision_options"] = unresolved_conflicts_in_options
+            # workflow_status will be set to paused_for_conflict_review again below
+            history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Re-pausing for {len(unresolved_conflicts_in_options)} remaining conflicts.")
+            # Fall through to the pausing logic
+
+    # If not resuming from a processed decision, or if re-pausing:
     if not novel_id:
         error_msg = f"Chapter {current_chapter_num}: Novel ID missing, cannot prepare conflicts for API review."
         history = _log_and_update_history(history, error_msg, True)
@@ -1849,57 +1874,153 @@ class WorkflowManager:
             original_content = current_state_snapshot.get("original_chapter_content_for_conflict_review")
             conflicts_at_pause = current_state_snapshot.get("current_chapter_conflicts", []) # These are the conflicts presented to user
 
-            # Correctly access action from custom_data for conflict_review
-            custom_data = decision_payload_from_api.get("custom_data", {})
-            action = custom_data.get("action", "proceed_as_is") # Default action
+            # Correctly access action directly from the payload
+            action = decision_payload_from_api.get("action")
+            conflict_id_from_payload = decision_payload_from_api.get("conflict_id")
+            suggestion_index_from_payload = decision_payload_from_api.get("suggestion_index")
+            user_comment = decision_payload_from_api.get("user_comment") # Log this if present
 
-            if not original_content:
-                 current_state_snapshot["error_message"] = "Original chapter content for conflict review not found in state. Cannot resume."
-                 current_state_snapshot["workflow_status"] = "resume_failed_missing_data"
-                 # Save this error state to DB
-                 error_snapshot_json = json.dumps({k: v for k, v in current_state_snapshot.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))})
-                 db_manager.update_novel_status_after_resume(novel_id, current_state_snapshot["workflow_status"], error_snapshot_json)
-                 return current_state_snapshot
-
-            if action == "attempt_generic_rewrite_all_conflicts":
-                history = current_state_snapshot.get("history", [])
-                history = _log_and_update_history(history, f"Chapter {current_state_snapshot.get('current_chapter_number')}: Human decision was 'attempt_generic_rewrite_all_conflicts'.")
+            history = current_state_snapshot.get("history", [])
+            if user_comment:
+                history = _log_and_update_history(history, f"User comment on conflict resolution action '{action}': {user_comment}")
                 current_state_snapshot["history"] = history
 
-                llm_client = LLMClient()
-                resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=self.db_name)
-                novel_context = current_state_snapshot.get("user_input") # Or a more specific context
+            # This is the text that might have been modified by *previous* actions in the same review session
+            current_chapter_text_being_edited = current_state_snapshot.get("generated_chapters", [])[-1]["content"]
 
-                revised_text = resolver_agent.attempt_auto_resolve(
-                    novel_id, original_content, conflicts_at_pause, novel_context=novel_context
-                )
-                if revised_text and revised_text != original_content:
-                    generated_chapters = list(current_state_snapshot.get("generated_chapters", []))
-                    if generated_chapters:
-                        updated_chapter = dict(generated_chapters[-1])
-                        updated_chapter["content"] = revised_text
-                        updated_chapter["summary"] = "Summary needs regeneration after conflict rewrite."
-                        generated_chapters[-1] = updated_chapter
-                        current_state_snapshot["generated_chapters"] = generated_chapters
-                        current_state_snapshot["current_chapter_conflicts"] = [] # Assume rewrite addressed them
-                        history = _log_and_update_history(history, "Chapter text modified by generic rewrite after human decision.")
-                        current_state_snapshot["history"] = history
-                    else: # Should not happen if original_content was present
-                        current_state_snapshot["error_message"] = "No generated chapters found to update after conflict rewrite."
+            # This is the list of conflicts as presented to the user, potentially with 'llm_suggestions'
+            # We need to update this list in-place for 'resolution_status' for re-pausing.
+            # The options are List[DecisionOption] from API, which has full_data as the conflict dict
+            # So, pending_decision_options is List[Dict] where each dict is a DecisionOption structure.
+            # The actual conflict is in 'full_data' of that.
+            current_conflicts_for_review = current_state_snapshot.get("pending_decision_options", [])
+
+
+            if action == "apply_suggestion":
+                if not conflict_id_from_payload or suggestion_index_from_payload is None:
+                    current_state_snapshot["error_message"] = "apply_suggestion action requires conflict_id and suggestion_index."
                 else:
-                    history = _log_and_update_history(history, "Generic rewrite attempted but no changes made to text.")
+                    target_conflict_option = next((c for c in current_conflicts_for_review if c["id"] == conflict_id_from_payload), None)
+                    if target_conflict_option and target_conflict_option["full_data"]:
+                        target_conflict_dict = target_conflict_option["full_data"] # This is the actual conflict dict
+                        original_excerpt = target_conflict_dict.get("excerpt")
+                        suggestions = target_conflict_dict.get("llm_suggestions", [])
+                        if original_excerpt and 0 <= suggestion_index_from_payload < len(suggestions):
+                            chosen_suggestion_text = suggestions[suggestion_index_from_payload]
+
+                            excerpt_start_index = current_chapter_text_being_edited.find(original_excerpt)
+                            if excerpt_start_index != -1:
+                                before_excerpt = current_chapter_text_being_edited[:excerpt_start_index]
+                                after_excerpt = current_chapter_text_being_edited[excerpt_start_index + len(original_excerpt):]
+                                current_chapter_text_being_edited = before_excerpt + chosen_suggestion_text + after_excerpt
+
+                                current_state_snapshot["generated_chapters"][-1]["content"] = current_chapter_text_being_edited
+                                target_conflict_dict["resolution_status"] = "applied_suggestion"
+                                target_conflict_dict["applied_suggestion_text"] = chosen_suggestion_text
+                                history = _log_and_update_history(history, f"Applied suggestion for conflict {conflict_id_from_payload}.")
+                                current_state_snapshot["history"] = history
+                            else:
+                                history = _log_and_update_history(history, f"Warning: Original excerpt for conflict {conflict_id_from_payload} not found in current text. Suggestion not applied.", True)
+                                target_conflict_dict["resolution_status"] = "apply_failed_excerpt_not_found"
+                        else:
+                             history = _log_and_update_history(history, f"Warning: Invalid suggestion index or missing excerpt for conflict {conflict_id_from_payload}.", True)
+                             if target_conflict_dict: target_conflict_dict["resolution_status"] = "apply_failed_invalid_suggestion"
+                    else:
+                        history = _log_and_update_history(history, f"Warning: Conflict ID {conflict_id_from_payload} not found for applying suggestion.", True)
+                # After applying one suggestion, we re-pause to show updated state.
+                current_state_snapshot["workflow_status"] = f"paused_for_conflict_review_ch_{current_state_snapshot.get('current_chapter_number')}"
+                # The user_made_decision_payload needs to signal to prepare_conflict_review_for_api that an action was taken
+                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "apply_suggestion"
+
+
+            elif action == "ignore_conflict":
+                if not conflict_id_from_payload:
+                    current_state_snapshot["error_message"] = "ignore_conflict action requires conflict_id."
+                else:
+                    target_conflict_option = next((c for c in current_conflicts_for_review if c["id"] == conflict_id_from_payload), None)
+                    if target_conflict_option and target_conflict_option["full_data"]:
+                        target_conflict_option["full_data"]["resolution_status"] = "ignored_by_user"
+                        history = _log_and_update_history(history, f"Conflict {conflict_id_from_payload} marked as ignored.")
+                        current_state_snapshot["history"] = history
+                    else:
+                        history = _log_and_update_history(history, f"Warning: Conflict ID {conflict_id_from_payload} not found for ignoring.", True)
+                current_state_snapshot["workflow_status"] = f"paused_for_conflict_review_ch_{current_state_snapshot.get('current_chapter_number')}"
+                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "ignore_conflict"
+
+
+            elif action == "rewrite_all_auto_remaining":
+                history = _log_and_update_history(history, "Attempting auto-resolve for remaining unresolved conflicts.")
+                current_state_snapshot["history"] = history
+
+                unresolved_conflicts = [
+                    c["full_data"] for c in current_conflicts_for_review
+                    if not c.get("full_data", {}).get("resolution_status")
+                ]
+                if unresolved_conflicts:
+                    llm_client = LLMClient()
+                    resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=self.db_name)
+                    novel_context = current_state_snapshot.get("user_input")
+
+                    revised_text = resolver_agent.attempt_auto_resolve(
+                        novel_id, current_chapter_text_being_edited, unresolved_conflicts, novel_context=novel_context
+                    )
+                    if revised_text and revised_text != current_chapter_text_being_edited:
+                        current_state_snapshot["generated_chapters"][-1]["content"] = revised_text
+                        history = _log_and_update_history(history, "Chapter text modified by 'rewrite_all_auto_remaining'.")
+                        current_state_snapshot["history"] = history
+                    else:
+                         history = _log_and_update_history(history, "'rewrite_all_auto_remaining' made no changes to text.")
+                         current_state_snapshot["history"] = history
+                else:
+                    history = _log_and_update_history(history, "No unresolved conflicts found for 'rewrite_all_auto_remaining'.")
                     current_state_snapshot["history"] = history
-                    # Conflicts remain as they were not changed
 
-            # For "proceed_as_is", no specific text modification here.
-            # The `user_made_decision_payload` now contains the action, which the `prepare_conflict_review_for_api` node will see upon reinvocation.
-            current_state_snapshot["original_chapter_content_for_conflict_review"] = None # Clear after processing
+                # This action implies we are done with this pause cycle.
+                current_state_snapshot["workflow_status"] = "running_after_conflict_review"
+                current_state_snapshot["pending_decision_type"] = None
+                current_state_snapshot["pending_decision_options"] = None
+                current_state_snapshot["pending_decision_prompt"] = None
+                current_state_snapshot["original_chapter_content_for_conflict_review"] = None
+                current_state_snapshot["current_chapter_conflicts"] = [] # Assume all processed or remaining are accepted as is after auto attempt.
+                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "rewrite_all_auto_remaining"
 
-        # Common state updates for any decision type before re-invocation
-        current_state_snapshot["workflow_status"] = f"resuming_after_{decision_type_from_api}"
-        current_state_snapshot["pending_decision_type"] = None
-        current_state_snapshot["pending_decision_options"] = None
-        current_state_snapshot["pending_decision_prompt"] = None
+
+            elif action == "proceed_with_remaining":
+                history = _log_and_update_history(history, "Proceeding with remaining conflicts as they are.")
+                current_state_snapshot["history"] = history
+                # Mark all remaining unresolved conflicts
+                for c_option in current_conflicts_for_review:
+                    if not c_option.get("full_data",{}).get("resolution_status"):
+                        c_option["full_data"]["resolution_status"] = "proceeded_without_change"
+
+                current_state_snapshot["workflow_status"] = "running_after_conflict_review"
+                current_state_snapshot["pending_decision_type"] = None
+                current_state_snapshot["pending_decision_options"] = None # Cleared as we are proceeding
+                current_state_snapshot["pending_decision_prompt"] = None
+                current_state_snapshot["original_chapter_content_for_conflict_review"] = None
+                # current_chapter_conflicts might remain as is in state if some were ignored/proceeded, for record keeping,
+                # but they won't be presented again for this pause cycle. Or clear them. Let's clear.
+                current_state_snapshot["current_chapter_conflicts"] = []
+                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "proceed_with_remaining"
+
+            else: # Default or unknown action
+                history = _log_and_update_history(history, f"Unknown action '{action}' for conflict review. Defaulting to re-pause.")
+                current_state_snapshot["history"] = history
+                current_state_snapshot["workflow_status"] = f"paused_for_conflict_review_ch_{current_state_snapshot.get('current_chapter_number')}"
+                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "unknown_action"
+
+
+            # If an individual action was taken ("apply_suggestion", "ignore_conflict") that might re-pause,
+            # we need to update the pending_decision_options in the snapshot before saving it via update_novel_pause_state later.
+            if current_state_snapshot["workflow_status"].startswith("paused_for_conflict_review"):
+                 current_state_snapshot["pending_decision_options"] = current_conflicts_for_review # Save updated statuses
+
+        # Common state updates for any decision type before re-invocation (some might be overridden by conflict logic)
+        if not current_state_snapshot["workflow_status"].startswith("paused_for_"): # If not specifically re-paused by conflict logic
+            current_state_snapshot["workflow_status"] = f"resuming_after_{decision_type_from_api}"
+            current_state_snapshot["pending_decision_type"] = None
+            current_state_snapshot["pending_decision_options"] = None
+            current_state_snapshot["pending_decision_prompt"] = None
         current_state_snapshot["error_message"] = None # Clear previous errors before resuming
 
         num_chapters = current_state_snapshot.get("user_input", {}).get("chapters", 3)

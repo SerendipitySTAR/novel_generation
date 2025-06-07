@@ -398,7 +398,8 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
     def test_execute_conflict_resolution_auto_no_change(self, MockConflictResolutionAgent):
         mock_resolver_instance = MockConflictResolutionAgent.return_value
         original_text = "Chapter content with conflict."
-        mock_resolver_instance.attempt_auto_resolve.return_value = original_text # No change
+        # Functional agent returns original text if no change, or None if error (which node handles by keeping original)
+        mock_resolver_instance.attempt_auto_resolve.return_value = original_text
 
         state = NovelWorkflowState(
             novel_id=1, current_chapter_number=1, db_name=self.db_name, history=[],
@@ -417,7 +418,7 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         mock_resolver_instance = MockConflictResolutionAgent.return_value
         original_text = "Chapter content with conflict."
         revised_text = "Revised chapter content."
-        mock_resolver_instance.attempt_auto_resolve.return_value = revised_text
+        mock_resolver_instance.attempt_auto_resolve.return_value = revised_text # Functional agent returns new text
 
         state = NovelWorkflowState(
             novel_id=1, current_chapter_number=1, db_name=self.db_name, history=[],
@@ -439,8 +440,11 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         mock_resolver_instance = MockConflictResolutionAgent.return_value
         mock_db_instance = MockDatabaseManager.return_value
 
-        sample_conflict_list = [{"conflict_id": "c1", "description": "Conflict 1", "type": "Plot", "severity": "High"}]
-        mock_resolver_instance.suggest_revisions_for_human_review.return_value = sample_conflict_list
+        # Functional agent now returns conflicts with 'llm_suggestions'
+        augmented_conflict_list = [
+            {"conflict_id": "c1", "description": "Conflict 1", "type": "Plot", "severity": "High", "llm_suggestions": ["Suggestion A for C1"]}
+        ]
+        mock_resolver_instance.suggest_revisions_for_human_review.return_value = augmented_conflict_list
 
         state = NovelWorkflowState(
             novel_id=1, current_chapter_number=1, db_name=self.db_name, history=[],
@@ -454,9 +458,11 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         self.assertEqual(returned_state["pending_decision_type"], "conflict_review")
         # Check options structure
         self.assertEqual(len(returned_state["pending_decision_options"]), 1)
-        self.assertEqual(returned_state["pending_decision_options"][0]["id"], "c1")
-        self.assertIn("Conflict Type: Plot", returned_state["pending_decision_options"][0]["text_summary"])
-        self.assertEqual(returned_state["pending_decision_options"][0]["full_data"], sample_conflict_list[0])
+        api_option = returned_state["pending_decision_options"][0]
+        self.assertEqual(api_option["id"], "c1")
+        self.assertIn("Conflict Type: Plot", api_option["text_summary"])
+        self.assertEqual(api_option["full_data"]["conflict_id"], "c1") # full_data is the conflict dict
+        self.assertEqual(api_option["full_data"]["llm_suggestions"], ["Suggestion A for C1"])
 
         self.assertTrue(returned_state["workflow_status"].startswith("paused_for_conflict_review_ch_1"))
         self.assertEqual(returned_state["original_chapter_content_for_conflict_review"], "Text with issues")
@@ -485,44 +491,121 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         self.assertIsNone(returned_state.get("pending_decision_type"))
 
     # --- Tests for resume_workflow (Conflict Review Path) ---
-    @patch.object(WorkflowManager, '_build_graph') # Prevent graph compilation in test
+    @patch.object(WorkflowManager, '_build_graph')
     @patch('src.orchestration.workflow_manager.DatabaseManager')
     @patch('src.orchestration.workflow_manager.ConflictResolutionAgent')
-    def test_resume_workflow_conflict_review_proceed_as_is(self, MockConflictResolutionAgent, MockDatabaseManager, mock_build_graph):
+    def test_resume_workflow_conflict_apply_suggestion(self, MockConflictResolutionAgent, MockDatabaseManager, mock_build_graph_ignored):
         mock_db_instance = MockDatabaseManager.return_value
-        mock_resolver_instance = MockConflictResolutionAgent.return_value
+        # Note: ConflictResolutionAgent is not directly used by resume_workflow for "apply_suggestion" itself,
+        # but its output (suggestions) would have been in the paused state.
 
-        original_content = "Chapter content with conflict."
+        original_chapter_content = "Chapter with conflict: old excerpt here."
+        conflict_id_to_apply = "c1"
+        suggestion_to_apply = "new excerpt text"
+
+        # This is what was saved when prepare_conflict_review_for_api paused
         paused_state_dict = {
             "novel_id": 1, "current_chapter_number": 1, "db_name": self.db_name, "history": ["paused for conflict"],
-            "generated_chapters": [{"id":1, "novel_id":1, "chapter_number":1, "title":"Ch1", "content":original_content, "summary":"S1"}],
-            "current_chapter_conflicts": [{"id": "c1", "description": "A conflict"}],
-            "original_chapter_content_for_conflict_review": original_content,
-            "pending_decision_type": "conflict_review", # This would be NULL in DB if record_user_decision cleared it
+            "generated_chapters": [{"id":1, "novel_id":1, "chapter_number":1, "title":"Ch1", "content":original_chapter_content, "summary":"S1"}],
+            "original_chapter_content_for_conflict_review": original_chapter_content,
+            "pending_decision_type": "conflict_review", # This should be set at pause time
             "workflow_status": "paused_for_conflict_review_ch_1",
+            "pending_decision_options": [ # This is List[DecisionOption] from API perspective, so full_data holds the conflict
+                {"id": "c1", "text_summary": "d1", "full_data": {"conflict_id": "c1", "description": "d1", "excerpt": "old excerpt here", "llm_suggestions": [suggestion_to_apply, "another suggestion"]}},
+                {"id": "c2", "text_summary": "d2", "full_data": {"conflict_id": "c2", "description": "d2", "excerpt": "another old excerpt", "llm_suggestions": ["suggestion for c2"]}}
+            ],
+            "current_chapter_conflicts": [ # Original raw conflicts, might be used by "rewrite_all_auto_remaining"
+                 {"conflict_id": "c1", "description": "d1", "excerpt": "old excerpt here"},
+                 {"conflict_id": "c2", "description": "d2", "excerpt": "another old excerpt"}
+            ],
             "user_input": {"theme":"t", "chapters":1, "auto_mode":False, "interaction_mode":"api"},
             "execution_count": 1
         }
         mock_db_instance.load_workflow_snapshot_and_decision_info.return_value = {
-            "full_workflow_state_json": json.dumps(paused_state_dict),
-            # user_made_decision_payload_json is set by record_user_decision, not directly used by resume_workflow logic here
+            "full_workflow_state_json": json.dumps(paused_state_dict)
         }
 
         manager = WorkflowManager(db_name=self.db_name)
-        manager.app = MagicMock() # Mock the compiled LangGraph app
-        manager.app.invoke = MagicMock(return_value=paused_state_dict) # invoke returns a state
+        manager.app = MagicMock()
+        # We need to mock what app.invoke returns. It will be the state after prepare_conflict_review_for_api runs again.
+        # Let's assume prepare_conflict_review_for_api correctly re-pauses with updated pending_decision_options.
+        state_after_prepare_node_runs = paused_state_dict.copy()
+        # Simulate that the applied conflict is now marked and text is updated in generated_chapters by resume_workflow
+        state_after_prepare_node_runs["generated_chapters"] = [{"id":1, "novel_id":1, "chapter_number":1, "title":"Ch1", "content":"Chapter with conflict: new excerpt text.", "summary":"S1"}]
+        updated_pending_options = [
+            {"id": "c1", "text_summary": "d1", "full_data": {"conflict_id": "c1", "description": "d1", "excerpt": "old excerpt here", "llm_suggestions": [suggestion_to_apply, "another suggestion"], "resolution_status": "applied_suggestion", "applied_suggestion_text": suggestion_to_apply}},
+            {"id": "c2", "text_summary": "d2", "full_data": {"conflict_id": "c2", "description": "d2", "excerpt": "another old excerpt", "llm_suggestions": ["suggestion for c2"]}} # c2 is still unresolved
+        ]
+        state_after_prepare_node_runs["pending_decision_options"] = updated_pending_options
+        state_after_prepare_node_runs["workflow_status"] = "paused_for_conflict_review_ch_1" # Node re-pauses
+        manager.app.invoke = MagicMock(return_value=state_after_prepare_node_runs)
 
-        decision_payload = {"custom_data": {"action": "proceed_as_is"}}
+        decision_payload = {"action": "apply_suggestion", "conflict_id": conflict_id_to_apply, "suggestion_index": 0}
         final_state = manager.resume_workflow(1, "conflict_review", decision_payload)
 
-        mock_resolver_instance.attempt_auto_resolve.assert_not_called()
-
-        # Check the state passed to invoke
+        # Verify state passed to invoke by resume_workflow
         invoked_state_arg = manager.app.invoke.call_args[0][0]
-        self.assertEqual(invoked_state_arg["user_made_decision_payload"]["action"], "proceed_as_is")
-        self.assertEqual(invoked_state_arg["generated_chapters"][0]["content"], original_content) # Should be original
-        self.assertIsNone(invoked_state_arg["original_chapter_content_for_conflict_review"]) # Cleared
-        mock_db_instance.update_novel_status_after_resume.assert_called()
+        self.assertEqual(invoked_state_arg["generated_chapters"][-1]["content"], "Chapter with conflict: new excerpt text.")
+        res_conflict_option = next(opt for opt in invoked_state_arg["pending_decision_options"] if opt["id"] == conflict_id_to_apply)
+        self.assertEqual(res_conflict_option["full_data"]["resolution_status"], "applied_suggestion")
+        self.assertEqual(res_conflict_option["full_data"]["applied_suggestion_text"], suggestion_to_apply)
+        self.assertTrue(invoked_state_arg["workflow_status"].startswith("paused_for_conflict_review_ch_"))
+        self.assertEqual(invoked_state_arg["user_made_decision_payload"]["action_taken_in_resume"], "apply_suggestion")
+
+        # Since it re-paused, update_novel_pause_state should be called by prepare_conflict_review_for_api,
+        # not update_novel_status_after_resume by resume_workflow's final block.
+        # This means the final_status in resume_workflow will start with "paused_for_"
+        mock_db_instance.update_novel_status_after_resume.assert_not_called()
+
+
+    @patch.object(WorkflowManager, '_build_graph')
+    @patch('src.orchestration.workflow_manager.DatabaseManager')
+    @patch('src.orchestration.workflow_manager.ConflictResolutionAgent')
+    def test_resume_workflow_conflict_ignore_conflict(self, MockConflictResolutionAgent, MockDatabaseManager, mock_build_graph):
+        mock_db_instance = MockDatabaseManager.return_value
+        original_content = "Chapter content with conflict: old excerpt here."
+        conflict_id_to_ignore = "c1"
+
+        paused_state_dict = {
+            "novel_id": 1, "current_chapter_number": 1, "db_name": self.db_name, "history": ["paused for conflict"],
+            "generated_chapters": [{"id":1, "novel_id":1, "chapter_number":1, "title":"Ch1", "content":original_content, "summary":"S1"}],
+            "original_chapter_content_for_conflict_review": original_content,
+            "pending_decision_type": "conflict_review",
+            "workflow_status": "paused_for_conflict_review_ch_1",
+            "pending_decision_options": [
+                {"id": "c1", "text_summary": "d1", "full_data": {"conflict_id": "c1", "description": "d1", "excerpt": "old excerpt here", "llm_suggestions": ["suggestion1"]}},
+                {"id": "c2", "text_summary": "d2", "full_data": {"conflict_id": "c2", "description": "d2", "excerpt": "another old excerpt", "llm_suggestions": ["suggestion for c2"]}}
+            ],
+            "current_chapter_conflicts": [{"conflict_id": "c1", "description": "d1", "excerpt": "old excerpt here"}],
+            "user_input": {"theme":"t", "chapters":1, "auto_mode":False, "interaction_mode":"api"},
+            "execution_count": 1
+        }
+        mock_db_instance.load_workflow_snapshot_and_decision_info.return_value = {
+            "full_workflow_state_json": json.dumps(paused_state_dict)
+        }
+
+        manager = WorkflowManager(db_name=self.db_name)
+        manager.app = MagicMock()
+        # Simulate state after prepare_conflict_review_for_api re-evaluates and re-pauses
+        state_after_prepare_node_runs = paused_state_dict.copy()
+        updated_pending_options = [
+            {"id": "c1", "text_summary": "d1", "full_data": {"conflict_id": "c1", "description": "d1", "excerpt": "old excerpt here", "llm_suggestions": ["suggestion1"], "resolution_status": "ignored_by_user"}},
+            {"id": "c2", "text_summary": "d2", "full_data": {"conflict_id": "c2", "description": "d2", "excerpt": "another old excerpt", "llm_suggestions": ["suggestion for c2"]}}
+        ]
+        state_after_prepare_node_runs["pending_decision_options"] = updated_pending_options
+        state_after_prepare_node_runs["workflow_status"] = "paused_for_conflict_review_ch_1"
+        manager.app.invoke = MagicMock(return_value=state_after_prepare_node_runs)
+
+        decision_payload = {"action": "ignore_conflict", "conflict_id": conflict_id_to_ignore}
+        final_state = manager.resume_workflow(1, "conflict_review", decision_payload)
+
+        invoked_state_arg = manager.app.invoke.call_args[0][0]
+        self.assertEqual(invoked_state_arg["generated_chapters"][0]["content"], original_content) # Unchanged
+        res_conflict_option = next(opt for opt in invoked_state_arg["pending_decision_options"] if opt["id"] == conflict_id_to_ignore)
+        self.assertEqual(res_conflict_option["full_data"]["resolution_status"], "ignored_by_user")
+        self.assertTrue(invoked_state_arg["workflow_status"].startswith("paused_for_conflict_review_ch_"))
+        self.assertEqual(invoked_state_arg["user_made_decision_payload"]["action_taken_in_resume"], "ignore_conflict")
+        mock_db_instance.update_novel_status_after_resume.assert_not_called()
 
 
     @patch.object(WorkflowManager, '_build_graph')
@@ -539,7 +622,10 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         paused_state_dict = {
             "novel_id": 1, "current_chapter_number": 1, "db_name": self.db_name, "history": ["paused for conflict"],
             "generated_chapters": [{"id":1, "novel_id":1, "chapter_number":1, "title":"Ch1", "content":original_content, "summary":"S1"}],
-            "current_chapter_conflicts": [{"id": "c1", "description": "A conflict"}],
+            "current_chapter_conflicts": [{"conflict_id": "c1", "description": "A conflict"}], # These are original conflicts
+            "pending_decision_options": [ # These are what user saw, potentially with suggestions
+                 {"id": "c1", "full_data":{"conflict_id": "c1", "description": "A conflict", "excerpt": "problematic excerpt"}}
+            ],
             "original_chapter_content_for_conflict_review": original_content,
             "pending_decision_type": "conflict_review",
             "workflow_status": "paused_for_conflict_review_ch_1",
@@ -552,25 +638,40 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
 
         manager = WorkflowManager(db_name=self.db_name)
         manager.app = MagicMock()
-        # Simulate invoke returns a state where status might be "running" or "completed"
-        # For this test, the crucial part is what happens *before* invoke
-        state_after_invoke = paused_state_dict.copy()
-        state_after_invoke["workflow_status"] = "completed"
-        manager.app.invoke = MagicMock(return_value=state_after_invoke)
+        # Simulate invoke leads to a state where prepare_conflict_review_for_api decides all resolved
+        state_after_invoke_and_prepare_node = paused_state_dict.copy()
+        state_after_invoke_and_prepare_node["workflow_status"] = "running_after_conflict_review_all_resolved_or_ignored"
+        state_after_invoke_and_prepare_node["generated_chapters"] = [{"id":1, "novel_id":1, "chapter_number":1, "title":"Ch1", "content":rewritten_text, "summary":"S1"}]
+        state_after_invoke_and_prepare_node["current_chapter_conflicts"] = []
+        state_after_invoke_and_prepare_node["pending_decision_type"] = None
+        state_after_invoke_and_prepare_node["pending_decision_options"] = None
+        manager.app.invoke = MagicMock(return_value=state_after_invoke_and_prepare_node)
 
-        decision_payload = {"custom_data": {"action": "attempt_generic_rewrite_all_conflicts"}}
+        decision_payload = {"action": "rewrite_all_auto_remaining"} # Action comes directly now
         final_state = manager.resume_workflow(1, "conflict_review", decision_payload)
 
+        # Check call to agent
+        # The conflicts passed to agent should be from pending_decision_options[...]['full_data']
+        # and only those that are unresolved.
+        unresolved_in_options = [opt["full_data"] for opt in paused_state_dict["pending_decision_options"] if not opt.get("full_data",{}).get("resolution_status")]
         mock_resolver_instance.attempt_auto_resolve.assert_called_once_with(
-            1, original_content, paused_state_dict["current_chapter_conflicts"],
+            1, original_content, unresolved_in_options,
             novel_context=paused_state_dict["user_input"]
         )
 
+        # Check state passed to invoke by resume_workflow
         invoked_state_arg = manager.app.invoke.call_args[0][0]
         self.assertEqual(invoked_state_arg["generated_chapters"][0]["content"], rewritten_text)
-        self.assertEqual(invoked_state_arg["current_chapter_conflicts"], []) # Should be cleared
-        self.assertIsNone(invoked_state_arg["original_chapter_content_for_conflict_review"]) # Cleared
-        mock_db_instance.update_novel_status_after_resume.assert_called()
+        self.assertEqual(invoked_state_arg["current_chapter_conflicts"], []) # Cleared by resume_workflow
+        self.assertIsNone(invoked_state_arg["original_chapter_content_for_conflict_review"])
+        self.assertEqual(invoked_state_arg["user_made_decision_payload"]["action_taken_in_resume"], "rewrite_all_auto_remaining")
+
+        # Check final DB update by resume_workflow
+        mock_db_instance.update_novel_status_after_resume.assert_called_once()
+        args_db_update = mock_db_instance.update_novel_status_after_resume.call_args[0]
+        self.assertEqual(args_db_update[0], 1) # novel_id
+        self.assertEqual(args_db_update[1], "running_after_conflict_review_all_resolved_or_ignored") # final status
+        self.assertIn(rewritten_text, args_db_update[2]) # final_snapshot_json
 
 
 if __name__ == '__main__':

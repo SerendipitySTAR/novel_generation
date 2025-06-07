@@ -61,8 +61,14 @@ class DecisionPromptResponse(BaseModel):
     workflow_status: str # e.g. "paused_for_outline_selection", "running", "completed"
 
 class DecisionSubmissionRequest(BaseModel):
-    selected_option_id: Optional[str] = None
-    custom_data: Optional[Dict[str, Any]] = None # For more complex inputs
+    action: str  # e.g., "apply_suggestion", "ignore_conflict", "rewrite_all_auto_remaining", "proceed_with_remaining"
+    conflict_id: Optional[str] = None # ID of the specific conflict, if action is conflict-specific
+    suggestion_index: Optional[int] = None # Index of the LLM suggestion, if action is "apply_suggestion"
+    user_comment: Optional[str] = None # Optional notes from user
+    # selected_option_id is removed as conflict_id is more specific for this context.
+    # custom_data is removed in favor of specific fields for conflict decisions.
+    # If this model is used for other decision types later, it might need to be more generic
+    # or have other models for other decision types. For now, tailor to conflict review.
 
 class ResumeWorkflowResponse(BaseModel):
     novel_id: int
