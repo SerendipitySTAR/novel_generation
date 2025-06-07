@@ -17,7 +17,7 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Present AI-generated options...to user (CLI selection for outlines & worldviews implemented; broader multi-option/scoring TODO).
     *   `[ ]` Text editor for user modifications (TODO).
     *   `[ ]` User session management (TODO).
-    *   `[ ]` Web UI (FastAPI/Flask backend, React/Vue/Svelte frontend) (TODO).
+    *   [p] Web UI (FastAPI backend initiated with core endpoints for novel generation start, status, and KB visualization. Frontend TODO).
 *   **[x] Orchestration & Workflow Layer (OLC - README 4.2)**
     *   `[x]` LangGraph based `WorkflowManager` implemented.
     *   `[x]` Manages sequence for outline, worldview, plot, characters, and chapter loop.
@@ -26,7 +26,9 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Conditional branching (Basic error handling exists. Complex branching based on scores/user input TODO).
     *   `[x]` Chapter generation loop structure implemented.
     *   `[x]` Global state management within workflow (MVP level).
-    *   `[ ]` Integration of human input nodes for user decisions (TODO).
+    *   [p] Automated chapter quality control via ContentIntegrityAgent scores, including a retry mechanism for low-quality chapters in Auto-Mode.
+    *   [p] Integration of human input nodes for user decisions (WorkflowManager decision nodes updated to support pausing for API-driven human mode; state saved to DB. API endpoints for querying/submitting decisions implemented. Full E2E flow for API human decisions needs testing & refinement).
+    *   [p] Placeholder logic for mode-specific conflict handling (Auto-Mode auto-resolve log, Human-Mode user prompt log) after ConflictDetectionAgent runs.
 *   **[p] Agent Layer (AL - README 4.3)**
     *   (Individual agent status below)
 *   **[x] LLM Abstraction Layer (LLMAL - README 4.5)**
@@ -38,10 +40,11 @@ This document tracks the implementation status of features and components descri
     *   `[x]` `KnowledgeBaseManager` for RAG using ChromaDB implemented.
     *   `[p]` Vector DB (ChromaDB) for RAG: Stores text chunks from agents. (Live embedding calls implemented; full functionality requires real API key).
     *   `[ ]` Knowledge Graph (KG) for structured facts (TODO).
+    *   [p] Knowledge Base Visualization (Backend API endpoint `/novels/{novel_id}/knowledge_graph` implemented to serve data from LoreKeeperAgent. Frontend visualization TODO).
     *   `[x]` SQL DB for storing `KnowledgeBaseEntry` metadata.
 *   **[x] Data Persistence Layer (DPL - README 4.6)**
     *   `[x]` `DatabaseManager` for SQLite implemented.
-    *   `[x]` Schema for novels, outlines, worldviews, plots (stores List[PlotChapterDetail] as JSON), characters (stores each character's DetailedCharacterProfile as JSON in `description` field), chapters, kb_entries.
+    *   `[x]` Schema for novels, outlines, worldviews, plots (stores List[PlotChapterDetail] as JSON), characters (stores each character's DetailedCharacterProfile as JSON in `description` field), chapters, kb_entries; Novels table extended with fields for workflow_status, pending_decision_info, and full_workflow_state_json to support resumable workflows.
     *   `[ ]` User info/auth storage (TODO).
     *   `[ ]` Versioning of generated content (TODO).
     *   `[ ]` Storing user edits/selections (TODO).
@@ -85,10 +88,10 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Initializes KB from outline, worldview, plot, and now detailed characters. (Live embedding calls implemented; full RAG functionality requires real API key; character data processing for KB now leverages rich DetailedCharacterProfile objects).
     *   `[p]` Updates KB with chapter summaries. (Live embedding calls implemented; full functionality requires real API key).
     *   `[ ]` Structured information extraction from generated content (NLP/LLM assisted) (TODO).
-    *   `[ ]` Conflict detection (TODO).
+    *   [p] Conflict detection (Basic `ConflictDetectionAgent` exists and is integrated into workflow. `WorkflowManager` includes placeholders for Auto-Mode auto-resolution and Human-Mode user notification. Advanced KG-based conflict detection and actual resolution logic TODO).
     *   `[ ]` User validation of KB entries (TODO).
 *   **[p] Quality Guardian Agent (质量审核智能体 - README 4.3.6)** Implemented to review selected outline based on Clarity, Originality, Conflict Potential, Overall Score, and provide Justification. Review is informational (printed to CLI). (Live LLM call enabled; parsing implemented; advanced features/integration TODO).
-*   **[ ] Content Integrity Agent (内容审核智能体 - README 4.3.7)** (TODO)
+*   [p] Content Integrity Agent (内容审核智能体 - README 4.3.7)** (Basic agent implemented with 7-dimensional scoring. WorkflowManager includes chapter retry mechanism in Auto-Mode based on its scores. Full retry strategy and human-in-the-loop for quality TODO).
 *   **[ ] Polish & Refinement Agent (润色智能体 - README 4.3.10)** (TODO)
 
 ## 3. Key Features & Workflow (from README 5 & others)
@@ -135,7 +138,7 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Context Synthesizer Agent (MVP, uses LoreKeeper, adapted for detailed plot & characters, refined brief structure).
     *   `[ ]` Basic frontend UI (TODO).
     *   `[x]` Data Persistence Layer (SQLite, Plot & Character descriptions stored as JSON).
-    *   `[x]` Orchestration Layer (LangGraph, includes CLI outline & worldview selection, Quality Guardian for outline).
+    *   `[x]` Orchestration Layer (LangGraph, includes CLI outline & worldview selection, Quality Guardian for outline). Now includes chapter quality retry logic (Auto-Mode) and placeholders for mode-specific conflict handling.
 *   **[p] Phase 1.b: Live LLM Testing, Prompt Tuning, and Output Stabilization**
     *   `[x]` Configure and Secure OpenAI API Key (Docs updated, .env.example created).
     *   `[x]` Enable Real LLM Calls in Agents & Workflow.
@@ -169,9 +172,19 @@ This document tracks the implementation status of features and components descri
     *   [ ] (Implicit) Critical Bug Fixing & Parser Robustness (Iterative) - Initial major pass done, ongoing as needed.
     *   [ ] (Implicit) RAG System - Live Functional Check - Basic logging in place, deeper functional check & tuning needed.
     *   [ ] (Implicit) Basic Coherence Review - Initial conceptual review done, ongoing with live tests.
-*   **[ ] Phase 2: Core Function Refinement & Initial Agent Shaping** (TODO) # This phase name might need renaming or merging as 2.A-D & 3.A cover much of its intent.
-*   **[ ] Phase 3: Advanced Features & UX Optimization** (TODO) # Original Phase 3
-*   **[ ] Phase 4: Commercialization Prep & Continuous Iteration** (TODO) # Original Phase 4
+*   **[p] Phase 2: Web Interface & Advanced Features (as per original issue doc)**
+    *   `[p]` Develop the core features of the Web interface:
+        *   `[p]` FastAPI backend: Implemented `POST /novels/` for async generation start.
+        *   `[p]` FastAPI backend: Implemented `GET /novels/{novel_id}/status` for status checks.
+        *   [p] FastAPI backend: Implemented `GET /decisions/next` and `POST /decisions/{type}` endpoints for user decisions in Human-Mode. `WorkflowManager` adapted to pause/resume with DB state persistence.
+        *   `[ ]` Frontend UI (React/Vue/Svelte etc.) (TODO).
+    *   `[p]` Implement visual management of the knowledge base:
+        *   `[p]` FastAPI backend: Implemented `GET /novels/{novel_id}/knowledge_graph` to serve KB data.
+        *   `[ ]` Frontend component to display the knowledge graph (TODO).
+    *   `[p]` Establish an intelligent conflict detection mechanism:
+        *   `[p]` Conceptual outline for advanced conflict detection (RAG, KG, better LLM prompts) defined.
+        *   `[ ]` Implementation of advanced conflict detection in `ConflictDetectionAgent` (TODO).
+        *   `[ ]` Implementation of conflict auto-resolution (Auto-Mode) or user-choice presentation (Human-Mode) in `WorkflowManager` (beyond current placeholders) (TODO).
 
 
 ## 5. Other Considerations
