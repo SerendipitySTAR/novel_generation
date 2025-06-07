@@ -101,6 +101,22 @@ class DatabaseManager:
                         FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
                     )
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS chapter_dependencies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        source_chapter_id INTEGER NOT NULL,
+                        target_chapter_id INTEGER NOT NULL,
+                        dependency_type TEXT NOT NULL DEFAULT 'prerequisite',
+                        dependency_strength TEXT NOT NULL DEFAULT 'medium',
+                        description TEXT,
+                        creation_date TEXT NOT NULL,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE,
+                        FOREIGN KEY (source_chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+                        FOREIGN KEY (target_chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+                        UNIQUE(source_chapter_id, target_chapter_id)
+                    )
+                """)
                 conn.commit()
             print(f"Database '{self.db_name}' initialized successfully. All tables are ready.")
         except sqlite3.Error as e:
@@ -514,6 +530,149 @@ class DatabaseManager:
             return entries
         except Exception as e: print(f"Error retrieving KB entries for novel {novel_id}: {e}"); return []
 
+    # --- Chapter Dependencies Methods ---
+    def get_dependencies_by_source_chapter_id(self, source_chapter_id: int) -> List[Dict[str, Any]]:
+        """获取指定源章节的所有依赖关系"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT cd.*,
+                           sc.title as source_chapter_title, sc.chapter_number as source_chapter_number,
+                           tc.title as target_chapter_title, tc.chapter_number as target_chapter_number
+                    FROM chapter_dependencies cd
+                    JOIN chapters sc ON cd.source_chapter_id = sc.id
+                    JOIN chapters tc ON cd.target_chapter_id = tc.id
+                    WHERE cd.source_chapter_id = ?
+                    ORDER BY tc.chapter_number
+                """, (source_chapter_id,))
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"Error retrieving dependencies for source chapter {source_chapter_id}: {e}")
+            return []
+
+    def get_dependencies_by_target_chapter_id(self, target_chapter_id: int) -> List[Dict[str, Any]]:
+        """获取指定目标章节的所有依赖关系"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT cd.*,
+                           sc.title as source_chapter_title, sc.chapter_number as source_chapter_number,
+                           tc.title as target_chapter_title, tc.chapter_number as target_chapter_number
+                    FROM chapter_dependencies cd
+                    JOIN chapters sc ON cd.source_chapter_id = sc.id
+                    JOIN chapters tc ON cd.target_chapter_id = tc.id
+                    WHERE cd.target_chapter_id = ?
+                    ORDER BY sc.chapter_number
+                """, (target_chapter_id,))
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"Error retrieving dependencies for target chapter {target_chapter_id}: {e}")
+            return []
+
+    def get_prerequisite_chapters_for_source(self, source_chapter_id: int) -> List[Dict[str, Any]]:
+        """获取指定源章节的所有前置章节（该章节依赖的章节）"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT cd.*,
+                           sc.title as source_chapter_title, sc.chapter_number as source_chapter_number,
+                           tc.title as target_chapter_title, tc.chapter_number as target_chapter_number
+                    FROM chapter_dependencies cd
+                    JOIN chapters sc ON cd.source_chapter_id = sc.id
+                    JOIN chapters tc ON cd.target_chapter_id = tc.id
+                    WHERE cd.target_chapter_id = ?
+                    AND cd.dependency_type = 'prerequisite'
+                    ORDER BY sc.chapter_number
+                """, (source_chapter_id,))
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"Error retrieving prerequisite chapters for source chapter {source_chapter_id}: {e}")
+            return []
+
+    def get_chapters_dependent_on_target(self, target_chapter_id: int) -> List[Dict[str, Any]]:
+        """获取依赖于指定目标章节的所有章节"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT cd.*,
+                           sc.title as source_chapter_title, sc.chapter_number as source_chapter_number,
+                           tc.title as target_chapter_title, tc.chapter_number as target_chapter_number
+                    FROM chapter_dependencies cd
+                    JOIN chapters sc ON cd.source_chapter_id = sc.id
+                    JOIN chapters tc ON cd.target_chapter_id = tc.id
+                    WHERE cd.source_chapter_id = ?
+                    AND cd.dependency_type = 'prerequisite'
+                    ORDER BY tc.chapter_number
+                """, (target_chapter_id,))
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"Error retrieving chapters dependent on target chapter {target_chapter_id}: {e}")
+            return []
+
+    def add_chapter_dependency(self, novel_id: int, source_chapter_id: int, target_chapter_id: int,
+                              dependency_type: str = 'prerequisite', dependency_strength: str = 'medium',
+                              description: str = None) -> int:
+        """添加章节依赖关系"""
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO chapter_dependencies
+                    (novel_id, source_chapter_id, target_chapter_id, dependency_type, dependency_strength, description, creation_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (novel_id, source_chapter_id, target_chapter_id, dependency_type, dependency_strength, description, ts))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                new_id = cursor.lastrowid
+                if new_id is None:
+                    raise sqlite3.Error("Failed to retrieve ID for chapter dependency.")
+                return int(new_id)
+        except sqlite3.Error as e:
+            print(f"Error adding chapter dependency: {e}")
+            raise
+
+    def remove_chapter_dependency(self, dependency_id: int) -> bool:
+        """删除章节依赖关系"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM chapter_dependencies WHERE id = ?", (dependency_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error removing chapter dependency: {e}")
+            return False
+
+    def get_all_chapter_dependencies_for_novel(self, novel_id: int) -> List[Dict[str, Any]]:
+        """获取指定小说的所有章节依赖关系"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT cd.*,
+                           sc.title as source_chapter_title, sc.chapter_number as source_chapter_number,
+                           tc.title as target_chapter_title, tc.chapter_number as target_chapter_number
+                    FROM chapter_dependencies cd
+                    JOIN chapters sc ON cd.source_chapter_id = sc.id
+                    JOIN chapters tc ON cd.target_chapter_id = tc.id
+                    WHERE cd.novel_id = ?
+                    ORDER BY sc.chapter_number, tc.chapter_number
+                """, (novel_id,))
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"Error retrieving all chapter dependencies for novel {novel_id}: {e}")
+            return []
+
 
 if __name__ == "__main__":
     print("--- Testing DatabaseManager (with DetailedCharacterProfile handling) ---")
@@ -613,6 +772,63 @@ if __name__ == "__main__":
     except json.JSONDecodeError as e:
         print(f"  Failed to deserialize plot_summary JSON: {e}")
 
+    # === NEW: Test Chapter Dependencies Methods ===
+    print("\n--- Testing Chapter Dependencies Methods ---")
+
+    # Add some test chapters
+    chapter1_id = db_manager.add_chapter(novel_id, 1, "第一章：开始", "第一章的内容...", "第一章的摘要")
+    chapter2_id = db_manager.add_chapter(novel_id, 2, "第二章：发展", "第二章的内容...", "第二章的摘要")
+    chapter3_id = db_manager.add_chapter(novel_id, 3, "第三章：高潮", "第三章的内容...", "第三章的摘要")
+    chapter4_id = db_manager.add_chapter(novel_id, 4, "第四章：结局", "第四章的内容...", "第四章的摘要")
+    print(f"Added test chapters: {chapter1_id}, {chapter2_id}, {chapter3_id}, {chapter4_id}")
+
+    # Add some dependencies
+    # Chapter 1 -> Chapter 2 (Chapter 2 depends on Chapter 1)
+    dep1_id = db_manager.add_chapter_dependency(novel_id, chapter1_id, chapter2_id, 'prerequisite', 'high', '第二章需要第一章的背景设定')
+    # Chapter 2 -> Chapter 3 (Chapter 3 depends on Chapter 2)
+    dep2_id = db_manager.add_chapter_dependency(novel_id, chapter2_id, chapter3_id, 'prerequisite', 'medium', '第三章需要第二章的人物发展')
+    # Chapter 1 -> Chapter 3 (Chapter 3 also depends on Chapter 1)
+    dep3_id = db_manager.add_chapter_dependency(novel_id, chapter1_id, chapter3_id, 'prerequisite', 'low', '第三章需要第一章的某些元素')
+    # Chapter 3 -> Chapter 4 (Chapter 4 depends on Chapter 3)
+    dep4_id = db_manager.add_chapter_dependency(novel_id, chapter3_id, chapter4_id, 'prerequisite', 'high', '第四章需要第三章的高潮结果')
+    print(f"Added dependencies: {dep1_id}, {dep2_id}, {dep3_id}, {dep4_id}")
+
+    # Test 1: get_dependencies_by_source_chapter_id
+    print(f"\n1. 测试 get_dependencies_by_source_chapter_id (源章节 {chapter1_id}):")
+    deps_by_source = db_manager.get_dependencies_by_source_chapter_id(chapter1_id)
+    print(f"   找到 {len(deps_by_source)} 个依赖关系:")
+    for dep in deps_by_source:
+        print(f"   - {dep['source_chapter_title']} -> {dep['target_chapter_title']} ({dep['dependency_strength']})")
+
+    # Test 2: get_dependencies_by_target_chapter_id
+    print(f"\n2. 测试 get_dependencies_by_target_chapter_id (目标章节 {chapter3_id}):")
+    deps_by_target = db_manager.get_dependencies_by_target_chapter_id(chapter3_id)
+    print(f"   找到 {len(deps_by_target)} 个依赖关系:")
+    for dep in deps_by_target:
+        print(f"   - {dep['source_chapter_title']} -> {dep['target_chapter_title']} ({dep['dependency_strength']})")
+
+    # Test 3: get_prerequisite_chapters_for_source
+    print(f"\n3. 测试 get_prerequisite_chapters_for_source (章节 {chapter3_id} 的前置章节):")
+    prerequisites = db_manager.get_prerequisite_chapters_for_source(chapter3_id)
+    print(f"   找到 {len(prerequisites)} 个前置章节:")
+    for prereq in prerequisites:
+        print(f"   - 前置: {prereq['source_chapter_title']} -> 当前: {prereq['target_chapter_title']}")
+
+    # Test 4: get_chapters_dependent_on_target
+    print(f"\n4. 测试 get_chapters_dependent_on_target (依赖于章节 {chapter1_id} 的章节):")
+    dependents = db_manager.get_chapters_dependent_on_target(chapter1_id)
+    print(f"   找到 {len(dependents)} 个依赖章节:")
+    for dep in dependents:
+        print(f"   - 基础: {dep['source_chapter_title']} -> 依赖: {dep['target_chapter_title']}")
+
+    # Test 5: get_all_chapter_dependencies_for_novel
+    print(f"\n5. 测试 get_all_chapter_dependencies_for_novel (小说 {novel_id} 的所有依赖):")
+    all_deps = db_manager.get_all_chapter_dependencies_for_novel(novel_id)
+    print(f"   找到 {len(all_deps)} 个总依赖关系:")
+    for dep in all_deps:
+        print(f"   - {dep['source_chapter_title']} -> {dep['target_chapter_title']} ({dep['dependency_type']}, {dep['dependency_strength']})")
+
+    print("\n✅ 章节依赖关系方法测试完成！")
 
     if os.path.exists(test_db_name):
         os.remove(test_db_name)

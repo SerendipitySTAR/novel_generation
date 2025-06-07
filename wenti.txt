@@ -1,35 +1,31 @@
-我使用如下代码：
-/media/sc/data/conda_envs/novels/bin/python /media/sc/data/sc/novel_generation/main.py --theme "废柴少女修仙日记" --style "搞笑幽默" --chapters 4 --words-per-chapter 1200 --auto-mode
-但总在最后异常终止，然后报错如下：
-...(内容省略)
-ChapterChroniclerAgent (Ch 4): Final Parse Path: Initial->TitleOK->ContentOK->SummaryOK
-Chapter '垃圾场藏龙：当扫帚侠教主成了灵力提款机' (Chapter 4) saved with ID 4 for Novel ID 1.
-Chapter 4 generated and saved.
-DEBUG: _check_node_output called (execution #1)
-Previous node successful. Routing to continue.
-DEBUG: execute_lore_keeper_update_kb - Starting for Chapter 4
-Executing Node: Lore Keeper Update KB for Chapter 4
-WARNING: No cached LoreKeeperAgent instance found, creating new one
-Database 'main_novel_generation.db' initialized successfully. All tables are ready.
-KnowledgeBaseManager: Attempting to use local embedding model at /media/sc/AI/self-llm/embed_model/sentence-transformers/all-MiniLM-L6-v2
-KnowledgeBaseManager: Successfully initialized local embeddings
-Updating knowledge base for novel 1 with chapter 4.
-Added 1 texts to Chroma collection for novel_id 1. Persisted.
-Lore Keeper KB updated with Chapter 4.
-DEBUG: execute_lore_keeper_update_kb - Successfully completed for Chapter 4
-KnowledgeBaseManager: Cleaned up vector store cache
-DEBUG: _check_node_output called (execution #1)
-Previous node successful. Routing to continue.
-DEBUG: increment_chapter_number - current: 4 -> 5
-DEBUG: increment_chapter_number - iterations: 3 -> 4
-DEBUG: increment_chapter_number - progress: 4/4 chapters
-/media/sc/data/sc/novel_generation/start.sh: 第 1 行： 491268 已杀死               /media/sc/data/conda_envs/novels/bin/python /media/sc/data/sc/novel_generation/main.py --theme "废柴少女修仙日记" --style "搞笑幽默" --chapters 4 --words-per-chapter 1200 --auto-mode
+(novels) sc@sc-Z790-GAMING-X-AX:/media/sc/data/sc/novel_generation$ cd /media/sc/data/sc/novel_generation && python3 test_chapter_dependencies.py
+🧪 开始测试章节依赖关系功能...
+Database 'test_chapter_deps_full.db' initialized successfully. All tables are ready.
+✅ 数据库初始化成功
+✅ 创建测试小说，ID: 1
+✅ 创建测试章节，IDs: 1, 2, 3
+✅ 添加章节依赖关系，IDs: 1, 2
 
+🔍 测试 get_dependencies_by_source_chapter_id:
+  第一章作为源的依赖关系数量: 1
+    源章节: 第一章：开始 -> 目标章节: 第二章：发展
 
-现在我明白问题了！从日志可以看出：
-increment_chapter_number 成功执行，显示了调试信息：
-current: 4 -> 5
-iterations: 3 -> 4
-progress: 4/4 chapters
-但是我们没有看到 _should_continue_chapter_loop 的调试输出，这说明问题出现在 LangGraph 的条件边缘路由过程中。
-问题在于 increment_chapter_number 函数没有返回 Incrementing chapter number from 4 to 5 (iteration 4) 这个历史记录的输出，这意味着 _log_and_update_history 函数可能有问题，或者返回的状态不完整。
+🔍 测试 get_dependencies_by_target_chapter_id:
+  第二章作为目标的依赖关系数量: 1
+    源章节: 第一章：开始 -> 目标章节: 第二章：发展
+
+🔍 测试 get_prerequisite_chapters_for_source:
+  第二章的前置章节数量: 1
+    前置章节: 第一章：开始 -> 当前章节: 第二章：发展
+
+🔍 测试 get_chapters_dependent_on_target:
+  依赖第一章的章节数量: 1
+    依赖章节: 第二章：发展 <- 被依赖章节: 第一章：开始
+
+🔍 测试 get_all_chapter_dependencies_for_novel:
+  小说的所有章节依赖关系数量: 2
+    第一章：开始 -> 第二章：发展 (prerequisite, high)
+    第二章：发展 -> 第三章：高潮 (prerequisite, medium)
+
+🎉 所有测试通过！
+🧹 清理测试数据库完成
