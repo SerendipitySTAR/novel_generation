@@ -36,6 +36,7 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Management of different models/configs (Basic model name passing; enhanced error logging for API issues implemented).
     *   `[p]` API retry, error handling, rate limiting (Enhanced error logging in LLMClient; specific retry/rate limit logic TODO).
     *   `[ ]` Support for local models (TODO).
+    *   [ ] LLM Caching (Deprioritized due to local model usage and quality focus).
 *   **[p] Knowledge Base Layer (KBL - README 4.4 & 6)**
     *   `[x]` `KnowledgeBaseManager` for RAG using ChromaDB implemented.
     *   `[p]` Vector DB (ChromaDB) for RAG: Stores text chunks from agents. (Live embedding calls implemented; full functionality requires real API key).
@@ -187,6 +188,14 @@ This document tracks the implementation status of features and components descri
         *   `[p]` Conceptual outline for advanced conflict detection (RAG, KG, better LLM prompts) defined.
         *   [p] Implementation of advanced conflict detection in `ConflictDetectionAgent` (Agent enhanced with RAG for KB context, improved LLM prompting for type/severity. Core logic implemented; further refinement and broader context integration ongoing).
         *   [p] Implementation of conflict auto-resolution (Auto-Mode) or user-choice presentation (Human-Mode) in `WorkflowManager`: Auto-mode calls stub `ConflictResolutionAgent`. Human-mode API flow prepares conflict data via stub agent and pauses for user review/decision (backend logic for pause/resume complete). Actual LLM-based resolution/suggestion by agent is TODO.
+*   **[p] Phase 3: Optimizations & Advanced Features (as per original issue doc)**
+    *   `[p]` Optimize context management and cost control:
+        *   `[x]` Analysis of current context usage and cost drivers completed.
+        *   `[ ]` LLM Request/Response Caching in `LLMClient` (Deprioritized based on user feedback for local models; quality focus).
+        *   `[p]` Hierarchical Context Management for `ChapterChroniclerAgent` (Conceptual strategy outlined; implementation TODO).
+        *   `[ ]` Hybrid Model Strategy (Conceptual planning TODO).
+    *   `[ ]` Implement advanced interactive features for Human-Mode (TODO - further breakdown needed).
+    *   `[ ]` Establish a user preference learning system (TODO - further breakdown needed).
 
 
 ## 5. Other Considerations
