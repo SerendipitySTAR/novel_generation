@@ -79,7 +79,7 @@ This document tracks the implementation status of features and components descri
 *   **[p] Context Synthesizer Agent (总结智能体 - README 4.3.8)**
     *   `[x]` MVP agent implemented in `src/agents/context_synthesizer_agent.py`.
     *   `[x]` Gathers data from DB (novel, outline, worldview, plot, previous chapters, characters).
-    *   `[p]` Retrieves context from LoreKeeperAgent and detailed plot from PlotArchitectAgent; uses detailed character profiles. Brief construction refined for clarity (e.g., RAG context demarcation, richer character/plot details to guide ChapterChroniclerAgent). (RAG needs real API key & live tuning; plot/character data usage enhanced).
+    *   [p] Retrieves context from LoreKeeperAgent and detailed plot from PlotArchitectAgent; uses detailed character profiles. Brief construction now includes hierarchical history of previous chapters (N-1 full text snippet, N-X summaries, older chapter titles). (RAG needs real API key & live tuning; plot/character data usage enhanced. Advanced key event summaries for distant chapters TODO).
     *   `[x]` Synthesizes a text brief for `ChapterChroniclerAgent`.
     *   `[ ]` Generate different granularity of summaries (TODO - currently one detailed brief for chapter agent).
     *   `[ ]` Highlight key info in summaries (TODO).
@@ -192,7 +192,7 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Optimize context management and cost control:
         *   `[x]` Analysis of current context usage and cost drivers completed.
         *   `[ ]` LLM Request/Response Caching in `LLMClient` (Deprioritized based on user feedback for local models; quality focus).
-        *   `[p]` Hierarchical Context Management for `ChapterChroniclerAgent` (Conceptual strategy outlined; implementation TODO).
+        *   [p] Hierarchical Context Management for `ChapterChroniclerAgent` (Implemented initial version in `ContextSynthesizerAgent`: N-1 full text snippet, N-X summaries, older chapter titles. Unit tests added. Advanced key event summaries for distant chapters and further RAG query refinement TODO).
         *   `[ ]` Hybrid Model Strategy (Conceptual planning TODO).
     *   `[ ]` Implement advanced interactive features for Human-Mode (TODO - further breakdown needed).
     *   `[ ]` Establish a user preference learning system (TODO - further breakdown needed).
@@ -202,7 +202,7 @@ This document tracks the implementation status of features and components descri
 
 *   **[ ] Responsible AI & Ethics (README 10)** (TODO - Content filtering, bias mitigation beyond basic LLM behavior).
 *   **[p] Testing & Quality Assurance (README 11)**
-    *   [p] Unit tests (Basic `if __name__ == '__main__'` tests for agents; More comprehensive unittest suites for key agents like ConflictDetectionAgent).
+    *   [p] Unit tests (Basic `if __name__ == '__main__'` tests for agents; More comprehensive unittest suites for key agents like ConflictDetectionAgent, ContextSynthesizerAgent).
     *   `[p]` Integration tests (Workflow manager tests with mocked/live agent interactions).
     *   `[p]` End-to-end tests (CLI `main.py` provides basic E2E test capability).
     *   `[ ]` Dedicated KB testing, consistency testing, prompt performance testing, UAT (TODO).

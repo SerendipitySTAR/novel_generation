@@ -484,6 +484,17 @@ class DatabaseManager:
                 return [Chapter(**dict(row)) for row in cur.fetchall()]
         except sqlite3.Error as e: print(f"Error retrieving chapters for novel {novel_id}: {e}"); return []
 
+    def get_chapter_by_novel_and_chapter_number(self, novel_id: int, chapter_number: int) -> Optional[Chapter]:
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM chapters WHERE novel_id = ? AND chapter_number = ?", (novel_id, chapter_number))
+                row = cur.fetchone()
+                return Chapter(**dict(row)) if row else None
+        except sqlite3.Error as e:
+            print(f"Error retrieving chapter novel_id={novel_id}, chapter_number={chapter_number}: {e}")
+            return None
+
     def update_novel_status(self, novel_id: int, workflow_status: str, current_step_details: Optional[str] = None, error_message: Optional[str] = None, history_log_json: Optional[str] = None):
         """
         Updates the status and other operational fields of a novel.
@@ -892,8 +903,20 @@ if __name__ == "__main__":
     chapter1_id = db_manager.add_chapter(novel_id, 1, "第一章：开始", "第一章的内容...", "第一章的摘要")
     chapter2_id = db_manager.add_chapter(novel_id, 2, "第二章：发展", "第二章的内容...", "第二章的摘要")
     chapter3_id = db_manager.add_chapter(novel_id, 3, "第三章：高潮", "第三章的内容...", "第三章的摘要")
-    chapter4_id = db_manager.add_chapter(novel_id, 4, "第四章：结局", "第四章的内容...", "第四章的摘要")
+    chapter4_id = db_manager.add_chapter(novel_id, 4, "第四章：结局", "第四章的内容...", "第四章的摘要") # type: ignore
     print(f"Added test chapters: {chapter1_id}, {chapter2_id}, {chapter3_id}, {chapter4_id}")
+
+    # Test get_chapter_by_novel_and_chapter_number
+    print("\n--- Testing get_chapter_by_novel_and_chapter_number ---")
+    retrieved_chapter_2 = db_manager.get_chapter_by_novel_and_chapter_number(novel_id, 2)
+    assert retrieved_chapter_2 is not None, "Failed to retrieve chapter 2 by novel_id and chapter_number."
+    assert retrieved_chapter_2['title'] == "第二章：发展"
+    assert "第二章的内容..." in retrieved_chapter_2['content']
+    print(f"Successfully retrieved Chapter {retrieved_chapter_2['chapter_number']} ('{retrieved_chapter_2['title']}') using new method.")
+
+    non_existent_chapter = db_manager.get_chapter_by_novel_and_chapter_number(novel_id, 99)
+    assert non_existent_chapter is None, "Retrieving non-existent chapter should return None."
+    print("Test for non-existent chapter successful.")
 
     # Add some dependencies
     # Chapter 1 -> Chapter 2 (Chapter 2 depends on Chapter 1)

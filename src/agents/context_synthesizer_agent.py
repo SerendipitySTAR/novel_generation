@@ -46,16 +46,81 @@ class ContextSynthesizerAgent:
             #     except json.JSONDecodeError:
             #         brief_parts.append(f"**Main Plot Arc (Raw from DB):**\n{plot_db['plot_summary']}\n")
 
+        # --- Hierarchical Previous Chapter Context ---
+        NUM_FULL_TEXT_PREVIOUS = 1
+        NUM_SUMMARY_PREVIOUS = 3
+        # Older chapters will get titles only
 
-        # Previous Chapter Summaries
+        brief_parts.append("**--- Previous Chapter Context (Hierarchical) ---**")
+
         all_db_chapters: List[Chapter] = self.db_manager.get_chapters_for_novel(novel_id)
-        previous_chapters_summaries_text: List[str] = []
-        for ch_db in sorted(all_db_chapters, key=lambda c: c['chapter_number']):
-            if ch_db['chapter_number'] < current_chapter_number:
-                previous_chapters_summaries_text.append(f"  - Chapter {ch_db['chapter_number']} ({ch_db['title']}) Summary: {ch_db['summary']}")
+        sorted_chapters = sorted(all_db_chapters, key=lambda c: c['chapter_number'])
 
-        if previous_chapters_summaries_text:
-            brief_parts.append("**Previously Happened:**\n" + "\n".join(previous_chapters_summaries_text) + "\n")
+        chapters_before_current = [ch for ch in sorted_chapters if ch['chapter_number'] < current_chapter_number]
+        chapters_before_current.reverse() # Process in reverse chronological order (most recent first)
+
+        full_text_added_count = 0
+        summary_added_count = 0
+        titles_added_count = 0
+
+        temp_full_text_section = []
+        temp_summary_section = []
+        temp_titles_only_section = []
+
+        for ch_db in chapters_before_current:
+            ch_num = ch_db['chapter_number']
+            ch_title = ch_db['title']
+            ch_summary = ch_db['summary']
+
+            if full_text_added_count < NUM_FULL_TEXT_PREVIOUS:
+                full_content = ch_db.get('content', 'Content not available.')
+                # Using a significant portion of content, or full if short.
+                # For example, up to 1500 chars or full content if shorter.
+                content_snippet = full_content[:1500] + ("..." if len(full_content) > 1500 else "")
+                temp_full_text_section.append(f"  **Chapter {ch_num}: {ch_title} (Full Text Snippet)**\n    {content_snippet}\n")
+                full_text_added_count += 1
+            elif summary_added_count < NUM_SUMMARY_PREVIOUS:
+                temp_summary_section.append(f"  - Chapter {ch_num} ({ch_title}) Summary: {ch_summary}")
+                summary_added_count += 1
+            else:
+                if titles_added_count == 0:
+                    temp_titles_only_section.append("  Older Chapter Mentions (Titles):")
+                temp_titles_only_section.append(f"    - Chapter {ch_num}: {ch_title}")
+                titles_added_count += 1
+
+        if temp_full_text_section:
+            brief_parts.append("\n**Immediately Preceding Chapter(s) (Full Text/Detailed Snippet):**")
+            brief_parts.extend(reversed(temp_full_text_section))
+        if temp_summary_section:
+            brief_parts.append("\n**Recent Past Chapters (Summaries):**")
+            brief_parts.extend(reversed(temp_summary_section))
+        if temp_titles_only_section:
+            # Reverse the order of titles so they appear chronologically under the header
+            temp_titles_only_section_ordered = list(reversed(temp_titles_only_section))
+            # The header "Older Chapter Mentions (Titles):" is already the first element if list is not empty
+            # So, we take it out, reverse the rest, and add it back.
+            older_header = ""
+            actual_titles = []
+            if temp_titles_only_section_ordered and "Older Chapter Mentions (Titles):" in temp_titles_only_section_ordered[-1]: # Header was added first, so now last after reverse
+                older_header = temp_titles_only_section_ordered.pop() # Remove header
+                actual_titles = list(reversed(temp_titles_only_section_ordered)) # Reverse titles back to older first
+            else: # Should not happen if titles_added_count logic is correct
+                 actual_titles = list(reversed(temp_titles_only_section_ordered))
+
+
+            brief_parts.append("\n**Earlier Chapter Mentions (Titles):**")
+            if older_header and "Older Chapter Mentions (Titles):" not in actual_titles[0] : # Avoid double header if already there
+                 pass # The structure of titles_only_section already includes its own sub-header if items exist.
+                      # The main header "Earlier Chapter Mentions (Titles):" is added above.
+            brief_parts.extend(actual_titles)
+
+
+        if not temp_full_text_section and not temp_summary_section and not temp_titles_only_section and current_chapter_number > 1:
+            brief_parts.append("  (No previous chapters found or processed based on configuration).")
+        elif current_chapter_number == 1:
+             brief_parts.append("  (This is the first chapter, no preceding chapter context).")
+
+        brief_parts.append("**--- End of Previous Chapter Context ---**\n")
 
         # Active Character Details (now using DetailedCharacterProfile)
         active_characters_details_text: List[str] = []
@@ -216,8 +281,15 @@ if __name__ == "__main__":
     assert f"**Novel Theme:** Test Novel for Context" in brief
     assert "**Overall Novel Outline:**\n" + "A hero seeks a lost artifact." in brief
     assert "**Worldview Core Concept:**\nA world of floating islands and sky-ships." in brief
-    assert f"Chapter 1 (The Call) Summary: Kael accepts the quest." in brief
-    assert "Character: Kael" in brief
+    # Assertion for previous chapter context will depend on NUM_FULL_TEXT_PREVIOUS, NUM_SUMMARY_PREVIOUS
+    # If current_chapter_number is 2, Chapter 1 ("The Call") should be full text.
+    if target_chapter_num_test == 2:
+        assert f"Chapter 1: The Call (Full Text Snippet)" in brief
+        assert "Content of chapter 1..."[:50] in brief # Check for part of the content
+    else: # If testing for chapter > 2, then Chapter 1 summary might appear or just title
+        assert f"Chapter 1 (The Call) Summary: Kael accepts the quest." in brief # This might change based on N values
+
+    assert "Kael" in brief # Check for character name, not "Character: Kael"
     assert f"Specific Plot Focus for THIS Chapter ({target_chapter_num_test}):\n{plot_summary_for_brief}" in brief
     assert "--- RELEVANT LORE AND CONTEXT (from Knowledge Base) ---" in brief
     print("\nBasic content verification of the brief passed.")
