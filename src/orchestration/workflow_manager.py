@@ -26,6 +26,7 @@ from src.agents.chapter_chronicler_agent import ChapterChroniclerAgent
 from src.agents.quality_guardian_agent import QualityGuardianAgent # Import added
 from src.agents.content_integrity_agent import ContentIntegrityAgent
 from src.agents.conflict_detection_agent import ConflictDetectionAgent
+from src.agents.conflict_resolution_agent import ConflictResolutionAgent # New Agent
 from src.llm_abstraction.llm_client import LLMClient # Ensure LLMClient is imported
 
 # Persistence and Core Models
@@ -85,6 +86,7 @@ class NovelWorkflowState(TypedDict):
     pending_decision_options: Optional[List[Dict[str, Any]]] # Stores DecisionOption like dicts
     pending_decision_prompt: Optional[str]
     user_made_decision_payload: Optional[Dict[str, Any]] # Stores submitted choice
+    original_chapter_content_for_conflict_review: Optional[str] # Stores chapter text before potential conflict resolution by human
     # 循环安全参数
     loop_iteration_count: int
     max_loop_iterations: int
@@ -1544,6 +1546,216 @@ def _check_workflow_pause_status(state: NovelWorkflowState) -> str:
     print(f"DEBUG: Workflow status is '{workflow_status}'. Continuing graph execution.")
     return "continue_workflow"
 
+def prepare_conflict_review_for_api(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = state.get("history", [])
+    novel_id = state.get("novel_id")
+    current_chapter_num = state.get("current_chapter_number")
+    generated_chapters = state.get("generated_chapters", [])
+    conflicts = state.get("current_chapter_conflicts", [])
+    db_name = state.get("db_name", "novel_mvp.db")
+    user_input = state.get("user_input", {}) # For novel_context
+
+    history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Preparing conflicts for API review.")
+
+    # Check if resuming after a decision was made for conflict_review by resume_workflow
+    # The user_made_decision_payload will contain the action chosen by the user.
+    decision_payload_for_current_node = state.get("user_made_decision_payload")
+    if decision_payload_for_current_node and decision_payload_for_current_node.get("source_decision_type") == "conflict_review":
+        action_taken = decision_payload_for_current_node.get("action", "unknown_action_processed")
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Conflict review decision '{action_taken}' processed by resume_workflow. Proceeding.")
+
+        # Clear the payload as it's been processed by resume_workflow's specific logic for this type
+        state["user_made_decision_payload"] = None
+        state["workflow_status"] = f"running_after_conflict_review_decision" # Generic running status
+        # Ensure other pending fields are also clear, though resume_workflow should have done this.
+        state["pending_decision_type"] = None
+        state["pending_decision_options"] = None
+        state["pending_decision_prompt"] = None
+        # original_chapter_content_for_conflict_review was handled by resume_workflow
+
+        state["history"] = history
+        return state # This will go to _check_workflow_pause_status, which should return "continue_workflow"
+
+    # If not resuming, proceed to pause for decision
+    if not novel_id:
+        error_msg = f"Chapter {current_chapter_num}: Novel ID missing, cannot prepare conflicts for API review."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    if not conflicts:
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: No conflicts found to prepare for API review. Proceeding.")
+        state["history"] = history
+        state["workflow_status"] = "running_no_conflicts_to_review" # Should proceed in graph
+        return state # Should be caught by _check_workflow_pause_status as not paused
+
+    if not generated_chapters:
+        error_msg = f"Chapter {current_chapter_num}: No generated chapters available for conflict review."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    original_chapter_text = generated_chapters[-1].get("content")
+    if not original_chapter_text:
+        error_msg = f"Chapter {current_chapter_num}: Original chapter text missing for conflict review."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    state["original_chapter_content_for_conflict_review"] = original_chapter_text
+
+    try:
+        llm_client = LLMClient()
+        resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=db_name)
+
+        # The ConflictResolutionAgent's suggest_revisions_for_human_review method
+        # is expected to format conflicts, perhaps adding suggestions or placeholders.
+        # For this subtask, it just adds a placeholder.
+        formatted_conflicts_for_api = resolver_agent.suggest_revisions_for_human_review(
+            novel_id, original_chapter_text, conflicts, novel_context=user_input
+        )
+
+        # Ensure options have unique IDs if the API expects them for selection
+        # The `conflict_id` from ConflictDetectionAgent can be used.
+        api_options = []
+        for i, conflict_detail in enumerate(formatted_conflicts_for_api):
+            api_options.append({
+                "id": conflict_detail.get("conflict_id", str(i+1)), # Use existing conflict_id
+                "text_summary": f"Conflict Type: {conflict_detail.get('type', 'N/A')}, Severity: {conflict_detail.get('severity', 'N/A')}",
+                "full_data": conflict_detail # The entire conflict dictionary
+            })
+
+        state["pending_decision_type"] = "conflict_review"
+        state["pending_decision_options"] = api_options
+        state["pending_decision_prompt"] = (
+            f"Conflicts ({len(api_options)}) detected in Chapter {current_chapter_num}. "
+            "Please review. You can choose to 'proceed_as_is' or 'attempt_generic_rewrite_all_conflicts'."
+        )
+        state["workflow_status"] = f"paused_for_conflict_review_ch_{current_chapter_num}"
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Pausing for API conflict review. {len(api_options)} conflicts presented.")
+
+        db_manager = DatabaseManager(db_name=db_name)
+        options_json = json.dumps(api_options)
+        serializable_state = {k: v for k, v in state.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))}
+        full_state_json = json.dumps(serializable_state)
+
+        db_manager.update_novel_pause_state(
+            novel_id, state["workflow_status"], state["pending_decision_type"],
+            options_json, state["pending_decision_prompt"], full_state_json
+        )
+        history = _log_and_update_history(history, "Successfully saved conflict review pause state to DB.")
+
+    except Exception as e:
+        error_msg = f"Chapter {current_chapter_num}: Error preparing conflicts for API review: {e}"
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+
+    state["history"] = history
+    return state
+
+def execute_conflict_resolution_auto(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = state.get("history", [])
+    novel_id = state.get("novel_id")
+    current_chapter_num = state.get("current_chapter_number")
+    generated_chapters = list(state.get("generated_chapters", [])) # Ensure it's a mutable list
+    conflicts_for_resolution = state.get("current_chapter_conflicts", [])
+    db_name = state.get("db_name", "novel_mvp.db")
+    # Using user_input as a proxy for novel_context, can be refined
+    novel_context_for_agent = state.get("user_input")
+
+    history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Entering auto conflict resolution node.")
+
+    if not novel_id:
+        error_msg = f"Chapter {current_chapter_num}: Novel ID missing, cannot perform auto conflict resolution."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    if not generated_chapters:
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: No chapters generated, skipping auto conflict resolution.", True)
+        state["history"] = history
+        # This shouldn't typically happen if graph logic is correct
+        return state
+
+    if not conflicts_for_resolution:
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: No conflicts to resolve, skipping auto conflict resolution.")
+        state["history"] = history
+        return state
+
+    last_chapter_obj = generated_chapters[-1]
+    original_chapter_text = last_chapter_obj.get("content")
+
+    if not original_chapter_text:
+        error_msg = f"Chapter {current_chapter_num}: Original chapter text is missing, cannot perform auto conflict resolution."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    try:
+        llm_client = LLMClient()
+        resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=db_name)
+
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Attempting auto-resolution for {len(conflicts_for_resolution)} conflicts.")
+        revised_text = resolver_agent.attempt_auto_resolve(
+            novel_id, original_chapter_text, conflicts_for_resolution, novel_context=novel_context_for_agent
+        )
+
+        if revised_text is not None and revised_text != original_chapter_text:
+            # Create a new dictionary for the updated chapter to ensure state update
+            updated_chapter = dict(last_chapter_obj)
+            updated_chapter["content"] = revised_text
+            updated_chapter["summary"] = "Summary needs regeneration after auto-resolution."
+
+            generated_chapters[-1] = updated_chapter # Replace the last chapter with the updated one
+
+            state["generated_chapters"] = generated_chapters
+            history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Auto-conflict resolution attempted and text was modified.")
+            # Clear conflicts as they've been "resolved" or attempted
+            state["current_chapter_conflicts"] = []
+        else:
+            history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Auto-conflict resolution attempted, but no changes made to chapter text.")
+            # Conflicts remain as they were not changed by auto-resolve
+
+    except Exception as e:
+        error_msg = f"Chapter {current_chapter_num}: Error during auto conflict resolution: {e}"
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+        # Do not clear conflicts if resolution failed
+
+    state["history"] = history
+    return state
+
+def _decide_after_conflict_detection(state: NovelWorkflowState) -> str:
+    history = state.get("history", [])
+    conflicts = state.get("current_chapter_conflicts", [])
+    user_input = state.get("user_input", {})
+    auto_mode = user_input.get("auto_mode", False)
+    interaction_mode = user_input.get("interaction_mode", "cli")
+
+    if conflicts:
+        history = _log_and_update_history(history, f"Decision: {len(conflicts)} conflicts found.")
+        if auto_mode:
+            history = _log_and_update_history(history, "Auto-Mode: Routing to auto-conflict resolution.")
+            state["history"] = history
+            return "resolve_conflicts_auto"
+        elif interaction_mode == "api": # Human mode, API interaction
+            history = _log_and_update_history(history, "Human-Mode (API): Routing for API-based conflict review preparation.")
+            state["history"] = history
+            return "human_api_conflict_pending" # This will go to prepare_conflict_review_for_api node
+        else: # Human mode, CLI interaction
+            history = _log_and_update_history(history, "Human-Mode (CLI): Conflicts detected. Currently, CLI mode proceeds without specific resolution step for conflicts. Manual review would be needed based on logs.")
+            state["history"] = history
+            return "proceed_to_increment" # CLI human mode currently doesn't pause for this
+    else:
+        history = _log_and_update_history(history, "Decision: No conflicts found. Proceeding to increment chapter.")
+        state["history"] = history
+        return "proceed_to_increment"
+
 
 def _should_retry_chapter(state: NovelWorkflowState) -> str:
     """
@@ -1624,22 +1836,71 @@ class WorkflowManager:
         # So, the state loaded from DB should reflect that a decision *was* made.
         # The decision_payload_from_api is the source of truth for applying the decision here.
 
-        # Validate that the workflow was indeed waiting for this type of decision,
-        # even if pending_decision_type is now NULL due to record_user_decision.
-        # This is more a sanity check on the calling logic.
-        # For this, we might need to peek into the state snapshot's original pending_decision_type
-        # or assume the API layer validated correctly against what was stored.
-        # For now, we trust decision_type_from_api matches what *was* pending.
+        # Basic validation (API layer should do more thorough validation against stored pending_decision_type)
+        # This is a sanity check within the resume logic.
+        # The `record_user_decision` in DB manager might have already cleared `pending_decision_type`
+        # so `current_state_snapshot["pending_decision_type"]` might be None here if loaded from DB after `record_user_decision`.
+        # The crucial part is that the API called this `resume_workflow` with the correct `decision_type_from_api`.
 
-        current_state_snapshot["user_made_decision_payload"] = decision_payload_from_api
+        # Store the raw decision payload for the target node to process
+        current_state_snapshot["user_made_decision_payload"] = {"source_decision_type": decision_type_from_api, **decision_payload_from_api}
 
-        # Update status and clear any decision fields that might have been in the snapshot
-        # (though record_user_decision should have cleared pending_decision_type)
+        if decision_type_from_api == "conflict_review":
+            original_content = current_state_snapshot.get("original_chapter_content_for_conflict_review")
+            conflicts_at_pause = current_state_snapshot.get("current_chapter_conflicts", []) # These are the conflicts presented to user
+
+            # Correctly access action from custom_data for conflict_review
+            custom_data = decision_payload_from_api.get("custom_data", {})
+            action = custom_data.get("action", "proceed_as_is") # Default action
+
+            if not original_content:
+                 current_state_snapshot["error_message"] = "Original chapter content for conflict review not found in state. Cannot resume."
+                 current_state_snapshot["workflow_status"] = "resume_failed_missing_data"
+                 # Save this error state to DB
+                 error_snapshot_json = json.dumps({k: v for k, v in current_state_snapshot.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))})
+                 db_manager.update_novel_status_after_resume(novel_id, current_state_snapshot["workflow_status"], error_snapshot_json)
+                 return current_state_snapshot
+
+            if action == "attempt_generic_rewrite_all_conflicts":
+                history = current_state_snapshot.get("history", [])
+                history = _log_and_update_history(history, f"Chapter {current_state_snapshot.get('current_chapter_number')}: Human decision was 'attempt_generic_rewrite_all_conflicts'.")
+                current_state_snapshot["history"] = history
+
+                llm_client = LLMClient()
+                resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=self.db_name)
+                novel_context = current_state_snapshot.get("user_input") # Or a more specific context
+
+                revised_text = resolver_agent.attempt_auto_resolve(
+                    novel_id, original_content, conflicts_at_pause, novel_context=novel_context
+                )
+                if revised_text and revised_text != original_content:
+                    generated_chapters = list(current_state_snapshot.get("generated_chapters", []))
+                    if generated_chapters:
+                        updated_chapter = dict(generated_chapters[-1])
+                        updated_chapter["content"] = revised_text
+                        updated_chapter["summary"] = "Summary needs regeneration after conflict rewrite."
+                        generated_chapters[-1] = updated_chapter
+                        current_state_snapshot["generated_chapters"] = generated_chapters
+                        current_state_snapshot["current_chapter_conflicts"] = [] # Assume rewrite addressed them
+                        history = _log_and_update_history(history, "Chapter text modified by generic rewrite after human decision.")
+                        current_state_snapshot["history"] = history
+                    else: # Should not happen if original_content was present
+                        current_state_snapshot["error_message"] = "No generated chapters found to update after conflict rewrite."
+                else:
+                    history = _log_and_update_history(history, "Generic rewrite attempted but no changes made to text.")
+                    current_state_snapshot["history"] = history
+                    # Conflicts remain as they were not changed
+
+            # For "proceed_as_is", no specific text modification here.
+            # The `user_made_decision_payload` now contains the action, which the `prepare_conflict_review_for_api` node will see upon reinvocation.
+            current_state_snapshot["original_chapter_content_for_conflict_review"] = None # Clear after processing
+
+        # Common state updates for any decision type before re-invocation
         current_state_snapshot["workflow_status"] = f"resuming_after_{decision_type_from_api}"
         current_state_snapshot["pending_decision_type"] = None
         current_state_snapshot["pending_decision_options"] = None
         current_state_snapshot["pending_decision_prompt"] = None
-        current_state_snapshot["error_message"] = None # Clear previous errors
+        current_state_snapshot["error_message"] = None # Clear previous errors before resuming
 
         num_chapters = current_state_snapshot.get("user_input", {}).get("chapters", 3)
         # Increment execution_count from the loaded state
@@ -1737,6 +1998,8 @@ class WorkflowManager:
         self.workflow.add_node("should_retry_chapter", _should_retry_chapter) # New conditional node
         self.workflow.add_node("lore_keeper_update_kb", execute_lore_keeper_update_kb)
         self.workflow.add_node("conflict_detection", execute_conflict_detection)
+        self.workflow.add_node("execute_conflict_resolution_auto", execute_conflict_resolution_auto)
+        self.workflow.add_node("prepare_conflict_review_for_api", prepare_conflict_review_for_api) # New node
         self.workflow.add_node("increment_chapter_number", increment_chapter_number)
         self.workflow.add_node("cleanup_resources", cleanup_resources)
         self.workflow.add_node("generate_kb_visualization_data", generate_kb_visualization_data)
@@ -1781,7 +2044,33 @@ class WorkflowManager:
             "proceed_to_kb_update": "lore_keeper_update_kb"
         })
         self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "conflict_detection", "stop_on_error": END})
-        self.workflow.add_conditional_edges("conflict_detection", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
+
+        # Conflict detection now goes to a decision node
+        self.workflow.add_conditional_edges("conflict_detection", _check_node_output, {"continue": "_decide_after_conflict_detection", "stop_on_error": END})
+
+        # Decision node after conflict detection
+        self.workflow.add_conditional_edges(
+            "_decide_after_conflict_detection",
+            _decide_after_conflict_detection,
+            {
+                "resolve_conflicts_auto": "execute_conflict_resolution_auto",
+                "human_api_conflict_pending": "prepare_conflict_review_for_api", # Now points to the new node
+                "proceed_to_increment": "increment_chapter_number"
+            }
+        )
+
+        # After auto-resolution, proceed to increment chapter
+        self.workflow.add_conditional_edges("execute_conflict_resolution_auto", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
+
+        # After preparing for API review, check pause status (should pause)
+        self.workflow.add_conditional_edges("prepare_conflict_review_for_api", _check_workflow_pause_status, {
+            "WORKFLOW_PAUSED": END,
+            # If it doesn't pause (e.g. error in prepare_conflict_review_for_api before setting pause status),
+            # or if it's resuming and processed the decision, it should continue.
+            # The node itself will change workflow_status from "paused_..." to "running_..." if resuming.
+            "continue_workflow": "increment_chapter_number" # Path if resuming and decision processed
+        })
+
         self.workflow.add_conditional_edges(
             "increment_chapter_number", _should_continue_chapter_loop,
             {
@@ -1849,6 +2138,7 @@ class WorkflowManager:
             pending_decision_options=None,
             pending_decision_prompt=None,
             user_made_decision_payload=None,
+            original_chapter_content_for_conflict_review=None,
             # 循环安全参数
             loop_iteration_count=0,
             max_loop_iterations=max(10, num_chapters * 3),  # 设置合理的最大迭代次数

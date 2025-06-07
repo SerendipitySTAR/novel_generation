@@ -28,7 +28,7 @@ This document tracks the implementation status of features and components descri
     *   `[x]` Global state management within workflow (MVP level).
     *   [p] Automated chapter quality control via ContentIntegrityAgent scores, including a retry mechanism for low-quality chapters in Auto-Mode.
     *   [p] Integration of human input nodes for user decisions (WorkflowManager decision nodes updated to support pausing for API-driven human mode; state saved to DB. API endpoints for querying/submitting decisions implemented. Full E2E flow for API human decisions needs testing & refinement).
-    *   [p] Placeholder logic for mode-specific conflict handling (Auto-Mode auto-resolve log, Human-Mode user prompt log) after ConflictDetectionAgent runs.
+    *   [p] Mode-specific conflict handling: Auto-Mode now attempts auto-resolution via (stub) `ConflictResolutionAgent`. Human-Mode (API) now prepares conflict data using (stub) `ConflictResolutionAgent` and pauses for user decision via API.
 *   **[p] Agent Layer (AL - README 4.3)**
     *   (Individual agent status below)
 *   **[x] LLM Abstraction Layer (LLMAL - README 4.5)**
@@ -93,6 +93,7 @@ This document tracks the implementation status of features and components descri
 *   **[p] Quality Guardian Agent (质量审核智能体 - README 4.3.6)** Implemented to review selected outline based on Clarity, Originality, Conflict Potential, Overall Score, and provide Justification. Review is informational (printed to CLI). (Live LLM call enabled; parsing implemented; advanced features/integration TODO).
 *   [p] Content Integrity Agent (内容审核智能体 - README 4.3.7)** (Basic agent implemented with 7-dimensional scoring. WorkflowManager includes chapter retry mechanism in Auto-Mode based on its scores. Full retry strategy and human-in-the-loop for quality TODO).
 *   [p] ConflictDetectionAgent (内容冲突检测智能体 - README 4.3.x - Assuming a number): Enhanced to use Knowledge Base context (RAG via LoreKeeperAgent) for detecting conflicts. Uses improved LLM prompting to categorize conflict type and severity. Integrated into WorkflowManager with `novel_id`. Unit tests updated.
+*   [p] ConflictResolutionAgent (内容冲突解决智能体 - README 4.3.x): Stub agent created with methods for `attempt_auto_resolve` and `suggest_revisions_for_human_review`. Integrated into WorkflowManager for both auto-mode resolution attempts and human-mode API conflict review data preparation.
 *   **[ ] Polish & Refinement Agent (润色智能体 - README 4.3.10)** (TODO)
 
 ## 3. Key Features & Workflow (from README 5 & others)
@@ -185,7 +186,7 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Establish an intelligent conflict detection mechanism:
         *   `[p]` Conceptual outline for advanced conflict detection (RAG, KG, better LLM prompts) defined.
         *   [p] Implementation of advanced conflict detection in `ConflictDetectionAgent` (Agent enhanced with RAG for KB context, improved LLM prompting for type/severity. Core logic implemented; further refinement and broader context integration ongoing).
-        *   `[ ]` Implementation of conflict auto-resolution (Auto-Mode) or user-choice presentation (Human-Mode) in `WorkflowManager` (beyond current placeholders) (TODO).
+        *   [p] Implementation of conflict auto-resolution (Auto-Mode) or user-choice presentation (Human-Mode) in `WorkflowManager`: Auto-mode calls stub `ConflictResolutionAgent`. Human-mode API flow prepares conflict data via stub agent and pauses for user review/decision (backend logic for pause/resume complete). Actual LLM-based resolution/suggestion by agent is TODO.
 
 
 ## 5. Other Considerations

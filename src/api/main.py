@@ -293,12 +293,27 @@ async def get_next_human_decision(novel_id: int):
             print(f"API Error: Could not parse decision options JSON for novel {novel_id}")
             raise HTTPException(status_code=500, detail="Error processing decision options for novel.")
 
-    if workflow_status and workflow_status.startswith("paused_for_") and pending_decision_type and options_list is not None: # Ensure options_list is not None if expected
+    if workflow_status and workflow_status.startswith("paused_for_") and pending_decision_type:
+        # For conflict_review, options_list might be the conflicts themselves.
+        # The API model DecisionOption expects id, text_summary, full_data.
+        # The 'pending_decision_options' in DB for conflict_review should be List[ConflictDict].
+        api_ready_options: List[DecisionOption] = []
+        if options_list and pending_decision_type == "conflict_review":
+            for conflict_dict in options_list: # options_list here is List[Dict] from JSON
+                api_ready_options.append(DecisionOption(
+                    id=str(conflict_dict.get("conflict_id", uuid.uuid4())), # Ensure ID, fallback to new UUID
+                    text_summary=conflict_dict.get("description", "N/A")[:150],
+                    full_data=conflict_dict
+                ))
+        elif options_list: # For other decision types like outline/worldview
+             api_ready_options = [DecisionOption(**opt) for opt in options_list]
+
+
         return DecisionPromptResponse(
             novel_id=novel_id,
             decision_type=pending_decision_type,
             prompt_message=prompt_message or f"Please make a selection for {pending_decision_type}.",
-            options=options_list,
+            options=api_ready_options, # Use the transformed list
             workflow_status=workflow_status
         )
     else:
