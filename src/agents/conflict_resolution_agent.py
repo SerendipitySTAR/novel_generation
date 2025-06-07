@@ -1,6 +1,7 @@
 # src/agents/conflict_resolution_agent.py
 from typing import Dict, Any, List, Optional
 import logging
+import re # Added for parsing LLM suggestions
 
 logger = logging.getLogger(__name__)
 
@@ -94,14 +95,99 @@ class ConflictResolutionAgent:
             return chapter_text # Return original if no changes from input text
 
     def suggest_revisions_for_human_review(self, novel_id: int, chapter_text: str, conflicts: List[Dict[str, Any]], novel_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        logger.info(f"Preparing {len(conflicts)} conflicts for human review for novel {novel_id}.")
+        logger.info(f"Preparing LLM-based suggestions for {len(conflicts)} conflicts in novel {novel_id}.")
+
+        if not self.llm_client:
+            logger.error("LLMClient not available. Cannot generate LLM-based suggestions.")
+            augmented_conflicts_error = []
+            for conflict in conflicts:
+                conflict_copy = conflict.copy()
+                conflict_copy["llm_suggestions"] = ["LLM suggestions unavailable due to missing client."]
+                augmented_conflicts_error.append(conflict_copy)
+            return augmented_conflicts_error
+
         if not conflicts:
             return []
 
-        formatted_conflicts = []
+        augmented_conflicts: List[Dict[str, Any]] = []
         for conflict in conflicts:
             conflict_copy = conflict.copy()
-            conflict_copy["suggested_action_placeholder"] = "Review this conflict."
-            conflict_copy["status_for_review"] = "pending_review"
-            formatted_conflicts.append(conflict_copy)
-        return formatted_conflicts
+            logger.info(f"Generating LLM suggestions for conflict ID {conflict.get('conflict_id')}: {conflict.get('description')}")
+
+            original_excerpt = conflict.get("excerpt")
+            if not original_excerpt or not isinstance(original_excerpt, str) or not original_excerpt.strip():
+                logger.warning(f"Conflict ID {conflict.get('conflict_id')} has no valid excerpt. Skipping LLM suggestion.")
+                conflict_copy["llm_suggestions"] = ["No excerpt provided to base suggestions on."]
+                augmented_conflicts.append(conflict_copy)
+                continue
+
+            start_index = chapter_text.find(original_excerpt)
+            if start_index == -1:
+                logger.warning(f"Original excerpt for conflict ID {conflict.get('conflict_id')} not found in chapter text. Cannot generate targeted suggestions. Excerpt: {original_excerpt[:100]}...")
+                conflict_copy["llm_suggestions"] = ["Original excerpt not found in chapter text for targeted suggestion generation."]
+                augmented_conflicts.append(conflict_copy)
+                continue
+
+            window_chars = 300 # Characters on each side for context
+            context_start = max(0, start_index - window_chars)
+            context_end = min(len(chapter_text), start_index + len(original_excerpt) + window_chars)
+            context_window_text = chapter_text[context_start:context_end]
+
+            prompt = (
+                f"A novel chapter has the following conflict:\n"
+                f"Conflict Type: {conflict.get('type', 'N/A')}\n"
+                f"Conflict Severity: {conflict.get('severity', 'N/A')}\n"
+                f"Conflict Description: {conflict.get('description', 'N/A')}\n"
+                f"Problematic Excerpt from chapter: \"{original_excerpt}\"\n"
+                f"Knowledge Base Reference (if any): {conflict.get('kb_reference', 'N/A')}\n\n"
+                f"Wider context from the chapter around the excerpt:\n"
+                f"--- BEGIN CONTEXT WINDOW ---\n{context_window_text}\n--- END CONTEXT WINDOW ---\n\n"
+                f"Your task is to provide one or two distinct, concise suggestions for how to rewrite ONLY the problematic excerpt (\"{original_excerpt}\") to resolve the conflict.\n"
+                f"The suggestions should maintain the original style and tone of the chapter and fit naturally into the context.\n"
+                f"Prefix each suggestion clearly, like \"Suggestion 1: [Rewritten excerpt]\" or \"Suggestion: [Rewritten excerpt]\".\n"
+                f"If providing two suggestions, separate them with '---' (three hyphens).\n"
+                f"If you believe no change to the excerpt is necessary or cannot formulate a good targeted suggestion for just the excerpt, respond with \"No specific rewrite suggestion for this excerpt.\"\n\n"
+                f"Suggestions:"
+            )
+
+            try:
+                max_tokens_for_suggestions = int(len(original_excerpt.split()) * 2.5 * 2) + 150 # Allow for two suggestions, some formatting, and buffer
+                llm_suggestions_text = self.llm_client.generate_text(
+                    prompt,
+                    max_tokens=max(100, max_tokens_for_suggestions), # Ensure reasonable minimum
+                    temperature=0.65
+                )
+
+                parsed_suggestions = []
+                clean_llm_output = llm_suggestions_text.strip()
+
+                if "no specific rewrite suggestion" in clean_llm_output.lower():
+                    parsed_suggestions.append("LLM indicated no specific rewrite suggestion needed for the excerpt.")
+                else:
+                    # Split by "---" for multiple suggestions, then process each part
+                    suggestion_parts = clean_llm_output.split("---")
+                    for part in suggestion_parts:
+                        part = part.strip()
+                        if not part:
+                            continue
+                        # Remove "Suggestion X:" prefix if present
+                        cleaned_suggestion = re.sub(r"Suggestion\s*\d*:\s*", "", part, flags=re.IGNORECASE).strip()
+                        if cleaned_suggestion:
+                            parsed_suggestions.append(cleaned_suggestion)
+
+                    if not parsed_suggestions and clean_llm_output: # If splitting failed but there's text
+                        parsed_suggestions.append(clean_llm_output) # Add raw cleaned output as one suggestion
+
+                conflict_copy["llm_suggestions"] = parsed_suggestions if parsed_suggestions else ["LLM response did not yield parseable suggestions."]
+
+            except Exception as e:
+                logger.error(f"Error during LLM call for conflict ID {conflict.get('conflict_id')} suggestions: {e}")
+                conflict_copy["llm_suggestions"] = [f"Error generating suggestions from LLM: {e}"]
+
+            # Remove old stub fields
+            conflict_copy.pop("suggested_action_placeholder", None)
+            conflict_copy.pop("status_for_review", None)
+
+            augmented_conflicts.append(conflict_copy)
+
+        return augmented_conflicts
