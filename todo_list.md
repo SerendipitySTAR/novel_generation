@@ -26,7 +26,9 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Conditional branching (Basic error handling exists. Complex branching based on scores/user input TODO).
     *   `[x]` Chapter generation loop structure implemented.
     *   `[x]` Global state management within workflow (MVP level).
+    *   [p] Automated chapter quality control via ContentIntegrityAgent scores, including a retry mechanism for low-quality chapters in Auto-Mode.
     *   `[ ]` Integration of human input nodes for user decisions (TODO).
+    *   [p] Placeholder logic for mode-specific conflict handling (Auto-Mode auto-resolve log, Human-Mode user prompt log) after ConflictDetectionAgent runs.
 *   **[p] Agent Layer (AL - README 4.3)**
     *   (Individual agent status below)
 *   **[x] LLM Abstraction Layer (LLMAL - README 4.5)**
@@ -85,10 +87,10 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Initializes KB from outline, worldview, plot, and now detailed characters. (Live embedding calls implemented; full RAG functionality requires real API key; character data processing for KB now leverages rich DetailedCharacterProfile objects).
     *   `[p]` Updates KB with chapter summaries. (Live embedding calls implemented; full functionality requires real API key).
     *   `[ ]` Structured information extraction from generated content (NLP/LLM assisted) (TODO).
-    *   `[ ]` Conflict detection (TODO).
+    *   [p] Conflict detection (Basic `ConflictDetectionAgent` exists and is integrated into workflow. `WorkflowManager` includes placeholders for Auto-Mode auto-resolution and Human-Mode user notification. Advanced KG-based conflict detection and actual resolution logic TODO).
     *   `[ ]` User validation of KB entries (TODO).
 *   **[p] Quality Guardian Agent (质量审核智能体 - README 4.3.6)** Implemented to review selected outline based on Clarity, Originality, Conflict Potential, Overall Score, and provide Justification. Review is informational (printed to CLI). (Live LLM call enabled; parsing implemented; advanced features/integration TODO).
-*   **[ ] Content Integrity Agent (内容审核智能体 - README 4.3.7)** (TODO)
+*   [p] Content Integrity Agent (内容审核智能体 - README 4.3.7)** (Basic agent implemented with 7-dimensional scoring. WorkflowManager includes chapter retry mechanism in Auto-Mode based on its scores. Full retry strategy and human-in-the-loop for quality TODO).
 *   **[ ] Polish & Refinement Agent (润色智能体 - README 4.3.10)** (TODO)
 
 ## 3. Key Features & Workflow (from README 5 & others)
@@ -135,7 +137,7 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Context Synthesizer Agent (MVP, uses LoreKeeper, adapted for detailed plot & characters, refined brief structure).
     *   `[ ]` Basic frontend UI (TODO).
     *   `[x]` Data Persistence Layer (SQLite, Plot & Character descriptions stored as JSON).
-    *   `[x]` Orchestration Layer (LangGraph, includes CLI outline & worldview selection, Quality Guardian for outline).
+    *   `[x]` Orchestration Layer (LangGraph, includes CLI outline & worldview selection, Quality Guardian for outline). Now includes chapter quality retry logic (Auto-Mode) and placeholders for mode-specific conflict handling.
 *   **[p] Phase 1.b: Live LLM Testing, Prompt Tuning, and Output Stabilization**
     *   `[x]` Configure and Secure OpenAI API Key (Docs updated, .env.example created).
     *   `[x]` Enable Real LLM Calls in Agents & Workflow.
