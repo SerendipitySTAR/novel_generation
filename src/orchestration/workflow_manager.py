@@ -73,6 +73,11 @@ class NovelWorkflowState(TypedDict):
     current_chapter_conflicts: Optional[List[Dict[str, Any]]]
     auto_decision_engine: Optional[AutoDecisionEngine] # New field
     knowledge_graph_data: Optional[Dict[str, Any]]
+    # Chapter Retry Mechanism Fields
+    current_chapter_retry_count: int
+    max_chapter_retries: int
+    current_chapter_original_content: Optional[str]
+    current_chapter_feedback_for_retry: Optional[str]
     # 循环安全参数
     loop_iteration_count: int
     max_loop_iterations: int
@@ -723,6 +728,22 @@ def execute_context_synthesizer_agent(state: NovelWorkflowState) -> Dict[str, An
             chapter_brief_text = context_agent.generate_chapter_brief(
                 novel_id, current_chapter_num, brief_plot_summary, active_char_ids
             )
+
+            # Check for retry and append feedback if necessary
+            if state.get("current_chapter_retry_count", 0) > 0:
+                feedback_for_retry = state.get("current_chapter_feedback_for_retry")
+                if feedback_for_retry:
+                    retry_message = (
+                        f"\n\n--- IMPORTANT: THIS IS A RETRY ATTEMPT (Attempt {state['current_chapter_retry_count']}) ---\n"
+                        f"Feedback from the previous attempt's quality review:\n"
+                        f"{feedback_for_retry}\n"
+                        f"Please carefully review this feedback and address all points in this new version of the chapter.\n"
+                        f"--- END OF RETRY FEEDBACK ---\n"
+                    )
+                    chapter_brief_text += retry_message
+                    history = _log_and_update_history(history, f"Appended retry feedback to chapter brief for Chapter {current_chapter_num}.")
+                    print(f"INFO: Appended retry feedback to brief for Chapter {current_chapter_num}, Retry Attempt: {state['current_chapter_retry_count']}")
+
             history = _log_and_update_history(history, f"Chapter brief generated for Chapter {current_chapter_num}.")
             # Storing the specific plot focus for the chronicler separately as requested by subtask.
             return {
@@ -864,19 +885,37 @@ def execute_lore_keeper_update_kb(state: NovelWorkflowState) -> Dict[str, Any]:
             _log_memory_usage("after lore_keeper_update_kb cleanup")
 
             print(f"DEBUG: execute_lore_keeper_update_kb - About to return result")
-            result = {"history": history, "error_message": None}
-            print(f"DEBUG: execute_lore_keeper_update_kb - Returning: {list(result.keys())}")
-            return result
+            # Clear retry-specific fields after successful KB update (or attempted update)
+            updates_for_return = {
+                "history": history,
+                "error_message": None,
+                "current_chapter_original_content": None,
+                "current_chapter_feedback_for_retry": None
+            }
+            print(f"DEBUG: execute_lore_keeper_update_kb - Returning: {list(updates_for_return.keys())}")
+            return updates_for_return
         except Exception as kb_error:
             # 如果知识库更新失败，记录警告但继续工作流程
             warning_msg = f"Warning: Failed to update knowledge base for Chapter {current_chapter_num} ({kb_error}), continuing workflow."
             print(f"WARNING: {warning_msg}")
             history = _log_and_update_history(history, warning_msg)
-            return {"history": history, "error_message": None}  # 不设置error_message，允许继续
+            # Still clear retry-specific fields even if KB update fails, as we are moving on from this chapter attempt
+            return {
+                "history": history,
+                "error_message": None, # 不设置error_message，允许继续
+                "current_chapter_original_content": None,
+                "current_chapter_feedback_for_retry": None
+            }
 
     except Exception as e:
         msg = f"Error in Lore Keeper Update KB node for Chapter {current_chapter_num}: {e}"
-        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        # Also clear retry fields in case of other errors in this node before returning
+        return {
+            "error_message": msg,
+            "history": _log_and_update_history(history, msg, True),
+            "current_chapter_original_content": None,
+            "current_chapter_feedback_for_retry": None
+        }
 
 def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
     # 记录内存使用情况
@@ -925,10 +964,11 @@ def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
     result = {
         "current_chapter_number": new_num,
         "loop_iteration_count": new_iterations,
+        "current_chapter_retry_count": 0, # Reset for the new chapter
         "history": history,
         "error_message": None
     }
-
+    print(f"DEBUG: increment_chapter_number - Reset retry count to 0 for the new chapter {new_num}.")
     print(f"DEBUG: increment_chapter_number - Returning result with keys: {list(result.keys())}")
     _log_memory_usage("after increment_chapter_number")
     return result
@@ -1041,12 +1081,18 @@ def execute_conflict_detection(state: NovelWorkflowState) -> Dict[str, Any]:
         print("----------------------------------------------------")
 
         auto_mode = state.get("user_input", {}).get("auto_mode", False)
-        if conflicts and auto_mode:
-            history = _log_and_update_history(history, "Auto-Mode: Conflicts detected. Phase 2: Placeholder for auto-resolution attempt.")
-            print("INFO: Auto-Mode: Conflicts detected. Placeholder for auto-resolution attempt.")
-        elif conflicts and not auto_mode:
-            history = _log_and_update_history(history, "Human-Mode: Conflicts detected. User review would be needed.")
-            print("INFO: Human-Mode: Conflicts detected. User review would be needed.")
+        if conflicts: # Check if the list is not empty
+            num_conflicts = len(conflicts)
+            if auto_mode:
+                log_message = f"INFO: Auto-Mode: {num_conflicts} conflicts detected. Placeholder for auto-resolution attempt. Workflow continues with original text."
+                print(log_message)
+                history = _log_and_update_history(history, log_message)
+            else: # Human-mode
+                log_message = f"INFO: Human-Mode: {num_conflicts} conflicts detected. Placeholder: User would be prompted for review and resolution options. Workflow continues."
+                print(log_message)
+                history = _log_and_update_history(history, log_message)
+        else: # No conflicts
+            history = _log_and_update_history(history, "No conflicts detected in chapter.") # Added for clarity
 
         result = dict(state)
         result.update({
@@ -1117,16 +1163,25 @@ def execute_content_integrity_review(state: NovelWorkflowState) -> Dict[str, Any
             history = _log_and_update_history(history, f"Chapter '{chapter_title}' PASSED quality check (Score: {overall_score} >= Threshold: {quality_threshold}).")
             print(f"INFO: Chapter '{chapter_title}' PASSED quality check (Score: {overall_score} >= Threshold: {quality_threshold}).")
         else:
-            history = _log_and_update_history(history, f"Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}). For Phase 1, workflow continues.")
-            print(f"WARNING: Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}). Phase 1: Workflow continues, no retry.")
+            history = _log_and_update_history(history, f"Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}).")
+            print(f"WARNING: Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}).")
+            # Store original content and feedback for retry
+            current_chapter_original_content = chapter_content
+            feedback_summary = f"Review Justification: {review_results.get('justification', 'N/A')}. " \
+                               f"Overall Score: {overall_score}. " \
+                               f"Detailed Scores: {review_results.get('scores', {})}"
+            current_chapter_feedback_for_retry = feedback_summary
+            history = _log_and_update_history(history, f"Stored original content and feedback for potential retry of chapter '{chapter_title}'.")
 
         # Update state
         result = dict(state)
         result.update({
             "current_chapter_review": review_results,
             "current_chapter_quality_passed": passed_quality_check,
+            "current_chapter_original_content": current_chapter_original_content if not passed_quality_check else None,
+            "current_chapter_feedback_for_retry": current_chapter_feedback_for_retry if not passed_quality_check else None,
             "history": history,
-            "error_message": None # Do not stop workflow on failed quality for Phase 1
+            "error_message": None
         })
         return result
 
@@ -1283,6 +1338,44 @@ def _should_continue_chapter_loop(state: NovelWorkflowState) -> str:
         traceback.print_exc()
         return "end_loop_on_error"
 
+def _should_retry_chapter(state: NovelWorkflowState) -> str:
+    """
+    Determines if the current chapter should be retried based on quality and retry limits.
+    """
+    history = _log_and_update_history(state.get("history", []), "Conditional Node: Should Retry Chapter?")
+    print("DEBUG: _should_retry_chapter - Function called")
+
+    auto_mode = state.get("user_input", {}).get("auto_mode", False)
+    quality_passed = state.get("current_chapter_quality_passed", True) # Default to True to avoid accidental retries
+    current_retry_count = state.get("current_chapter_retry_count", 0)
+    max_retries = state.get("max_chapter_retries", 1)
+
+    print(f"DEBUG: _should_retry_chapter - Auto Mode: {auto_mode}, Quality Passed: {quality_passed}, Retries: {current_retry_count}/{max_retries}")
+
+    if auto_mode and not quality_passed and current_retry_count < max_retries:
+        new_retry_count = current_retry_count + 1
+        state["current_chapter_retry_count"] = new_retry_count # Update state directly
+        history = _log_and_update_history(history, f"Chapter failed quality. Incrementing retry count to {new_retry_count}. Will attempt retry.")
+        print(f"INFO: Chapter retry {new_retry_count}/{max_retries} will be attempted.")
+        state["history"] = history # Persist history update
+        return "retry_chapter"
+    else:
+        if auto_mode and not quality_passed and current_retry_count >= max_retries:
+            history = _log_and_update_history(history, f"Chapter failed quality, but max retries ({max_retries}) reached. Proceeding without retry.")
+            print(f"WARNING: Max retries reached for chapter. Proceeding without further retries.")
+        elif not auto_mode and not quality_passed:
+            history = _log_and_update_history(history, "Chapter failed quality, but not in auto_mode. Proceeding without retry.")
+            print("INFO: Chapter failed quality, but not in auto_mode. No retry.")
+        elif quality_passed:
+            history = _log_and_update_history(history, "Chapter passed quality check. Proceeding.")
+            print("INFO: Chapter passed quality. No retry needed.")
+
+        # Reset retry count for the next chapter in all cases where we don't retry
+        state["current_chapter_retry_count"] = 0
+        state["history"] = history # Persist history update
+        print("DEBUG: _should_retry_chapter - Resetting retry count to 0 for next chapter.")
+        return "proceed_to_kb_update"
+
 class WorkflowManager:
     def __init__(self, db_name="novel_mvp.db", mode="human"):
         self.db_name = db_name
@@ -1347,6 +1440,7 @@ class WorkflowManager:
         self.workflow.add_node("context_synthesizer", execute_context_synthesizer_agent)
         self.workflow.add_node("chapter_chronicler", execute_chapter_chronicler_agent)
         self.workflow.add_node("content_integrity_review", execute_content_integrity_review)
+        self.workflow.add_node("should_retry_chapter", _should_retry_chapter) # New conditional node
         self.workflow.add_node("lore_keeper_update_kb", execute_lore_keeper_update_kb)
         self.workflow.add_node("conflict_detection", execute_conflict_detection)
         self.workflow.add_node("increment_chapter_number", increment_chapter_number)
@@ -1371,7 +1465,13 @@ class WorkflowManager:
         self.workflow.add_conditional_edges("prepare_for_chapter_loop", _check_node_output, {"continue": "context_synthesizer", "stop_on_error": END})
         self.workflow.add_conditional_edges("context_synthesizer", _check_node_output, {"continue": "chapter_chronicler", "stop_on_error": END})
         self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "content_integrity_review", "stop_on_error": END})
-        self.workflow.add_conditional_edges("content_integrity_review", _check_node_output, {"continue": "lore_keeper_update_kb", "stop_on_error": END})
+        # content_integrity_review now goes to should_retry_chapter
+        self.workflow.add_conditional_edges("content_integrity_review", _check_node_output, {"continue": "should_retry_chapter", "stop_on_error": END})
+        # should_retry_chapter branches
+        self.workflow.add_conditional_edges("should_retry_chapter", _should_retry_chapter, {
+            "retry_chapter": "context_synthesizer", # Loop back to context synthesizer
+            "proceed_to_kb_update": "lore_keeper_update_kb"
+        })
         self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "conflict_detection", "stop_on_error": END})
         self.workflow.add_conditional_edges("conflict_detection", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
         self.workflow.add_conditional_edges(
@@ -1429,6 +1529,11 @@ class WorkflowManager:
             current_chapter_conflicts=None,
             auto_decision_engine=self.auto_decision_engine, # Add this line
             knowledge_graph_data=None,
+            # Chapter Retry Mechanism Fields
+            current_chapter_retry_count=0,
+            max_chapter_retries=1, # Default to 1 retry
+            current_chapter_original_content=None,
+            current_chapter_feedback_for_retry=None,
             # 循环安全参数
             loop_iteration_count=0,
             max_loop_iterations=max(10, num_chapters * 3),  # 设置合理的最大迭代次数
