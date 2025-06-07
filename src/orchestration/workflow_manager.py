@@ -26,6 +26,7 @@ from src.agents.chapter_chronicler_agent import ChapterChroniclerAgent
 from src.agents.quality_guardian_agent import QualityGuardianAgent # Import added
 from src.agents.content_integrity_agent import ContentIntegrityAgent
 from src.agents.conflict_detection_agent import ConflictDetectionAgent
+from src.agents.conflict_resolution_agent import ConflictResolutionAgent # New Agent
 from src.llm_abstraction.llm_client import LLMClient # Ensure LLMClient is imported
 
 # Persistence and Core Models
@@ -39,6 +40,7 @@ class UserInput(TypedDict):
     chapters: Optional[int]  # 新增：用户指定的章节数
     words_per_chapter: Optional[int]
     auto_mode: Optional[bool]  # 新增：自动模式，跳过用户交互
+    interaction_mode: Optional[str] # "cli" or "api"
 
 class NovelWorkflowState(TypedDict):
     user_input: UserInput
@@ -73,6 +75,18 @@ class NovelWorkflowState(TypedDict):
     current_chapter_conflicts: Optional[List[Dict[str, Any]]]
     auto_decision_engine: Optional[AutoDecisionEngine] # New field
     knowledge_graph_data: Optional[Dict[str, Any]]
+    # Chapter Retry Mechanism Fields
+    current_chapter_retry_count: int
+    max_chapter_retries: int
+    current_chapter_original_content: Optional[str]
+    current_chapter_feedback_for_retry: Optional[str]
+    # API Interaction / Human-in-the-loop state
+    workflow_status: Optional[str] # e.g., "running", "paused_for_outline_selection"
+    pending_decision_type: Optional[str]
+    pending_decision_options: Optional[List[Dict[str, Any]]] # Stores DecisionOption like dicts
+    pending_decision_prompt: Optional[str]
+    user_made_decision_payload: Optional[Dict[str, Any]] # Stores submitted choice
+    original_chapter_content_for_conflict_review: Optional[str] # Stores chapter text before potential conflict resolution by human
     # 循环安全参数
     loop_iteration_count: int
     max_loop_iterations: int
@@ -217,10 +231,93 @@ def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
     selected_index = 0
     # choice_int = 0 # No longer needed here due to new logic structure
 
-    auto_mode = state.get("user_input", {}).get("auto_mode", False)
+    user_input_settings = state.get("user_input", {})
+    auto_mode = user_input_settings.get("auto_mode", False)
+    interaction_mode = user_input_settings.get("interaction_mode", "cli")
     auto_engine = state.get("auto_decision_engine")
 
-    if auto_mode and auto_engine: # Check for engine presence
+    # API Interaction Mode (Human makes decision via API)
+    if interaction_mode == "api" and not auto_mode:
+        decision_payload = state.get("user_made_decision_payload")
+        if decision_payload and decision_payload.get("selected_option_id"):
+            # Resuming from API decision
+            try:
+                selected_option_id_str = decision_payload["selected_option_id"]
+                # Find the selected outline by its ID (which is stringified index+1)
+                # This assumes options were presented with ID "1", "2", ...
+                selected_outline_text = None
+                original_options = state.get("all_generated_outlines", [])
+                for i, outline_text_option in enumerate(original_options):
+                    if str(i+1) == selected_option_id_str:
+                        selected_outline_text = outline_text_option
+                        selected_index = i # For logging
+                        break
+
+                if selected_outline_text is None:
+                    raise ValueError(f"Selected option ID '{selected_option_id_str}' not found in available outlines.")
+
+                log_msg = f"API Mode: Resumed with selected Outline {selected_index + 1}."
+                history = _log_and_update_history(history, log_msg)
+                state["narrative_outline_text"] = selected_outline_text
+                state["user_made_decision_payload"] = None # Clear consumed decision
+                state["workflow_status"] = "running_after_outline_decision"
+                # Clear pending decision fields that were set for pausing
+                state["pending_decision_type"] = None
+                state["pending_decision_options"] = None
+                state["pending_decision_prompt"] = None
+                state["history"] = history
+                state["error_message"] = None
+                state["execution_count"] = execution_count
+                return state
+            except (ValueError, TypeError) as e:
+                msg = f"API Mode: Error processing outline decision: {e}. Invalid payload: {decision_payload}"
+                state["error_message"] = msg
+                state["history"] = _log_and_update_history(history, msg, True)
+                state["execution_count"] = execution_count
+                return state # Error state will be caught by _check_node_output
+        else:
+            # Pausing for API decision
+            options_for_api = []
+            for i, outline_text_option in enumerate(all_outlines):
+                options_for_api.append({
+                    "id": str(i + 1), # API decision will refer to this ID
+                    "text_summary": outline_text_option[:150] + "...",
+                    "full_data": outline_text_option
+                })
+            state["pending_decision_type"] = "outline_selection"
+            state["pending_decision_options"] = options_for_api
+            state["pending_decision_prompt"] = "Please select a narrative outline for the novel."
+            state["workflow_status"] = "paused_for_outline_selection"
+            history = _log_and_update_history(history, "API Mode: Pausing for outline selection.")
+            state["history"] = history # Ensure history is updated in state
+            state["execution_count"] = execution_count
+
+            # Persist state to DB before returning
+            try:
+                db_manager = DatabaseManager(db_name=state.get("db_name", "novel_mvp.db"))
+                options_json = json.dumps(options_for_api)
+                # Create a serializable version of the state for JSON dump
+                # This is tricky because state can contain non-serializable objects like agent instances
+                # For now, we'll attempt a direct dump, but this might need a custom encoder or selective serialization
+                serializable_state = {k: v for k, v in state.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))}
+                state_json = json.dumps(serializable_state) # Might fail if state has complex objects
+                db_manager.update_novel_pause_state(
+                    state["novel_id"], state["workflow_status"], state["pending_decision_type"],
+                    options_json, state["pending_decision_prompt"], state_json
+                )
+                history = _log_and_update_history(history, "Successfully saved paused state to DB.")
+                state["history"] = history
+            except Exception as db_e:
+                error_msg = f"API Mode: Failed to save paused state to DB: {db_e}"
+                history = _log_and_update_history(history, error_msg, True)
+                state["history"] = history
+                state["error_message"] = error_msg # This will stop the workflow via _check_node_output
+                # Do not return yet, let it fall through to _check_workflow_pause_status which might be an error state
+
+            return state # This state will be caught by _check_workflow_pause_status
+
+    # Auto Mode (CLI or API)
+    if auto_mode and auto_engine:
         print("Auto mode enabled: Making automatic outline selection.")
         # Ensure all_outlines is not empty before calling decide
         if not all_outlines: # This check was already there, just ensuring context
@@ -245,12 +342,12 @@ def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
                 selected_index = 0 # Fallback, though problematic
                 selected_outline_text = all_outlines[selected_index] # Ensure selected_outline_text is set
                 log_msg = f"Auto mode: Selected an outline via AutoDecisionEngine (index unknown, defaulted to 1)."
-    elif auto_mode and not auto_engine:
+    elif auto_mode and not auto_engine: # Auto mode but no engine (e.g. API auto mode without engine fully setup)
         print("Auto mode enabled, but AutoDecisionEngine not found in state. Defaulting to Outline 1.")
         log_msg = "Auto mode (engine missing): Defaulting to Outline 1."
         selected_index = 0 # Default behavior
         selected_outline_text = all_outlines[selected_index]
-    else: # Human interaction mode
+    else: # CLI Human interaction mode
         try:
             import sys
             if not sys.stdin.isatty():
@@ -413,10 +510,84 @@ def present_worldviews_for_selection_cli(state: NovelWorkflowState) -> dict:
     selected_index = 0
     # choice_int = 0 # No longer needed here
 
-    auto_mode = state.get("user_input", {}).get("auto_mode", False)
+    user_input_settings = state.get("user_input", {})
+    auto_mode = user_input_settings.get("auto_mode", False)
+    interaction_mode = user_input_settings.get("interaction_mode", "cli")
     auto_engine = state.get("auto_decision_engine")
 
-    if auto_mode and auto_engine: # Check for engine presence
+    # API Interaction Mode (Human makes decision via API)
+    if interaction_mode == "api" and not auto_mode:
+        decision_payload = state.get("user_made_decision_payload")
+        if decision_payload and decision_payload.get("selected_option_id"):
+            # Resuming from API decision
+            try:
+                selected_option_id_str = decision_payload["selected_option_id"]
+                selected_wv_detail = None
+                original_options = state.get("all_generated_worldviews", [])
+                for i, wv_option in enumerate(original_options):
+                    if str(i+1) == selected_option_id_str:
+                        selected_wv_detail = wv_option
+                        selected_index = i # for logging
+                        break
+
+                if selected_wv_detail is None:
+                    raise ValueError(f"Selected option ID '{selected_option_id_str}' not found in available worldviews.")
+
+                log_msg = f"API Mode: Resumed with selected Worldview {selected_index + 1} ('{selected_wv_detail.get('world_name', 'N/A')}')."
+                history = _log_and_update_history(history, log_msg)
+                state["selected_worldview_detail"] = selected_wv_detail
+                state["user_made_decision_payload"] = None # Clear consumed decision
+                state["workflow_status"] = "running_after_worldview_decision"
+                # Clear pending decision fields
+                state["pending_decision_type"] = None
+                state["pending_decision_options"] = None
+                state["pending_decision_prompt"] = None
+                state["history"] = history
+                state["error_message"] = None
+                return state # Return the full state dict
+            except (ValueError, TypeError) as e:
+                msg = f"API Mode: Error processing worldview decision: {e}. Invalid payload: {decision_payload}"
+                state["error_message"] = msg
+                state["history"] = _log_and_update_history(history, msg, True)
+                return state # Error state will be caught by _check_node_output
+        else:
+            # Pausing for API decision
+            options_for_api = []
+            for i, wv_detail_option in enumerate(all_worldviews):
+                options_for_api.append({
+                    "id": str(i + 1),
+                    "text_summary": f"{wv_detail_option.get('world_name', 'N/A')} - {wv_detail_option.get('core_concept', 'N/A')[:100]}...",
+                    "full_data": wv_detail_option
+                })
+            state["pending_decision_type"] = "worldview_selection"
+            state["pending_decision_options"] = options_for_api
+            state["pending_decision_prompt"] = "Please select a worldview for the novel."
+            state["workflow_status"] = "paused_for_worldview_selection"
+            history = _log_and_update_history(history, "API Mode: Pausing for worldview selection.")
+            state["history"] = history # Ensure history is updated in state
+
+            # Persist state to DB
+            try:
+                db_manager = DatabaseManager(db_name=state.get("db_name", "novel_mvp.db"))
+                options_json = json.dumps(options_for_api)
+                serializable_state = {k: v for k, v in state.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))}
+                state_json = json.dumps(serializable_state)
+                db_manager.update_novel_pause_state(
+                    state["novel_id"], state["workflow_status"], state["pending_decision_type"],
+                    options_json, state["pending_decision_prompt"], state_json
+                )
+                history = _log_and_update_history(history, "Successfully saved paused worldview selection state to DB.")
+                state["history"] = history
+            except Exception as db_e:
+                error_msg = f"API Mode: Failed to save paused worldview state to DB: {db_e}"
+                history = _log_and_update_history(history, error_msg, True)
+                state["history"] = history
+                state["error_message"] = error_msg
+
+            return state # This state will be caught by _check_workflow_pause_status
+
+    # Auto Mode (CLI or API)
+    if auto_mode and auto_engine:
         print("Auto mode enabled: Making automatic worldview selection.")
         if not all_worldviews: # This check was already there
             error_msg = "No worldviews available for automatic selection."
@@ -432,12 +603,12 @@ def present_worldviews_for_selection_cli(state: NovelWorkflowState) -> dict:
                 selected_index = 0 # Fallback
                 selected_wv_detail = all_worldviews[selected_index] # Ensure selected_wv_detail is set
                 log_msg = f"Auto mode: Selected a worldview via AutoDecisionEngine (index unknown, defaulted to 1)."
-    elif auto_mode and not auto_engine:
+    elif auto_mode and not auto_engine: # Auto mode but no engine
         print("Auto mode enabled, but AutoDecisionEngine not found in state. Defaulting to Worldview 1.")
         log_msg = "Auto mode (engine missing): Defaulting to Worldview 1."
         selected_index = 0
         selected_wv_detail = all_worldviews[selected_index]
-    else: # Human interaction mode
+    else: # CLI Human interaction mode
         try:
             import sys
             if not sys.stdin.isatty():
@@ -723,6 +894,22 @@ def execute_context_synthesizer_agent(state: NovelWorkflowState) -> Dict[str, An
             chapter_brief_text = context_agent.generate_chapter_brief(
                 novel_id, current_chapter_num, brief_plot_summary, active_char_ids
             )
+
+            # Check for retry and append feedback if necessary
+            if state.get("current_chapter_retry_count", 0) > 0:
+                feedback_for_retry = state.get("current_chapter_feedback_for_retry")
+                if feedback_for_retry:
+                    retry_message = (
+                        f"\n\n--- IMPORTANT: THIS IS A RETRY ATTEMPT (Attempt {state['current_chapter_retry_count']}) ---\n"
+                        f"Feedback from the previous attempt's quality review:\n"
+                        f"{feedback_for_retry}\n"
+                        f"Please carefully review this feedback and address all points in this new version of the chapter.\n"
+                        f"--- END OF RETRY FEEDBACK ---\n"
+                    )
+                    chapter_brief_text += retry_message
+                    history = _log_and_update_history(history, f"Appended retry feedback to chapter brief for Chapter {current_chapter_num}.")
+                    print(f"INFO: Appended retry feedback to brief for Chapter {current_chapter_num}, Retry Attempt: {state['current_chapter_retry_count']}")
+
             history = _log_and_update_history(history, f"Chapter brief generated for Chapter {current_chapter_num}.")
             # Storing the specific plot focus for the chronicler separately as requested by subtask.
             return {
@@ -864,19 +1051,37 @@ def execute_lore_keeper_update_kb(state: NovelWorkflowState) -> Dict[str, Any]:
             _log_memory_usage("after lore_keeper_update_kb cleanup")
 
             print(f"DEBUG: execute_lore_keeper_update_kb - About to return result")
-            result = {"history": history, "error_message": None}
-            print(f"DEBUG: execute_lore_keeper_update_kb - Returning: {list(result.keys())}")
-            return result
+            # Clear retry-specific fields after successful KB update (or attempted update)
+            updates_for_return = {
+                "history": history,
+                "error_message": None,
+                "current_chapter_original_content": None,
+                "current_chapter_feedback_for_retry": None
+            }
+            print(f"DEBUG: execute_lore_keeper_update_kb - Returning: {list(updates_for_return.keys())}")
+            return updates_for_return
         except Exception as kb_error:
             # 如果知识库更新失败，记录警告但继续工作流程
             warning_msg = f"Warning: Failed to update knowledge base for Chapter {current_chapter_num} ({kb_error}), continuing workflow."
             print(f"WARNING: {warning_msg}")
             history = _log_and_update_history(history, warning_msg)
-            return {"history": history, "error_message": None}  # 不设置error_message，允许继续
+            # Still clear retry-specific fields even if KB update fails, as we are moving on from this chapter attempt
+            return {
+                "history": history,
+                "error_message": None, # 不设置error_message，允许继续
+                "current_chapter_original_content": None,
+                "current_chapter_feedback_for_retry": None
+            }
 
     except Exception as e:
         msg = f"Error in Lore Keeper Update KB node for Chapter {current_chapter_num}: {e}"
-        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+        # Also clear retry fields in case of other errors in this node before returning
+        return {
+            "error_message": msg,
+            "history": _log_and_update_history(history, msg, True),
+            "current_chapter_original_content": None,
+            "current_chapter_feedback_for_retry": None
+        }
 
 def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
     # 记录内存使用情况
@@ -925,10 +1130,11 @@ def increment_chapter_number(state: NovelWorkflowState) -> Dict[str, Any]:
     result = {
         "current_chapter_number": new_num,
         "loop_iteration_count": new_iterations,
+        "current_chapter_retry_count": 0, # Reset for the new chapter
         "history": history,
         "error_message": None
     }
-
+    print(f"DEBUG: increment_chapter_number - Reset retry count to 0 for the new chapter {new_num}.")
     print(f"DEBUG: increment_chapter_number - Returning result with keys: {list(result.keys())}")
     _log_memory_usage("after increment_chapter_number")
     return result
@@ -1009,25 +1215,47 @@ def execute_conflict_detection(state: NovelWorkflowState) -> Dict[str, Any]:
         llm_client_instance = LLMClient() # Or get from state if available
 
         # LoreKeeperAgent instance might be needed. For now, agent handles it being None.
-        # lore_keeper_instance = state.get("lore_keeper_instance")
+        # lore_keeper_instance = state.get("lore_keeper_instance") # This would be if LKA runs before and is cached. CDA will init its own if needed.
 
-        agent = ConflictDetectionAgent(llm_client=llm_client_instance) # Pass llm_client
-        history = _log_and_update_history(history, f"ConflictDetectionAgent instantiated for chapter '{chapter_title}'.")
+        db_name_for_agent = state.get("db_name", "novel_mvp.db")
+        agent = ConflictDetectionAgent(llm_client=llm_client_instance, db_name=db_name_for_agent)
+        history = _log_and_update_history(history, f"ConflictDetectionAgent instantiated for chapter '{chapter_title}' using db: {db_name_for_agent}.")
+
+        novel_id = state.get("novel_id")
+        if novel_id is None:
+            msg = f"Novel ID is missing in state, cannot perform conflict detection for chapter '{chapter_title}'."
+            history = _log_and_update_history(history, msg, True)
+            # Return a valid state structure even on error
+            result = dict(state)
+            result.update({
+                "error_message": msg, # Set error message
+                "history": history,
+                "current_chapter_conflicts": [{"error": msg, "description": msg}]
+            })
+            return result
 
         # Prepare context for conflict detection (simplified for now)
         # previous_chapters_summary = [...] # This would need to be built up
         novel_ctx = {
             "theme": state.get("user_input", {}).get("theme"),
-            "style": state.get("user_input", {}).get("style_preferences"),
+            "style_preferences": state.get("user_input", {}).get("style_preferences"), # Corrected key
             "worldview_description": state.get("selected_worldview_detail", {}).get("core_concept")
                                      if state.get("selected_worldview_detail") else
                                      state.get("worldview_data", {}).get("description"),
         }
 
+        chapter_num_for_agent = last_chapter.get('chapter_number')
+        if chapter_num_for_agent is None: # Should not happen if chapter is valid
+            msg = f"Chapter number missing for last generated chapter. Cannot run conflict detection."
+            history = _log_and_update_history(history, msg, True)
+            result = dict(state)
+            result.update({"error_message": msg, "history": history, "current_chapter_conflicts": [{"error": msg, "description": msg}]})
+            return result
+
         conflicts = agent.detect_conflicts(
+            novel_id=novel_id,
             current_chapter_text=chapter_content,
-            current_chapter_number=last_chapter.get('chapter_number', 0),
-            # previous_chapters_summary=previous_chapters_summary, # Future enhancement
+            current_chapter_number=chapter_num_for_agent,
             novel_context=novel_ctx
         )
         history = _log_and_update_history(history, f"Conflict detection completed for chapter '{chapter_title}'. Found {len(conflicts)} conflicts.")
@@ -1041,12 +1269,18 @@ def execute_conflict_detection(state: NovelWorkflowState) -> Dict[str, Any]:
         print("----------------------------------------------------")
 
         auto_mode = state.get("user_input", {}).get("auto_mode", False)
-        if conflicts and auto_mode:
-            history = _log_and_update_history(history, "Auto-Mode: Conflicts detected. Phase 2: Placeholder for auto-resolution attempt.")
-            print("INFO: Auto-Mode: Conflicts detected. Placeholder for auto-resolution attempt.")
-        elif conflicts and not auto_mode:
-            history = _log_and_update_history(history, "Human-Mode: Conflicts detected. User review would be needed.")
-            print("INFO: Human-Mode: Conflicts detected. User review would be needed.")
+        if conflicts: # Check if the list is not empty
+            num_conflicts = len(conflicts)
+            if auto_mode:
+                log_message = f"INFO: Auto-Mode: {num_conflicts} conflicts detected. Placeholder for auto-resolution attempt. Workflow continues with original text."
+                print(log_message)
+                history = _log_and_update_history(history, log_message)
+            else: # Human-mode
+                log_message = f"INFO: Human-Mode: {num_conflicts} conflicts detected. Placeholder: User would be prompted for review and resolution options. Workflow continues."
+                print(log_message)
+                history = _log_and_update_history(history, log_message)
+        else: # No conflicts
+            history = _log_and_update_history(history, "No conflicts detected in chapter.") # Added for clarity
 
         result = dict(state)
         result.update({
@@ -1117,16 +1351,25 @@ def execute_content_integrity_review(state: NovelWorkflowState) -> Dict[str, Any
             history = _log_and_update_history(history, f"Chapter '{chapter_title}' PASSED quality check (Score: {overall_score} >= Threshold: {quality_threshold}).")
             print(f"INFO: Chapter '{chapter_title}' PASSED quality check (Score: {overall_score} >= Threshold: {quality_threshold}).")
         else:
-            history = _log_and_update_history(history, f"Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}). For Phase 1, workflow continues.")
-            print(f"WARNING: Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}). Phase 1: Workflow continues, no retry.")
+            history = _log_and_update_history(history, f"Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}).")
+            print(f"WARNING: Chapter '{chapter_title}' FAILED quality check (Score: {overall_score} < Threshold: {quality_threshold}).")
+            # Store original content and feedback for retry
+            current_chapter_original_content = chapter_content
+            feedback_summary = f"Review Justification: {review_results.get('justification', 'N/A')}. " \
+                               f"Overall Score: {overall_score}. " \
+                               f"Detailed Scores: {review_results.get('scores', {})}"
+            current_chapter_feedback_for_retry = feedback_summary
+            history = _log_and_update_history(history, f"Stored original content and feedback for potential retry of chapter '{chapter_title}'.")
 
         # Update state
         result = dict(state)
         result.update({
             "current_chapter_review": review_results,
             "current_chapter_quality_passed": passed_quality_check,
+            "current_chapter_original_content": current_chapter_original_content if not passed_quality_check else None,
+            "current_chapter_feedback_for_retry": current_chapter_feedback_for_retry if not passed_quality_check else None,
             "history": history,
-            "error_message": None # Do not stop workflow on failed quality for Phase 1
+            "error_message": None
         })
         return result
 
@@ -1283,18 +1526,423 @@ def _should_continue_chapter_loop(state: NovelWorkflowState) -> str:
         traceback.print_exc()
         return "end_loop_on_error"
 
+def _check_workflow_pause_status(state: NovelWorkflowState) -> str:
+    """
+    Checks if the workflow is paused for an API decision.
+    If paused, ends the current graph invocation. The workflow will be resumed
+    via a separate call to `WorkflowManager.resume_workflow` once the API receives the decision.
+    """
+    workflow_status = state.get("workflow_status", "running")
+    if workflow_status and workflow_status.startswith("paused_for_"):
+        print(f"DEBUG: Workflow PAUSED. Status: {workflow_status}. Ending current graph execution.")
+        # History update for this should be in the node that sets the pause status.
+        return "WORKFLOW_PAUSED" # This will lead to END in the graph for this invocation.
+
+    # Default to a generic continue if no specific routing is needed beyond this check
+    # If different nodes need different "continue" paths after this check,
+    # this function might need to return more specific values based on state.
+    # For now, a single "continue_workflow" assumes the node's _check_node_output
+    # will handle further conditional logic if needed, or it's a direct path.
+    print(f"DEBUG: Workflow status is '{workflow_status}'. Continuing graph execution.")
+    return "continue_workflow"
+
+def prepare_conflict_review_for_api(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = state.get("history", [])
+    novel_id = state.get("novel_id")
+    current_chapter_num = state.get("current_chapter_number")
+    generated_chapters = state.get("generated_chapters", [])
+    conflicts = state.get("current_chapter_conflicts", [])
+    db_name = state.get("db_name", "novel_mvp.db")
+    user_input = state.get("user_input", {}) # For novel_context
+
+    history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Preparing conflicts for API review.")
+
+    # Check if resuming after a decision was made for conflict_review by resume_workflow
+    # The user_made_decision_payload will contain the action chosen by the user.
+    decision_payload_for_current_node = state.get("user_made_decision_payload")
+    if decision_payload_for_current_node and decision_payload_for_current_node.get("source_decision_type") == "conflict_review":
+        action_taken = decision_payload_for_current_node.get("action", "unknown_action_processed")
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Conflict review decision '{action_taken}' processed by resume_workflow. Proceeding.")
+
+        # Clear the payload as it's been processed by resume_workflow's specific logic for this type
+        state["user_made_decision_payload"] = None
+        state["workflow_status"] = f"running_after_conflict_review_decision" # Generic running status
+        # Ensure other pending fields are also clear, though resume_workflow should have done this.
+        state["pending_decision_type"] = None
+        state["pending_decision_options"] = None
+        state["pending_decision_prompt"] = None
+        # original_chapter_content_for_conflict_review was handled by resume_workflow
+
+        state["history"] = history
+        return state # This will go to _check_workflow_pause_status, which should return "continue_workflow"
+
+    # If not resuming, proceed to pause for decision
+    if not novel_id:
+        error_msg = f"Chapter {current_chapter_num}: Novel ID missing, cannot prepare conflicts for API review."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    if not conflicts:
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: No conflicts found to prepare for API review. Proceeding.")
+        state["history"] = history
+        state["workflow_status"] = "running_no_conflicts_to_review" # Should proceed in graph
+        return state # Should be caught by _check_workflow_pause_status as not paused
+
+    if not generated_chapters:
+        error_msg = f"Chapter {current_chapter_num}: No generated chapters available for conflict review."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    original_chapter_text = generated_chapters[-1].get("content")
+    if not original_chapter_text:
+        error_msg = f"Chapter {current_chapter_num}: Original chapter text missing for conflict review."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    state["original_chapter_content_for_conflict_review"] = original_chapter_text
+
+    try:
+        llm_client = LLMClient()
+        resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=db_name)
+
+        # The ConflictResolutionAgent's suggest_revisions_for_human_review method
+        # is expected to format conflicts, perhaps adding suggestions or placeholders.
+        # For this subtask, it just adds a placeholder.
+        formatted_conflicts_for_api = resolver_agent.suggest_revisions_for_human_review(
+            novel_id, original_chapter_text, conflicts, novel_context=user_input
+        )
+
+        # Ensure options have unique IDs if the API expects them for selection
+        # The `conflict_id` from ConflictDetectionAgent can be used.
+        api_options = []
+        for i, conflict_detail in enumerate(formatted_conflicts_for_api):
+            api_options.append({
+                "id": conflict_detail.get("conflict_id", str(i+1)), # Use existing conflict_id
+                "text_summary": f"Conflict Type: {conflict_detail.get('type', 'N/A')}, Severity: {conflict_detail.get('severity', 'N/A')}",
+                "full_data": conflict_detail # The entire conflict dictionary
+            })
+
+        state["pending_decision_type"] = "conflict_review"
+        state["pending_decision_options"] = api_options
+        state["pending_decision_prompt"] = (
+            f"Conflicts ({len(api_options)}) detected in Chapter {current_chapter_num}. "
+            "Please review. You can choose to 'proceed_as_is' or 'attempt_generic_rewrite_all_conflicts'."
+        )
+        state["workflow_status"] = f"paused_for_conflict_review_ch_{current_chapter_num}"
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Pausing for API conflict review. {len(api_options)} conflicts presented.")
+
+        db_manager = DatabaseManager(db_name=db_name)
+        options_json = json.dumps(api_options)
+        serializable_state = {k: v for k, v in state.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))}
+        full_state_json = json.dumps(serializable_state)
+
+        db_manager.update_novel_pause_state(
+            novel_id, state["workflow_status"], state["pending_decision_type"],
+            options_json, state["pending_decision_prompt"], full_state_json
+        )
+        history = _log_and_update_history(history, "Successfully saved conflict review pause state to DB.")
+
+    except Exception as e:
+        error_msg = f"Chapter {current_chapter_num}: Error preparing conflicts for API review: {e}"
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+
+    state["history"] = history
+    return state
+
+def execute_conflict_resolution_auto(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = state.get("history", [])
+    novel_id = state.get("novel_id")
+    current_chapter_num = state.get("current_chapter_number")
+    generated_chapters = list(state.get("generated_chapters", [])) # Ensure it's a mutable list
+    conflicts_for_resolution = state.get("current_chapter_conflicts", [])
+    db_name = state.get("db_name", "novel_mvp.db")
+    # Using user_input as a proxy for novel_context, can be refined
+    novel_context_for_agent = state.get("user_input")
+
+    history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Entering auto conflict resolution node.")
+
+    if not novel_id:
+        error_msg = f"Chapter {current_chapter_num}: Novel ID missing, cannot perform auto conflict resolution."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    if not generated_chapters:
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: No chapters generated, skipping auto conflict resolution.", True)
+        state["history"] = history
+        # This shouldn't typically happen if graph logic is correct
+        return state
+
+    if not conflicts_for_resolution:
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: No conflicts to resolve, skipping auto conflict resolution.")
+        state["history"] = history
+        return state
+
+    last_chapter_obj = generated_chapters[-1]
+    original_chapter_text = last_chapter_obj.get("content")
+
+    if not original_chapter_text:
+        error_msg = f"Chapter {current_chapter_num}: Original chapter text is missing, cannot perform auto conflict resolution."
+        history = _log_and_update_history(history, error_msg, True)
+        state["history"] = history
+        state["error_message"] = error_msg
+        return state
+
+    try:
+        llm_client = LLMClient()
+        resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=db_name)
+
+        history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Attempting auto-resolution for {len(conflicts_for_resolution)} conflicts.")
+        revised_text = resolver_agent.attempt_auto_resolve(
+            novel_id, original_chapter_text, conflicts_for_resolution, novel_context=novel_context_for_agent
+        )
+
+        if revised_text is not None and revised_text != original_chapter_text:
+            # Create a new dictionary for the updated chapter to ensure state update
+            updated_chapter = dict(last_chapter_obj)
+            updated_chapter["content"] = revised_text
+            updated_chapter["summary"] = "Summary needs regeneration after auto-resolution."
+
+            generated_chapters[-1] = updated_chapter # Replace the last chapter with the updated one
+
+            state["generated_chapters"] = generated_chapters
+            history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Auto-conflict resolution attempted and text was modified.")
+            # Clear conflicts as they've been "resolved" or attempted
+            state["current_chapter_conflicts"] = []
+        else:
+            history = _log_and_update_history(history, f"Chapter {current_chapter_num}: Auto-conflict resolution attempted, but no changes made to chapter text.")
+            # Conflicts remain as they were not changed by auto-resolve
+
+    except Exception as e:
+        error_msg = f"Chapter {current_chapter_num}: Error during auto conflict resolution: {e}"
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+        # Do not clear conflicts if resolution failed
+
+    state["history"] = history
+    return state
+
+def _decide_after_conflict_detection(state: NovelWorkflowState) -> str:
+    history = state.get("history", [])
+    conflicts = state.get("current_chapter_conflicts", [])
+    user_input = state.get("user_input", {})
+    auto_mode = user_input.get("auto_mode", False)
+    interaction_mode = user_input.get("interaction_mode", "cli")
+
+    if conflicts:
+        history = _log_and_update_history(history, f"Decision: {len(conflicts)} conflicts found.")
+        if auto_mode:
+            history = _log_and_update_history(history, "Auto-Mode: Routing to auto-conflict resolution.")
+            state["history"] = history
+            return "resolve_conflicts_auto"
+        elif interaction_mode == "api": # Human mode, API interaction
+            history = _log_and_update_history(history, "Human-Mode (API): Routing for API-based conflict review preparation.")
+            state["history"] = history
+            return "human_api_conflict_pending" # This will go to prepare_conflict_review_for_api node
+        else: # Human mode, CLI interaction
+            history = _log_and_update_history(history, "Human-Mode (CLI): Conflicts detected. Currently, CLI mode proceeds without specific resolution step for conflicts. Manual review would be needed based on logs.")
+            state["history"] = history
+            return "proceed_to_increment" # CLI human mode currently doesn't pause for this
+    else:
+        history = _log_and_update_history(history, "Decision: No conflicts found. Proceeding to increment chapter.")
+        state["history"] = history
+        return "proceed_to_increment"
+
+
+def _should_retry_chapter(state: NovelWorkflowState) -> str:
+    """
+    Determines if the current chapter should be retried based on quality and retry limits.
+    """
+    history = _log_and_update_history(state.get("history", []), "Conditional Node: Should Retry Chapter?")
+    print("DEBUG: _should_retry_chapter - Function called")
+
+    auto_mode = state.get("user_input", {}).get("auto_mode", False)
+    quality_passed = state.get("current_chapter_quality_passed", True) # Default to True to avoid accidental retries
+    current_retry_count = state.get("current_chapter_retry_count", 0)
+    max_retries = state.get("max_chapter_retries", 1)
+
+    print(f"DEBUG: _should_retry_chapter - Auto Mode: {auto_mode}, Quality Passed: {quality_passed}, Retries: {current_retry_count}/{max_retries}")
+
+    if auto_mode and not quality_passed and current_retry_count < max_retries:
+        new_retry_count = current_retry_count + 1
+        state["current_chapter_retry_count"] = new_retry_count # Update state directly
+        history = _log_and_update_history(history, f"Chapter failed quality. Incrementing retry count to {new_retry_count}. Will attempt retry.")
+        print(f"INFO: Chapter retry {new_retry_count}/{max_retries} will be attempted.")
+        state["history"] = history # Persist history update
+        return "retry_chapter"
+    else:
+        if auto_mode and not quality_passed and current_retry_count >= max_retries:
+            history = _log_and_update_history(history, f"Chapter failed quality, but max retries ({max_retries}) reached. Proceeding without retry.")
+            print(f"WARNING: Max retries reached for chapter. Proceeding without further retries.")
+        elif not auto_mode and not quality_passed:
+            history = _log_and_update_history(history, "Chapter failed quality, but not in auto_mode. Proceeding without retry.")
+            print("INFO: Chapter failed quality, but not in auto_mode. No retry.")
+        elif quality_passed:
+            history = _log_and_update_history(history, "Chapter passed quality check. Proceeding.")
+            print("INFO: Chapter passed quality. No retry needed.")
+
+        # Reset retry count for the next chapter in all cases where we don't retry
+        state["current_chapter_retry_count"] = 0
+        state["history"] = history # Persist history update
+        print("DEBUG: _should_retry_chapter - Resetting retry count to 0 for next chapter.")
+        return "proceed_to_kb_update"
+
 class WorkflowManager:
-    def __init__(self, db_name="novel_mvp.db", mode="human"):
+    def __init__(self, db_name="novel_mvp.db", mode="human"): # mode is now less relevant here, user_input drives it.
         self.db_name = db_name
-        self.mode = mode
-        self.auto_decision_engine = AutoDecisionEngine() if self.mode == "auto" else None
-        print(f"WorkflowManager initialized in '{self.mode}' mode. AutoDecisionEngine {'enabled' if self.auto_decision_engine else 'disabled'}.")
-        # Ensure self.initial_history reflects this
-        self.initial_history = [f"WorkflowManager initialized (DB: {self.db_name}, Mode: {self.mode}) and graph compiled."]
+        # self.mode = mode # Keep for now if auto_decision_engine relies on it
+        # self.auto_decision_engine = AutoDecisionEngine() if self.mode == "auto" else None
+        # The auto_decision_engine should be part of the state if it's mode-dependent
+        # For now, assume it's instantiated if needed based on state.user_input.auto_mode
+
+        print(f"WorkflowManager initialized (DB: {self.db_name}).")
+        self.initial_history = [f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled."]
         self.workflow = StateGraph(NovelWorkflowState)
         self._build_graph()
         self.app = self.workflow.compile()
-        # print(f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled.") # Original print removed, covered by new one
+
+    def resume_workflow(self, novel_id: int, decision_type_from_api: str, decision_payload_from_api: Dict) -> Dict:
+        """
+        Resumes the workflow from a paused state after a human decision made via API.
+        Loads the state from DB, applies decision, and re-invokes the workflow.
+        """
+        print(f"WorkflowManager: Attempting to resume workflow for novel_id {novel_id} with decision type {decision_type_from_api}")
+        db_manager = DatabaseManager(self.db_name)
+
+        loaded_data = db_manager.load_workflow_snapshot_and_decision_info(novel_id)
+        if not loaded_data or not loaded_data.get("full_workflow_state_json"):
+            # This case should ideally be handled by the API layer before calling resume_workflow
+            # but as a safeguard:
+            error_msg = f"Cannot resume: workflow state not found for novel {novel_id}."
+            print(f"ERROR: {error_msg}")
+            # This function needs to return a state dict, so construct one indicating error.
+            # However, without the original state, we can't do much.
+            # This highlights the need for robust state management by the caller (API layer).
+            # For now, return a minimal error state if possible, or raise an exception that the API layer must handle.
+            raise ValueError(error_msg) # Or return a specific error state dict
+
+        current_state_snapshot: NovelWorkflowState = json.loads(loaded_data["full_workflow_state_json"])
+
+        # It's expected that user_made_decision_payload_json was set by API via record_user_decision
+        # And that pending_decision_type was cleared by record_user_decision
+        # So, the state loaded from DB should reflect that a decision *was* made.
+        # The decision_payload_from_api is the source of truth for applying the decision here.
+
+        # Basic validation (API layer should do more thorough validation against stored pending_decision_type)
+        # This is a sanity check within the resume logic.
+        # The `record_user_decision` in DB manager might have already cleared `pending_decision_type`
+        # so `current_state_snapshot["pending_decision_type"]` might be None here if loaded from DB after `record_user_decision`.
+        # The crucial part is that the API called this `resume_workflow` with the correct `decision_type_from_api`.
+
+        # Store the raw decision payload for the target node to process
+        current_state_snapshot["user_made_decision_payload"] = {"source_decision_type": decision_type_from_api, **decision_payload_from_api}
+
+        if decision_type_from_api == "conflict_review":
+            original_content = current_state_snapshot.get("original_chapter_content_for_conflict_review")
+            conflicts_at_pause = current_state_snapshot.get("current_chapter_conflicts", []) # These are the conflicts presented to user
+
+            # Correctly access action from custom_data for conflict_review
+            custom_data = decision_payload_from_api.get("custom_data", {})
+            action = custom_data.get("action", "proceed_as_is") # Default action
+
+            if not original_content:
+                 current_state_snapshot["error_message"] = "Original chapter content for conflict review not found in state. Cannot resume."
+                 current_state_snapshot["workflow_status"] = "resume_failed_missing_data"
+                 # Save this error state to DB
+                 error_snapshot_json = json.dumps({k: v for k, v in current_state_snapshot.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))})
+                 db_manager.update_novel_status_after_resume(novel_id, current_state_snapshot["workflow_status"], error_snapshot_json)
+                 return current_state_snapshot
+
+            if action == "attempt_generic_rewrite_all_conflicts":
+                history = current_state_snapshot.get("history", [])
+                history = _log_and_update_history(history, f"Chapter {current_state_snapshot.get('current_chapter_number')}: Human decision was 'attempt_generic_rewrite_all_conflicts'.")
+                current_state_snapshot["history"] = history
+
+                llm_client = LLMClient()
+                resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=self.db_name)
+                novel_context = current_state_snapshot.get("user_input") # Or a more specific context
+
+                revised_text = resolver_agent.attempt_auto_resolve(
+                    novel_id, original_content, conflicts_at_pause, novel_context=novel_context
+                )
+                if revised_text and revised_text != original_content:
+                    generated_chapters = list(current_state_snapshot.get("generated_chapters", []))
+                    if generated_chapters:
+                        updated_chapter = dict(generated_chapters[-1])
+                        updated_chapter["content"] = revised_text
+                        updated_chapter["summary"] = "Summary needs regeneration after conflict rewrite."
+                        generated_chapters[-1] = updated_chapter
+                        current_state_snapshot["generated_chapters"] = generated_chapters
+                        current_state_snapshot["current_chapter_conflicts"] = [] # Assume rewrite addressed them
+                        history = _log_and_update_history(history, "Chapter text modified by generic rewrite after human decision.")
+                        current_state_snapshot["history"] = history
+                    else: # Should not happen if original_content was present
+                        current_state_snapshot["error_message"] = "No generated chapters found to update after conflict rewrite."
+                else:
+                    history = _log_and_update_history(history, "Generic rewrite attempted but no changes made to text.")
+                    current_state_snapshot["history"] = history
+                    # Conflicts remain as they were not changed
+
+            # For "proceed_as_is", no specific text modification here.
+            # The `user_made_decision_payload` now contains the action, which the `prepare_conflict_review_for_api` node will see upon reinvocation.
+            current_state_snapshot["original_chapter_content_for_conflict_review"] = None # Clear after processing
+
+        # Common state updates for any decision type before re-invocation
+        current_state_snapshot["workflow_status"] = f"resuming_after_{decision_type_from_api}"
+        current_state_snapshot["pending_decision_type"] = None
+        current_state_snapshot["pending_decision_options"] = None
+        current_state_snapshot["pending_decision_prompt"] = None
+        current_state_snapshot["error_message"] = None # Clear previous errors before resuming
+
+        num_chapters = current_state_snapshot.get("user_input", {}).get("chapters", 3)
+        # Increment execution_count from the loaded state
+        current_state_snapshot["execution_count"] = current_state_snapshot.get("execution_count", 0) + 1
+        recursion_limit = max(50, 15 + (4 * num_chapters) + 10 + current_state_snapshot["execution_count"])
+
+        print(f"DEBUG: Resuming workflow execution for novel {novel_id}. Execution count: {current_state_snapshot['execution_count']}")
+
+        final_state_after_resume: NovelWorkflowState
+        try:
+            final_state_after_resume = self.app.invoke(current_state_snapshot, {"recursion_limit": recursion_limit})
+        except Exception as e:
+            print(f"CRITICAL: Workflow resumption for novel {novel_id} failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
+            current_state_snapshot["error_message"] = f"Workflow resumption failed critically: {e}"
+            current_state_snapshot["workflow_status"] = "resumption_critical_error"
+            final_state_after_resume = current_state_snapshot # type: ignore
+
+        # After invocation, handle DB update based on the outcome
+        final_status = final_state_after_resume.get("workflow_status", "unknown_after_resume")
+        final_snapshot_json_for_db = json.dumps({k: v for k, v in final_state_after_resume.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))})
+
+        if final_status and final_status.startswith("paused_for_"):
+            # If it paused again, update_novel_pause_state will be called from the decision node itself.
+            # So, this specific call might be redundant if the decision node handles its own pause saving.
+            # However, if invoke ends due to recursion limit before hitting a save point, this save is crucial.
+            print(f"Workflow for novel {novel_id} resumed and then paused again for: {final_status}")
+            # The decision node (e.g. present_outlines_cli) should have already saved its pause state.
+            # If we save here, ensure it's the absolute latest state.
+            # db_manager.update_novel_pause_state(
+            #     novel_id, final_status,
+            #     final_state_after_resume.get("pending_decision_type"),
+            #     json.dumps(final_state_after_resume.get("pending_decision_options")) if final_state_after_resume.get("pending_decision_options") else None,
+            #     final_state_after_resume.get("pending_decision_prompt"),
+            #     final_snapshot_json_for_db
+            # )
+        else: # Completed, failed, or other terminal/intermediate state that isn't a formal pause
+            print(f"Workflow for novel {novel_id} resumed. Final status: {final_status}.")
+            db_manager.update_novel_status_after_resume(novel_id, final_status, final_snapshot_json_for_db)
+
+        return final_state_after_resume
 
     def _should_prompt_user(self, decision_point: Optional[str] = None) -> bool:
         """
@@ -1347,23 +1995,40 @@ class WorkflowManager:
         self.workflow.add_node("context_synthesizer", execute_context_synthesizer_agent)
         self.workflow.add_node("chapter_chronicler", execute_chapter_chronicler_agent)
         self.workflow.add_node("content_integrity_review", execute_content_integrity_review)
+        self.workflow.add_node("should_retry_chapter", _should_retry_chapter) # New conditional node
         self.workflow.add_node("lore_keeper_update_kb", execute_lore_keeper_update_kb)
         self.workflow.add_node("conflict_detection", execute_conflict_detection)
+        self.workflow.add_node("execute_conflict_resolution_auto", execute_conflict_resolution_auto)
+        self.workflow.add_node("prepare_conflict_review_for_api", prepare_conflict_review_for_api) # New node
         self.workflow.add_node("increment_chapter_number", increment_chapter_number)
         self.workflow.add_node("cleanup_resources", cleanup_resources)
         self.workflow.add_node("generate_kb_visualization_data", generate_kb_visualization_data)
 
         self.workflow.set_entry_point("narrative_pathfinder")
         self.workflow.add_conditional_edges("narrative_pathfinder", _check_node_output, {"continue": "present_outlines_cli", "stop_on_error": END})
-        self.workflow.add_conditional_edges("present_outlines_cli", _check_node_output, {"continue": "persist_novel_record", "stop_on_error": END})
+
+        # present_outlines_cli now goes to _check_workflow_pause_status
+        self.workflow.add_conditional_edges("present_outlines_cli", _check_workflow_pause_status, {
+            "WORKFLOW_PAUSED": END, # End this invocation if paused
+            "continue_workflow": "persist_novel_record" # If not paused, proceed
+        })
+        # Then _check_node_output for persist_novel_record
         self.workflow.add_conditional_edges("persist_novel_record", _check_node_output, {"continue": "persist_initial_outline", "stop_on_error": END})
+
         # Updated edges for Quality Guardian
         self.workflow.add_conditional_edges("persist_initial_outline", _check_node_output, {"continue": "outline_quality_guardian", "stop_on_error": END})
         self.workflow.add_conditional_edges("outline_quality_guardian", _check_node_output, {"continue": "world_weaver", "stop_on_error": END})
 
         self.workflow.add_conditional_edges("world_weaver", _check_node_output, {"continue": "present_worldviews_cli", "stop_on_error": END})
-        self.workflow.add_conditional_edges("present_worldviews_cli", _check_node_output, {"continue": "persist_worldview", "stop_on_error": END})
+
+        # present_worldviews_cli now goes to _check_workflow_pause_status
+        self.workflow.add_conditional_edges("present_worldviews_cli", _check_workflow_pause_status, {
+            "WORKFLOW_PAUSED": END, # End this invocation if paused
+            "continue_workflow": "persist_worldview" # If not paused, proceed
+        })
+        # Then _check_node_output for persist_worldview
         self.workflow.add_conditional_edges("persist_worldview", _check_node_output, {"continue": "plot_architect", "stop_on_error": END})
+
         self.workflow.add_conditional_edges("plot_architect", _check_node_output, {"continue": "persist_plot", "stop_on_error": END})
         self.workflow.add_conditional_edges("persist_plot", _check_node_output, {"continue": "character_sculptor", "stop_on_error": END})
         self.workflow.add_conditional_edges("character_sculptor", _check_node_output, {"continue": "lore_keeper_initialize", "stop_on_error": END})
@@ -1371,9 +2036,41 @@ class WorkflowManager:
         self.workflow.add_conditional_edges("prepare_for_chapter_loop", _check_node_output, {"continue": "context_synthesizer", "stop_on_error": END})
         self.workflow.add_conditional_edges("context_synthesizer", _check_node_output, {"continue": "chapter_chronicler", "stop_on_error": END})
         self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "content_integrity_review", "stop_on_error": END})
-        self.workflow.add_conditional_edges("content_integrity_review", _check_node_output, {"continue": "lore_keeper_update_kb", "stop_on_error": END})
+        # content_integrity_review now goes to should_retry_chapter
+        self.workflow.add_conditional_edges("content_integrity_review", _check_node_output, {"continue": "should_retry_chapter", "stop_on_error": END})
+        # should_retry_chapter branches
+        self.workflow.add_conditional_edges("should_retry_chapter", _should_retry_chapter, {
+            "retry_chapter": "context_synthesizer", # Loop back to context synthesizer
+            "proceed_to_kb_update": "lore_keeper_update_kb"
+        })
         self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "conflict_detection", "stop_on_error": END})
-        self.workflow.add_conditional_edges("conflict_detection", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
+
+        # Conflict detection now goes to a decision node
+        self.workflow.add_conditional_edges("conflict_detection", _check_node_output, {"continue": "_decide_after_conflict_detection", "stop_on_error": END})
+
+        # Decision node after conflict detection
+        self.workflow.add_conditional_edges(
+            "_decide_after_conflict_detection",
+            _decide_after_conflict_detection,
+            {
+                "resolve_conflicts_auto": "execute_conflict_resolution_auto",
+                "human_api_conflict_pending": "prepare_conflict_review_for_api", # Now points to the new node
+                "proceed_to_increment": "increment_chapter_number"
+            }
+        )
+
+        # After auto-resolution, proceed to increment chapter
+        self.workflow.add_conditional_edges("execute_conflict_resolution_auto", _check_node_output, {"continue": "increment_chapter_number", "stop_on_error": END})
+
+        # After preparing for API review, check pause status (should pause)
+        self.workflow.add_conditional_edges("prepare_conflict_review_for_api", _check_workflow_pause_status, {
+            "WORKFLOW_PAUSED": END,
+            # If it doesn't pause (e.g. error in prepare_conflict_review_for_api before setting pause status),
+            # or if it's resuming and processed the decision, it should continue.
+            # The node itself will change workflow_status from "paused_..." to "running_..." if resuming.
+            "continue_workflow": "increment_chapter_number" # Path if resuming and decision processed
+        })
+
         self.workflow.add_conditional_edges(
             "increment_chapter_number", _should_continue_chapter_loop,
             {
@@ -1406,7 +2103,8 @@ class WorkflowManager:
                 style_preferences=user_input_data.get("style_preferences"),
                 chapters=num_chapters,  # 新增：传递用户指定的章节数
                 words_per_chapter=words_per_chapter,
-                auto_mode=user_input_data.get("auto_mode", False)  # 新增：自动模式支持
+                auto_mode=user_input_data.get("auto_mode", False),  # 新增：自动模式支持
+                interaction_mode=user_input_data.get("interaction_mode", "cli") # Default to cli
             ),
             error_message=None, history=current_history,
             novel_id=None, novel_data=None,
@@ -1429,6 +2127,18 @@ class WorkflowManager:
             current_chapter_conflicts=None,
             auto_decision_engine=self.auto_decision_engine, # Add this line
             knowledge_graph_data=None,
+            # Chapter Retry Mechanism Fields
+            current_chapter_retry_count=0,
+            max_chapter_retries=1, # Default to 1 retry
+            current_chapter_original_content=None,
+            current_chapter_feedback_for_retry=None,
+            # API Interaction / Human-in-the-loop state
+            workflow_status="running", # Initial status
+            pending_decision_type=None,
+            pending_decision_options=None,
+            pending_decision_prompt=None,
+            user_made_decision_payload=None,
+            original_chapter_content_for_conflict_review=None,
             # 循环安全参数
             loop_iteration_count=0,
             max_loop_iterations=max(10, num_chapters * 3),  # 设置合理的最大迭代次数

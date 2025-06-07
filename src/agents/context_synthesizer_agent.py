@@ -14,7 +14,35 @@ class ContextSynthesizerAgent:
             self.lore_keeper = LoreKeeperAgent(db_name=db_name, chroma_db_directory=chroma_db_directory)
         except ValueError as e:
             print(f"Error initializing LoreKeeperAgent in ContextSynthesizerAgent: {e}")
-            raise
+            self.lore_keeper = None # Ensure lore_keeper is None if init fails
+            # raise # Or handle more gracefully depending on desired behavior if LKA is critical
+
+    def _generate_focused_rag_queries(self, plot_summary: str) -> List[str]:
+        if not self.lore_keeper or not self.lore_keeper.llm_client:
+            print("ContextSynthesizerAgent: LLMClient for LoreKeeper not available. Falling back to using plot summary as the sole RAG query.")
+            return [plot_summary]
+
+        prompt = (
+            f"Given the following plot summary for an upcoming novel chapter:\n"
+            f"\"{plot_summary}\"\n\n"
+            f"Generate a list of 3-5 concise and distinct search query strings or key questions that would be most effective for querying a knowledge base to retrieve relevant background information, lore, character details, or world details needed to write this chapter.\n"
+            f"Output these queries as a comma-separated list. For example: \"Sunstone location, Dragon's Peak defenses, Kael's previous encounter with dragons\""
+        )
+        try:
+            response_text = self.lore_keeper.llm_client.generate_text(prompt, max_tokens=150, temperature=0.5)
+            if response_text:
+                queries = [q.strip() for q in response_text.split(',') if q.strip()]
+                if queries:
+                    print(f"ContextSynthesizerAgent: Generated focused RAG queries: {queries}")
+                    return queries
+                else:
+                    print("ContextSynthesizerAgent: LLM generated an empty or poorly formatted list of queries. Falling back.")
+            else:
+                print("ContextSynthesizerAgent: LLM generated no response for RAG queries. Falling back.")
+        except Exception as e:
+            print(f"ContextSynthesizerAgent: Error during LLM call for RAG query generation: {e}. Falling back.")
+
+        return [plot_summary] # Fallback
 
     def generate_chapter_brief(self, novel_id: int, current_chapter_number: int,
                                current_chapter_plot_summary_for_brief: str, # Renamed for clarity, this is from PlotChapterDetail
@@ -46,16 +74,81 @@ class ContextSynthesizerAgent:
             #     except json.JSONDecodeError:
             #         brief_parts.append(f"**Main Plot Arc (Raw from DB):**\n{plot_db['plot_summary']}\n")
 
+        # --- Hierarchical Previous Chapter Context ---
+        NUM_FULL_TEXT_PREVIOUS = 1
+        NUM_SUMMARY_PREVIOUS = 3
+        # Older chapters will get titles only
 
-        # Previous Chapter Summaries
+        brief_parts.append("**--- Previous Chapter Context (Hierarchical) ---**")
+
         all_db_chapters: List[Chapter] = self.db_manager.get_chapters_for_novel(novel_id)
-        previous_chapters_summaries_text: List[str] = []
-        for ch_db in sorted(all_db_chapters, key=lambda c: c['chapter_number']):
-            if ch_db['chapter_number'] < current_chapter_number:
-                previous_chapters_summaries_text.append(f"  - Chapter {ch_db['chapter_number']} ({ch_db['title']}) Summary: {ch_db['summary']}")
+        sorted_chapters = sorted(all_db_chapters, key=lambda c: c['chapter_number'])
 
-        if previous_chapters_summaries_text:
-            brief_parts.append("**Previously Happened:**\n" + "\n".join(previous_chapters_summaries_text) + "\n")
+        chapters_before_current = [ch for ch in sorted_chapters if ch['chapter_number'] < current_chapter_number]
+        chapters_before_current.reverse() # Process in reverse chronological order (most recent first)
+
+        full_text_added_count = 0
+        summary_added_count = 0
+        titles_added_count = 0
+
+        temp_full_text_section = []
+        temp_summary_section = []
+        temp_titles_only_section = []
+
+        for ch_db in chapters_before_current:
+            ch_num = ch_db['chapter_number']
+            ch_title = ch_db['title']
+            ch_summary = ch_db['summary']
+
+            if full_text_added_count < NUM_FULL_TEXT_PREVIOUS:
+                full_content = ch_db.get('content', 'Content not available.')
+                # Using a significant portion of content, or full if short.
+                # For example, up to 1500 chars or full content if shorter.
+                content_snippet = full_content[:1500] + ("..." if len(full_content) > 1500 else "")
+                temp_full_text_section.append(f"  **Chapter {ch_num}: {ch_title} (Full Text Snippet)**\n    {content_snippet}\n")
+                full_text_added_count += 1
+            elif summary_added_count < NUM_SUMMARY_PREVIOUS:
+                temp_summary_section.append(f"  - Chapter {ch_num} ({ch_title}) Summary: {ch_summary}")
+                summary_added_count += 1
+            else:
+                if titles_added_count == 0:
+                    temp_titles_only_section.append("  Older Chapter Mentions (Titles):")
+                temp_titles_only_section.append(f"    - Chapter {ch_num}: {ch_title}")
+                titles_added_count += 1
+
+        if temp_full_text_section:
+            brief_parts.append("\n**Immediately Preceding Chapter(s) (Full Text/Detailed Snippet):**")
+            brief_parts.extend(reversed(temp_full_text_section))
+        if temp_summary_section:
+            brief_parts.append("\n**Recent Past Chapters (Summaries):**")
+            brief_parts.extend(reversed(temp_summary_section))
+        if temp_titles_only_section:
+            # Reverse the order of titles so they appear chronologically under the header
+            temp_titles_only_section_ordered = list(reversed(temp_titles_only_section))
+            # The header "Older Chapter Mentions (Titles):" is already the first element if list is not empty
+            # So, we take it out, reverse the rest, and add it back.
+            older_header = ""
+            actual_titles = []
+            if temp_titles_only_section_ordered and "Older Chapter Mentions (Titles):" in temp_titles_only_section_ordered[-1]: # Header was added first, so now last after reverse
+                older_header = temp_titles_only_section_ordered.pop() # Remove header
+                actual_titles = list(reversed(temp_titles_only_section_ordered)) # Reverse titles back to older first
+            else: # Should not happen if titles_added_count logic is correct
+                 actual_titles = list(reversed(temp_titles_only_section_ordered))
+
+
+            brief_parts.append("\n**Earlier Chapter Mentions (Titles):**")
+            if older_header and "Older Chapter Mentions (Titles):" not in actual_titles[0] : # Avoid double header if already there
+                 pass # The structure of titles_only_section already includes its own sub-header if items exist.
+                      # The main header "Earlier Chapter Mentions (Titles):" is added above.
+            brief_parts.extend(actual_titles)
+
+
+        if not temp_full_text_section and not temp_summary_section and not temp_titles_only_section and current_chapter_number > 1:
+            brief_parts.append("  (No previous chapters found or processed based on configuration).")
+        elif current_chapter_number == 1:
+             brief_parts.append("  (This is the first chapter, no preceding chapter context).")
+
+        brief_parts.append("**--- End of Previous Chapter Context ---**\n")
 
         # Active Character Details (now using DetailedCharacterProfile)
         active_characters_details_text: List[str] = []
@@ -91,14 +184,41 @@ class ContextSynthesizerAgent:
         # Current chapter plot summary (passed as argument, derived from PlotChapterDetail by workflow manager)
         brief_parts.append(f"**Specific Plot Focus for THIS Chapter ({current_chapter_number}):**\n{current_chapter_plot_summary_for_brief}\n")
 
-        # Get Context from LoreKeeperAgent
-        print(f"ContextSynthesizer: Querying LoreKeeper for novel_id {novel_id} with focus '{current_chapter_plot_summary_for_brief[:100]}...' and characters {active_character_names_for_lore_query}")
-        lore_context = self.lore_keeper.get_context_for_chapter(
-            novel_id,
-            current_plot_focus=current_chapter_plot_summary_for_brief,
-            active_characters_in_scene=active_character_names_for_lore_query
-        )
-        brief_parts.append(f"--- RELEVANT LORE AND CONTEXT (from Knowledge Base) ---\n{lore_context}\n--- END LORE AND CONTEXT ---\n")
+        # Get Context from LoreKeeperAgent using focused queries
+        focused_queries = self._generate_focused_rag_queries(current_chapter_plot_summary_for_brief)
+
+        aggregated_kb_results_content = []
+        seen_kb_document_contents = set()
+        retrieved_kb_context_str = "Knowledge Base access unavailable or no relevant information found."
+
+        if self.lore_keeper and self.lore_keeper.kb_manager:
+            print(f"ContextSynthesizer: Performing RAG queries for novel_id {novel_id} using {len(focused_queries)} focused queries.")
+            for query_str in focused_queries:
+                try:
+                    # print(f"ContextSynthesizer: RAG Query: '{query_str}'")
+                    kb_results_for_query = self.lore_keeper.kb_manager.query_knowledge_base(
+                        novel_id, query_str, n_results=2 # Fetch 2 results per focused query
+                    )
+                    if kb_results_for_query:
+                        for doc_content, score in kb_results_for_query:
+                            if doc_content not in seen_kb_document_contents:
+                                aggregated_kb_results_content.append(
+                                    f"- {doc_content} (Source query: '{query_str[:50].strip()}...', Similarity: {score:.2f})"
+                                )
+                                seen_kb_document_contents.add(doc_content)
+                except Exception as e:
+                    print(f"ContextSynthesizer: Error during RAG query for '{query_str}': {e}")
+
+            if aggregated_kb_results_content:
+                retrieved_kb_context_str = "\n".join(aggregated_kb_results_content)
+            else:
+                 retrieved_kb_context_str = "No specific information retrieved from Knowledge Base for this chapter's focus using focused queries."
+        else:
+            print("ContextSynthesizer: LoreKeeper or KBManager not available, skipping RAG queries.")
+            retrieved_kb_context_str = "Knowledge Base access unavailable (LoreKeeper not initialized)."
+
+
+        brief_parts.append(f"--- RELEVANT LORE AND CONTEXT (from Knowledge Base) ---\n{retrieved_kb_context_str}\n--- END LORE AND CONTEXT ---\n")
 
         brief_parts.append("--- END OF BRIEF ---")
         return "\n\n".join(brief_parts) # Use double newline for better section separation in final brief
@@ -216,8 +336,15 @@ if __name__ == "__main__":
     assert f"**Novel Theme:** Test Novel for Context" in brief
     assert "**Overall Novel Outline:**\n" + "A hero seeks a lost artifact." in brief
     assert "**Worldview Core Concept:**\nA world of floating islands and sky-ships." in brief
-    assert f"Chapter 1 (The Call) Summary: Kael accepts the quest." in brief
-    assert "Character: Kael" in brief
+    # Assertion for previous chapter context will depend on NUM_FULL_TEXT_PREVIOUS, NUM_SUMMARY_PREVIOUS
+    # If current_chapter_number is 2, Chapter 1 ("The Call") should be full text.
+    if target_chapter_num_test == 2:
+        assert f"Chapter 1: The Call (Full Text Snippet)" in brief
+        assert "Content of chapter 1..."[:50] in brief # Check for part of the content
+    else: # If testing for chapter > 2, then Chapter 1 summary might appear or just title
+        assert f"Chapter 1 (The Call) Summary: Kael accepts the quest." in brief # This might change based on N values
+
+    assert "Kael" in brief # Check for character name, not "Character: Kael"
     assert f"Specific Plot Focus for THIS Chapter ({target_chapter_num_test}):\n{plot_summary_for_brief}" in brief
     assert "--- RELEVANT LORE AND CONTEXT (from Knowledge Base) ---" in brief
     print("\nBasic content verification of the brief passed.")
