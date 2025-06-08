@@ -30,6 +30,7 @@ from src.agents.quality_guardian_agent import QualityGuardianAgent # Import adde
 from src.agents.content_integrity_agent import ContentIntegrityAgent
 from src.agents.conflict_detection_agent import ConflictDetectionAgent
 from src.agents.conflict_resolution_agent import ConflictResolutionAgent # New Agent
+from src.agents.plot_regenerator_agent import PlotRegeneratorAgent # New Agent for Plot Regeneration
 from src.llm_abstraction.llm_client import LLMClient # Ensure LLMClient is imported
 
 # Persistence and Core Models
@@ -97,6 +98,10 @@ class NovelWorkflowState(TypedDict):
     available_plot_branch_options: Optional[List[List[PlotChapterDetail]]]
     selected_plot_branch_path: Optional[List[PlotChapterDetail]]
     chapter_number_for_branching: Optional[int]
+    # Plot Regeneration State Fields
+    needs_plot_regeneration: Optional[bool] = False
+    regeneration_start_chapter_number: Optional[int] = None
+    plot_modified_at_chapter: Optional[int] = None
     # Manual Chapter Review State Fields
     chapter_pending_manual_review_id: Optional[int] = None
     chapter_content_for_manual_review: Optional[str] = None
@@ -835,57 +840,86 @@ def execute_lore_keeper_initialize(state: NovelWorkflowState) -> Dict[str, Any]:
         return {"error_message": msg, "history": _log_and_update_history(history, msg, True), "lore_keeper_initialized": False}
 
 def prepare_for_chapter_loop(state: NovelWorkflowState) -> Dict[str, Any]:
-    history = _log_and_update_history(state.get("history", []), "Executing Node: Prepare for Chapter Loop")
+    history = _log_and_update_history(state.get("history", []), "Node: Prepare for Chapter Loop")
+
     detailed_plot = state.get("detailed_plot_data")
-    if not detailed_plot:
-        msg = "Detailed plot data not found, cannot determine total chapters for loop."
-        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+    if not detailed_plot: # Handles None or empty list
+        msg = "Detailed plot data not found or empty, cannot determine total chapters for loop."
+        history = _log_and_update_history(history, msg, True)
+        return {**state, "error_message": msg, "history": history}
 
-    # 优先使用用户输入的章节数，而不是detailed_plot的长度
     user_input = state.get("user_input", {})
-    user_requested_chapters = user_input.get("chapters", 0) if user_input else 0
+    user_requested_chapters = user_input.get("chapters", 0) # Default to 0 if not present
 
-    # 如果用户输入中没有章节数，尝试从state中获取（向后兼容）
-    if user_requested_chapters == 0:
-        user_requested_chapters = state.get("total_chapters_to_generate", 0)
-
+    # Determine total_chapters based on user input or plot length
     plot_chapters_count = len(detailed_plot)
+    total_chapters_to_set: int
 
-    if plot_chapters_count == 0:
-        # If plot data is empty, this is an error condition - don't default to 3
-        msg = "Detailed plot data list is empty. Cannot proceed with chapter generation."
-        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
-
-    # 验证用户输入与plot数据的一致性
     if user_requested_chapters > 0:
-        # 使用用户输入的章节数
-        total_chapters = user_requested_chapters
+        total_chapters_to_set = user_requested_chapters
         if plot_chapters_count != user_requested_chapters:
-            warning_msg = f"Warning: User requested {user_requested_chapters} chapters, but plot contains {plot_chapters_count} chapters. Using user input ({user_requested_chapters})."
-            print(f"WARNING: {warning_msg}")
+            warning_msg = f"Warning: User requested {user_requested_chapters} chapters, but current plot has {plot_chapters_count} chapters. Proceeding with user's request for {user_requested_chapters} total chapters."
             history = _log_and_update_history(history, warning_msg)
-
-            # 如果plot章节数少于用户要求，这可能是个问题
+            # This scenario implies that plot regeneration might be needed if plot_chapters_count < user_requested_chapters
+            # or that the plot is longer and might be truncated by chapter generation loop logic.
+            # For now, we honor user_requested_chapters as the target for the novel.
             if plot_chapters_count < user_requested_chapters:
-                msg = f"Error: Plot only contains {plot_chapters_count} chapters, but user requested {user_requested_chapters}. Cannot generate more chapters than plot provides."
-                return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+                 history = _log_and_update_history(history, f"Note: Plot ({plot_chapters_count} chaps) is shorter than user's desired novel length ({user_requested_chapters} chaps). Further plot development/regeneration might be needed if this loop doesn't extend it.", True)
+
+    elif plot_chapters_count > 0: # User did not specify, so use current plot length
+        total_chapters_to_set = plot_chapters_count
+        history = _log_and_update_history(history, f"User did not specify chapter count. Using current plot length: {plot_chapters_count} chapters.")
+    else: # No user input for chapters, and plot is empty (should have been caught by `if not detailed_plot`)
+        msg = "Cannot determine total chapters: No user input for chapter count and plot data is empty."
+        history = _log_and_update_history(history, msg, True)
+        return {**state, "error_message": msg, "history": history}
+
+    # Logic for current_chapter_number and generated_chapters
+    current_chapter_number_from_state = state.get("current_chapter_number", 0) # Default to 0 to trigger initialization if not set
+    generated_chapters_from_state = state.get("generated_chapters") # Can be None
+
+    current_chapter_to_set: int
+    generated_chapters_to_set: List[Chapter]
+
+    if current_chapter_number_from_state > 0 and generated_chapters_from_state is not None:
+        # This implies we are resuming or continuing a loop, possibly after plot regeneration
+        # which should have correctly set current_chapter_number and truncated generated_chapters.
+        current_chapter_to_set = current_chapter_number_from_state
+        generated_chapters_to_set = generated_chapters_from_state
+        history = _log_and_update_history(history, f"Chapter loop continues/resumes. Starting/Next chapter: {current_chapter_to_set}. Previously generated chapters count: {len(generated_chapters_to_set)}.")
     else:
-        # 如果用户输入缺失，使用plot数据的长度
-        total_chapters = plot_chapters_count
-        warning_msg = f"Warning: No user chapter count found, using plot data length ({plot_chapters_count})."
-        print(f"WARNING: {warning_msg}")
-        history = _log_and_update_history(history, warning_msg)
+        # Initializing for a new run from chapter 1
+        current_chapter_to_set = 1
+        generated_chapters_to_set = []
+        history = _log_and_update_history(history, "Chapter loop initializing for a new run from Chapter 1.")
+        # Reset retry counts for a fully fresh start if these were not reset by a previous node.
+        # This is a safeguard.
+        state["current_chapter_retry_count"] = 0
+        state["current_chapter_original_content"] = None
+        state["current_chapter_feedback_for_retry"] = None
 
-    history = _log_and_update_history(history, f"Preparing for chapter loop. Total chapters to generate: {total_chapters}")
-    print(f"DEBUG: prepare_for_chapter_loop - User requested: {user_requested_chapters}, Plot contains: {plot_chapters_count}, Final decision: {total_chapters}")
 
-    return {
-        "current_chapter_number": 1,
-        "generated_chapters": [],
-        "total_chapters_to_generate": total_chapters,
+    history = _log_and_update_history(history, f"Chapter loop prepared. Target total chapters: {total_chapters_to_set}. Starting content generation for chapter: {current_chapter_to_set}.")
+    print(f"DEBUG: prepare_for_chapter_loop - Final decision: Total Chapters: {total_chapters_to_set}, Current Chapter to process: {current_chapter_to_set}")
+
+    updates_for_state = {
+        "current_chapter_number": current_chapter_to_set,
+        "generated_chapters": generated_chapters_to_set,
+        "total_chapters_to_generate": total_chapters_to_set,
         "history": history,
-        "error_message": None
+        "error_message": None # Clear any previous error if this node runs successfully
     }
+    # Ensure other relevant fields are clean if it's a fresh start from chapter 1 implied by the else block
+    if current_chapter_to_set == 1 and not generated_chapters_to_set:
+        updates_for_state["current_chapter_retry_count"] = 0
+        updates_for_state["current_chapter_original_content"] = None
+        updates_for_state["current_chapter_feedback_for_retry"] = None
+        updates_for_state["current_chapter_review"] = None
+        updates_for_state["current_chapter_quality_passed"] = None
+        updates_for_state["current_chapter_conflicts"] = None
+
+    return {**state, **updates_for_state}
+
 
 def execute_context_synthesizer_agent(state: NovelWorkflowState) -> Dict[str, Any]:
     current_chapter_num = state['current_chapter_number']
@@ -1589,6 +1623,26 @@ def _check_workflow_pause_status(state: NovelWorkflowState) -> str:
     print(f"DEBUG: Workflow status is '{workflow_status}'. Continuing graph execution.")
     return "continue_workflow"
 
+def _check_if_plot_regeneration_needed(state: NovelWorkflowState) -> str:
+    """
+    Checks if plot regeneration is flagged as needed in the state.
+    """
+    history = state.get("history", [])
+    needs_regeneration = state.get("needs_plot_regeneration", False)
+
+    if needs_regeneration:
+        start_chapter = state.get('regeneration_start_chapter_number', 'UNKNOWN')
+        modified_at = state.get('plot_modified_at_chapter', 'UNKNOWN')
+        history = _log_and_update_history(history, f"Plot regeneration is needed. Modified at chapter {modified_at}, starting regeneration from chapter {start_chapter}.")
+        state["history"] = history
+        # Reset the flag after checking to avoid re-triggering without a new modification event
+        # state["needs_plot_regeneration"] = False # This will be reset by the regeneration node itself if successful
+        return "regenerate_plot"
+    else:
+        history = _log_and_update_history(history, "Plot regeneration is not needed. Proceeding with current plot.")
+        state["history"] = history
+        return "skip_regeneration"
+
 def execute_plot_twist_agent(state: NovelWorkflowState) -> Dict[str, Any]:
     history = state.get("history", [])
     novel_id = state.get("novel_id")
@@ -1802,6 +1856,139 @@ def prepare_conflict_review_for_api(state: NovelWorkflowState) -> Dict[str, Any]
         error_msg = f"Chapter {current_chapter_num}: Error preparing conflicts for API review: {e}"
         history = _log_and_update_history(history, error_msg, True)
         state["error_message"] = error_msg
+
+    state["history"] = history
+    return state
+
+def execute_plot_regeneration_node(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Node: Execute Plot Regeneration")
+
+    narrative_outline = state.get("narrative_outline_text")
+    worldview_detail = state.get("selected_worldview_detail") # This is WorldviewDetail TypedDict
+    current_detailed_plot = state.get("detailed_plot_data", [])
+    start_chapter_for_regen = state.get("regeneration_start_chapter_number")
+    desired_total_chapters = state.get("total_chapters_to_generate") # This is the overall novel length desired
+    db_name = state.get("db_name")
+    # plot_modified_at_chapter = state.get("plot_modified_at_chapter") # Not strictly needed by agent if preceding_plot_details is correctly formed
+
+    if start_chapter_for_regen is None or desired_total_chapters is None:
+        error_msg = "Plot regeneration start chapter or desired total chapters not set."
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+        state["history"] = history
+        # Critical error, do not clear needs_plot_regeneration yet
+        return state
+
+    if not narrative_outline:
+        error_msg = "Narrative outline is missing, cannot regenerate plot."
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+        state["history"] = history
+        return state
+
+    if not worldview_detail:
+        error_msg = "Selected worldview detail is missing, cannot regenerate plot."
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+        state["history"] = history
+        return state
+
+    worldview_text = worldview_detail.get('core_concept', '') or worldview_detail.get('raw_llm_output_for_worldview', '')
+    if not worldview_text:
+        worldview_text = "Default general worldview due to missing specific data."
+        history = _log_and_update_history(history, "Warning: Worldview text for regeneration is empty, using default.", True)
+
+
+    # Prepare preceding_plot_details: chapters strictly before start_chapter_for_regen
+    # The current_detailed_plot might have been truncated at plot_modified_at_chapter by a twist/branch.
+    # We need the part of the plot that leads up to the regeneration point.
+    preceding_plot_details: List[PlotChapterDetail] = []
+    if start_chapter_for_regen > 1:
+        preceding_plot_details = [chap for chap in current_detailed_plot if chap.get('chapter_number', 0) < start_chapter_for_regen]
+        # Ensure preceding_plot_details are sorted and contiguous up to start_chapter_for_regen - 1
+        if preceding_plot_details and preceding_plot_details[-1].get('chapter_number') != start_chapter_for_regen -1:
+            history = _log_and_update_history(history, f"Warning: Preceding plot details for regeneration might be inconsistent. Last chapter is {preceding_plot_details[-1].get('chapter_number')}, expected {start_chapter_for_regen -1}.", True)
+            # Potentially, just take the slice: current_detailed_plot[:start_chapter_for_regen-1]
+            # This assumes current_detailed_plot is correctly ordered and complete up to the modification point.
+            preceding_plot_details = current_detailed_plot[:start_chapter_for_regen-1]
+
+
+    history = _log_and_update_history(history, f"Preparing for plot regeneration. Preceding chapters: {len(preceding_plot_details)}. Regen from: {start_chapter_for_regen}. Desired total: {desired_total_chapters}.")
+
+    if start_chapter_for_regen > desired_total_chapters:
+        history = _log_and_update_history(history, f"Regeneration start chapter {start_chapter_for_regen} is beyond desired total chapters {desired_total_chapters}. Plot will be truncated.")
+        state["detailed_plot_data"] = preceding_plot_details # Truncate plot
+        state["total_chapters_to_generate"] = len(preceding_plot_details) # Update total chapters to new length
+        history = _log_and_update_history(history, f"Plot truncated to {len(preceding_plot_details)} chapters. New total_chapters_to_generate: {state['total_chapters_to_generate']}.")
+        # Clear flags as regeneration is "handled" by truncation
+        state["needs_plot_regeneration"] = False
+        state["regeneration_start_chapter_number"] = None
+        state["plot_modified_at_chapter"] = None
+        state["history"] = history
+        return state
+
+    try:
+        agent = PlotRegeneratorAgent(llm_client=LLMClient(db_name=db_name)) # Assuming default LLM client or pass one
+        history = _log_and_update_history(history, f"Calling PlotRegeneratorAgent to regenerate plot from chapter {start_chapter_for_regen} to {desired_total_chapters}.")
+
+        regenerated_segment = agent.regenerate_plot_segment(
+            narrative_outline=narrative_outline,
+            worldview_data=worldview_text,
+            preceding_plot_details=preceding_plot_details,
+            regeneration_start_chapter=start_chapter_for_regen,
+            desired_total_chapters=desired_total_chapters # Agent needs to know how many chapters to make in total for the novel
+        )
+
+        if not regenerated_segment:
+            error_msg = "PlotRegeneratorAgent returned no segment. Regeneration failed."
+            history = _log_and_update_history(history, error_msg, True)
+            state["error_message"] = error_msg
+            # Do not clear needs_plot_regeneration, allow for retry or alternative handling
+        else:
+            history = _log_and_update_history(history, f"PlotRegeneratorAgent returned {len(regenerated_segment)} chapters for the segment.")
+            new_detailed_plot = preceding_plot_details + regenerated_segment
+
+            # Validate length (optional, but good sanity check)
+            if len(new_detailed_plot) != desired_total_chapters:
+                history = _log_and_update_history(history, f"Warning: After regeneration, plot has {len(new_detailed_plot)} chapters, but desired total was {desired_total_chapters}.", True)
+
+            state["detailed_plot_data"] = new_detailed_plot
+            # Persist the newly regenerated plot
+            plot_id = state.get("plot_id")
+            if plot_id and db_name:
+                db_manager = DatabaseManager(db_name=db_name)
+                updated_plot_json = json.dumps(new_detailed_plot, ensure_ascii=False, indent=2)
+                if db_manager.update_plot_summary(plot_id, updated_plot_json):
+                    history = _log_and_update_history(history, f"Successfully updated plot in DB (ID: {plot_id}) after regeneration.")
+                else:
+                    history = _log_and_update_history(history, f"Warning: Failed to update plot in DB (ID: {plot_id}) after regeneration.", True)
+            else:
+                 history = _log_and_update_history(history, "Plot ID or DB name missing, skipping DB update for regenerated plot.")
+
+
+            history = _log_and_update_history(history, "Plot regeneration successful. New plot installed.")
+            # Clear flags on successful regeneration
+            state["needs_plot_regeneration"] = False
+            state["regeneration_start_chapter_number"] = None
+            state["plot_modified_at_chapter"] = None
+            # The total_chapters_to_generate should now match the length of the new_detailed_plot
+            # if the regeneration was meant to fulfill that exact number.
+            # Or, if user_input.chapters is the ultimate source of truth, it might differ.
+            # For now, assume desired_total_chapters passed to agent was correct.
+            # If the plot length from regeneration matches desired_total_chapters, this is fine.
+            # If it doesn't, total_chapters_to_generate might need an update if this new plot is canonical.
+            # Let's assume for now that total_chapters_to_generate remains the user's original intent unless explicitly changed by a meta-process.
+            # However, if the new_detailed_plot is shorter than total_chapters_to_generate, the chapter loop might behave unexpectedly.
+            # It's safer to update total_chapters_to_generate to the new actual length of the plot if regeneration is considered complete.
+            # state["total_chapters_to_generate"] = len(new_detailed_plot)
+            # history = _log_and_update_history(history, f"Total chapters to generate updated to {len(new_detailed_plot)} based on regenerated plot length.")
+
+
+    except Exception as e:
+        error_msg = f"Error during plot regeneration node execution: {e}"
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+        # Do not clear needs_plot_regeneration on error
 
     state["history"] = history
     return state
@@ -2034,24 +2221,112 @@ def apply_selected_plot_twist(state: NovelWorkflowState) -> Dict[str, Any]:
 
         state["detailed_plot_data"] = updated_plot_list
 
+        # Set regeneration flags
+        state["needs_plot_regeneration"] = True
+        state["plot_modified_at_chapter"] = twist_chapter_num
+        state["regeneration_start_chapter_number"] = twist_chapter_num + 1
+        history = _log_and_update_history(history, f"Plot twist applied to chapter {twist_chapter_num}. Flagging for plot regeneration starting from chapter {twist_chapter_num + 1}.")
+
         # Persist the updated plot to the database
         db_manager = DatabaseManager(db_name=db_name)
         updated_plot_json = json.dumps(updated_plot_list, ensure_ascii=False, indent=2)
         if db_manager.update_plot_summary(plot_id, updated_plot_json):
-            history = _log_and_update_history(history, f"Successfully updated plot in DB (ID: {plot_id}) with applied twist.")
+            history = _log_and_update_history(history, f"Successfully updated plot in DB (ID: {plot_id}) with applied twist and regeneration flags.")
         else:
             history = _log_and_update_history(history, f"Warning: Failed to update plot in DB (ID: {plot_id}) after applying twist.", True)
             # Not necessarily a fatal error for workflow, but good to log.
 
     except Exception as e:
-        error_msg = f"Error applying plot twist: {e}"
+        error_msg = f"Error applying plot twist or setting regeneration flags: {e}"
         history = _log_and_update_history(history, error_msg, True)
         state["error_message"] = error_msg
 
     # Clear twist-related state fields after application (or attempted application)
+    # but keep regeneration flags
     state["available_plot_twist_options"] = None
     state["selected_plot_twist_option"] = None
     state["chapter_number_for_twist"] = None
+    # needs_plot_regeneration, plot_modified_at_chapter, regeneration_start_chapter_number are preserved
+    state["history"] = history
+    return state
+
+def apply_selected_plot_branch(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Node: Apply Selected Plot Branch")
+
+    selected_branch_path: Optional[List[PlotChapterDetail]] = state.get("selected_plot_branch_path")
+    branch_point_chapter_num: Optional[int] = state.get("chapter_number_for_branching")
+    detailed_plot_data: Optional[List[PlotChapterDetail]] = state.get("detailed_plot_data")
+    plot_id: Optional[int] = state.get("plot_id")
+    db_name: Optional[str] = state.get("db_name")
+
+    if not selected_branch_path or not branch_point_chapter_num or not detailed_plot_data:
+        history = _log_and_update_history(history, "Skipping application of plot branch: missing selected branch path, branch chapter number, or current plot data.")
+        state["available_plot_branch_options"] = None
+        state["selected_plot_branch_path"] = None
+        state["chapter_number_for_branching"] = None
+        state["history"] = history
+        return state
+
+    try:
+        current_plot_list = list(detailed_plot_data) # Make a mutable copy
+        branch_idx = branch_point_chapter_num - 1
+
+        if not (0 <= branch_idx < len(current_plot_list)):
+            error_msg = f"Invalid chapter index {branch_idx} for applying branch. Plot length: {len(current_plot_list)}."
+            history = _log_and_update_history(history, error_msg, True)
+            state["error_message"] = error_msg
+            # Clear branch state even on error to avoid inconsistent state
+            state["available_plot_branch_options"] = None
+            state["selected_plot_branch_path"] = None
+            state["chapter_number_for_branching"] = None
+            state["history"] = history
+            return state
+
+        history = _log_and_update_history(history, f"Applying selected plot branch starting at Chapter {branch_point_chapter_num}. The branch has {len(selected_branch_path)} chapters.")
+
+        # Replace the plot from the branch point onwards with the new branch path
+        updated_plot_list = current_plot_list[:branch_idx] + selected_branch_path
+        history = _log_and_update_history(history, f"Plot updated with branch. New total chapters in plot: {len(updated_plot_list)}.")
+        state["detailed_plot_data"] = updated_plot_list
+
+        # Set regeneration flags
+        state["needs_plot_regeneration"] = True # This might be true if the branch doesn't match total_chapters_to_generate
+        state["plot_modified_at_chapter"] = branch_point_chapter_num
+        # The next chapter to write/regenerate is the one AFTER the last chapter of the newly applied branch path
+        regeneration_start_num = branch_point_chapter_num + len(selected_branch_path)
+        state["regeneration_start_chapter_number"] = regeneration_start_num
+
+        history = _log_and_update_history(history, f"Plot branch applied at chapter {branch_point_chapter_num}. Flagging for potential plot regeneration or continuation from chapter {regeneration_start_num}.")
+
+        # Update total_chapters_to_generate to reflect the new plot length if the branch alters it.
+        # This assumes the selected branch defines the new canonical length up to its end.
+        # Further regeneration might extend it if regeneration_start_num <= user_input.chapters
+        if len(updated_plot_list) != state.get("total_chapters_to_generate"):
+             history = _log_and_update_history(history, f"Original total_chapters_to_generate was {state.get('total_chapters_to_generate')}. New plot length is {len(updated_plot_list)}. This might be adjusted by regeneration.")
+        # For now, we don't explicitly set total_chapters_to_generate here, as regeneration logic might handle it.
+
+
+        # Persist the updated plot to the database
+        if plot_id and db_name:
+            db_manager = DatabaseManager(db_name=db_name)
+            updated_plot_json = json.dumps(updated_plot_list, ensure_ascii=False, indent=2)
+            if db_manager.update_plot_summary(plot_id, updated_plot_json):
+                history = _log_and_update_history(history, f"Successfully updated plot in DB (ID: {plot_id}) with applied branch and regeneration flags.")
+            else:
+                history = _log_and_update_history(history, f"Warning: Failed to update plot in DB (ID: {plot_id}) after applying branch.", True)
+        else:
+            history = _log_and_update_history(history, "Plot ID or DB name missing, skipping DB update for plot branch.")
+
+    except Exception as e:
+        error_msg = f"Error applying plot branch or setting regeneration flags: {e}"
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+
+    # Clear branch-selection-specific state fields after application (or attempted application)
+    state["available_plot_branch_options"] = None
+    state["selected_plot_branch_path"] = None
+    state["chapter_number_for_branching"] = None
+    # Regeneration flags (needs_plot_regeneration, etc.) are preserved.
     state["history"] = history
     return state
 
@@ -2709,6 +2984,10 @@ class WorkflowManager:
         self.workflow.add_node("execute_plot_twist_agent", execute_plot_twist_agent)
         self.workflow.add_node("present_plot_twist_options_for_selection", present_plot_twist_options_for_selection)
         self.workflow.add_node("apply_selected_plot_twist", apply_selected_plot_twist)
+        self.workflow.add_node("apply_selected_plot_branch", apply_selected_plot_branch) # New node for branches
+        # Plot Regeneration Nodes
+        self.workflow.add_node("_check_if_plot_regeneration_needed", _check_if_plot_regeneration_needed)
+        self.workflow.add_node("execute_plot_regeneration_node", execute_plot_regeneration_node)
         # Regular Chapter Nodes
         self.workflow.add_node("context_synthesizer", execute_context_synthesizer_agent)
         self.workflow.add_node("chapter_chronicler", execute_chapter_chronicler_agent)
@@ -2785,9 +3064,34 @@ class WorkflowManager:
 
         self.workflow.add_conditional_edges("execute_plot_twist_agent", _check_node_output, {"continue": "present_plot_twist_options_for_selection", "stop_on_error": "context_synthesizer"}) # If twist agent errors, fallback to normal flow
         self.workflow.add_conditional_edges("present_plot_twist_options_for_selection", _check_workflow_pause_status, {"WORKFLOW_PAUSED": END, "continue_workflow": "apply_selected_plot_twist"})
-        self.workflow.add_conditional_edges("apply_selected_plot_twist", _check_node_output, {"continue": "context_synthesizer", "stop_on_error": END}) # After applying twist, proceed to context for (potentially new) chapter
+
+        # After applying a twist, check if regeneration is needed
+        self.workflow.add_conditional_edges("apply_selected_plot_twist", _check_node_output, {"continue": "_check_if_plot_regeneration_needed", "stop_on_error": END})
+
+        # Similarly, after applying a branch (if that node were connected), check for regeneration
+        # This edge is defined now, though apply_selected_plot_branch is not yet called by any preceding node in this version of the graph.
+        self.workflow.add_conditional_edges("apply_selected_plot_branch", _check_node_output, {"continue": "_check_if_plot_regeneration_needed", "stop_on_error": END})
+
+        # Conditional routing for plot regeneration
+        self.workflow.add_conditional_edges(
+            "_check_if_plot_regeneration_needed",
+            _check_if_plot_regeneration_needed, # This is the function that returns "regenerate_plot" or "skip_regeneration"
+            {
+                "regenerate_plot": "execute_plot_regeneration_node",
+                "skip_regeneration": "prepare_for_chapter_loop"
+            }
+        )
+        # After plot regeneration, go to prepare_for_chapter_loop to re-evaluate chapter counts and proceed
+        self.workflow.add_conditional_edges("execute_plot_regeneration_node", _check_node_output, {"continue": "prepare_for_chapter_loop", "stop_on_error": END})
 
         # Regular chapter flow nodes
+        # context_synthesizer is now reached if a twist/branch was skipped, OR if regeneration was skipped *and* the path led there.
+        # More robustly, most paths should converge on prepare_for_chapter_loop after any plot modification or decision.
+        # The skip_twist path from _should_generate_twist still correctly goes to context_synthesizer.
+        # If a twist/branch is applied, it goes to _check_if_plot_regeneration_needed.
+        # If regeneration is skipped, it goes to prepare_for_chapter_loop.
+        # If regeneration happens, it goes to prepare_for_chapter_loop.
+        # So, context_synthesizer is primarily for the "no plot modification this cycle" path.
         self.workflow.add_conditional_edges("context_synthesizer", _check_node_output, {"continue": "chapter_chronicler", "stop_on_error": END})
         self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "content_integrity_review", "stop_on_error": END})
 
