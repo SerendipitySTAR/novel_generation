@@ -19,7 +19,7 @@ class QualityGuardianAgent:
 
     def _construct_prompt_for_outline_review(self, outline_text: str) -> str:
         prompt = f"""You are a literary critic and editor. Review the following novel outline based on the criteria below.
-Provide a score from 1 (Poor) to 5 (Excellent) for each criterion.
+Provide a score from 1 (Poor) to 10 (Excellent) for each criterion.
 Also, provide a brief overall justification for your scores (2-3 sentences).
 
 Outline to Review:
@@ -28,10 +28,10 @@ Outline to Review:
 ---
 
 Please format your review EXACTLY as follows, with each item on a new line:
-Clarity: [1-5]
-Originality: [1-5]
-Conflict Potential: [1-5]
-Overall Score: [1-5]
+Clarity: [1-10]
+Originality: [1-10]
+Conflict Potential: [1-10]
+Overall Score: [1-10]
 Justification: [Your brief justification here.]
 
 Begin your review now:
@@ -47,16 +47,17 @@ Begin your review now:
             "justification": "Could not parse justification."
         }
         try:
-            clarity_match = re.search(r"Clarity:\s*([1-5])", response_text, re.IGNORECASE)
+            # Updated regex to capture 1-10 (or single digit)
+            clarity_match = re.search(r"Clarity:\s*(\d0?|[\d])", response_text, re.IGNORECASE)
             if clarity_match: review["clarity"] = int(clarity_match.group(1))
 
-            originality_match = re.search(r"Originality:\s*([1-5])", response_text, re.IGNORECASE)
+            originality_match = re.search(r"Originality:\s*(\d0?|[\d])", response_text, re.IGNORECASE)
             if originality_match: review["originality"] = int(originality_match.group(1))
 
-            conflict_match = re.search(r"Conflict Potential:\s*([1-5])", response_text, re.IGNORECASE)
+            conflict_match = re.search(r"Conflict Potential:\s*(\d0?|[\d])", response_text, re.IGNORECASE)
             if conflict_match: review["conflict_potential"] = int(conflict_match.group(1))
 
-            overall_match = re.search(r"Overall Score:\s*([1-5])", response_text, re.IGNORECASE)
+            overall_match = re.search(r"Overall Score:\s*(\d0?|[\d])", response_text, re.IGNORECASE)
             if overall_match: review["overall_score"] = int(overall_match.group(1))
 
             # Use re.DOTALL for justification as it might be multi-line or have newlines before it.

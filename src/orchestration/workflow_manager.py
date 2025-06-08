@@ -63,7 +63,9 @@ class NovelWorkflowState(TypedDict):
     plot_id: Optional[int]
     detailed_plot_data: Optional[List[PlotChapterDetail]]
     plot_data: Optional[Plot]
-    characters: Optional[List[Character]] # This will become List[DetailedCharacterProfile] after CharacterSculptor update
+    all_generated_character_options: Optional[Dict[str, List[DetailedCharacterProfile]]] # New field for options
+    selected_detailed_character_profiles: Optional[List[DetailedCharacterProfile]] # New field for chosen detailed profiles
+    saved_characters_db_model: Optional[List[Character]] # Renamed from 'characters'
     lore_keeper_initialized: bool
     current_chapter_number: int
     total_chapters_to_generate: int
@@ -87,6 +89,18 @@ class NovelWorkflowState(TypedDict):
     workflow_status: Optional[str] # e.g., "running", "paused_for_outline_selection"
     pending_decision_type: Optional[str]
     pending_decision_options: Optional[List[Dict[str, Any]]] # Stores DecisionOption like dicts
+    # Plot Twist State Fields
+    available_plot_twist_options: Optional[List[PlotChapterDetail]]
+    selected_plot_twist_option: Optional[PlotChapterDetail]
+    chapter_number_for_twist: Optional[int]
+    # Plot Branching State Fields
+    available_plot_branch_options: Optional[List[List[PlotChapterDetail]]]
+    selected_plot_branch_path: Optional[List[PlotChapterDetail]]
+    chapter_number_for_branching: Optional[int]
+    # Manual Chapter Review State Fields
+    chapter_pending_manual_review_id: Optional[int] = None
+    chapter_content_for_manual_review: Optional[str] = None
+    chapter_review_feedback_for_manual_review: Optional[Dict[str, Any]] = None
     pending_decision_prompt: Optional[str]
     user_made_decision_payload: Optional[Dict[str, Any]] # Stores submitted choice
     original_chapter_content_for_conflict_review: Optional[str] # Stores chapter text before potential conflict resolution by human
@@ -727,18 +741,26 @@ def execute_character_sculptor_agent(state: NovelWorkflowState) -> Dict[str, Any
         character_concepts = ["the main protagonist", "a compelling antagonist"] # Example concepts
         history = _log_and_update_history(history, f"Generating characters for concepts: {character_concepts}")
         agent = CharacterSculptorAgent(db_name=state.get("db_name", "novel_mvp.db"))
-        # The CharacterSculptorAgent now returns List[DetailedCharacterProfile]
-        characters_profiles = agent.generate_and_save_characters(
-            novel_id=novel_id, narrative_outline=outline['overview_text'],
-            worldview_data_core_concept=worldview_text_for_chars, plot_summary_str=plot_summary_for_chars,
+        # CharacterSculptorAgent.generate_character_profile_options returns Dict[str, List[DetailedCharacterProfile]]
+        # This node should now store these options. Selection will be a new node.
+        # For now, let's assume this node's purpose is to generate options.
+        # The actual saving will happen after a selection step.
+        # This change means 'character_sculptor' node might need a subsequent 'select_characters' node.
+        # For this sub-task, we just update the state fields.
+        # The agent.generate_character_profile_options does not take novel_id.
+        character_profile_options = agent.generate_character_profile_options(
+            narrative_outline=outline['overview_text'],
+            worldview_data_core_concept=worldview_text_for_chars,
+            plot_summary_str=plot_summary_for_chars,
             character_concepts=character_concepts
+            # num_options_per_concept can be passed if not default
         )
-        if characters_profiles: # Check if list is not empty
-            history = _log_and_update_history(history, f"Generated and saved {len(characters_profiles)} detailed character profiles.")
-            # The 'characters' field in state should now hold List[DetailedCharacterProfile]
-            return {"characters": characters_profiles, "history": history, "error_message": None}
+        if character_profile_options:
+            history = _log_and_update_history(history, f"Generated {sum(len(opts) for opts in character_profile_options.values())} character profile options for {len(character_concepts)} concepts.")
+            # Store all generated options in the new state field
+            return {"all_generated_character_options": character_profile_options, "history": history, "error_message": None}
         else:
-            msg = "Character Sculptor Agent failed to generate characters."
+            msg = "Character Sculptor Agent failed to generate character options."
             return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
     except Exception as e:
         msg = f"Error in Character Sculptor Agent node: {e}"
@@ -755,16 +777,30 @@ def execute_lore_keeper_initialize(state: NovelWorkflowState) -> Dict[str, Any]:
             db_manager = DatabaseManager(db_name=state.get("db_name", "novel_mvp.db"))
             plot_db_object = db_manager.get_plot_by_id(state["plot_id"])
 
-        # characters state now holds List[DetailedCharacterProfile]
-        # LoreKeeperAgent's initialize_knowledge_base expects List[Character] (the DB model)
-        # We need to adapt this. For now, we can create basic Character objects for KB init
-        # or update LoreKeeperAgent to handle DetailedCharacterProfile.
-        # For this step, let's pass the detailed profiles, assuming LoreKeeper can extract name/role/description.
-        character_details_for_kb = state["characters"]
+        # LoreKeeperAgent's initialize_knowledge_base expects List[Character] (the DB model).
+        # It should now use `selected_detailed_character_profiles` if available,
+        # or `saved_characters_db_model` if detailed profiles are not the primary source for KB init.
+        # For now, let's assume KB initialization might happen *after* characters are selected and saved.
+        # If character selection is a separate step, this node might need to be re-ordered or
+        # use `selected_detailed_character_profiles`.
+    # LoreKeeperAgent's initialize_knowledge_base expects List[Character] (the DB model).
+    # It should now use `selected_detailed_character_profiles` if available,
+    # or `saved_characters_db_model` if detailed profiles are not the primary source for KB init.
+    # For this sub-task, we'll use `selected_detailed_character_profiles`.
+    # Note: `initialize_knowledge_base` in LoreKeeperAgent might need adjustment
+    # if it strictly expects List[Character] and not List[DetailedCharacterProfile].
+    # For now, we pass List[DetailedCharacterProfile], assuming it can handle it or will be adapted.
+    character_details_for_kb = state.get("selected_detailed_character_profiles")
 
-        if not all([novel_id, outline, worldview_db_object, plot_db_object, character_details_for_kb is not None]):
-            msg = "Missing data for Lore Keeper initialization."
-            return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
+
+    # Allow KB initialization even if characters are not yet selected/available.
+    if character_details_for_kb is None:
+        history = _log_and_update_history(history, "Selected character profiles not yet available for Lore Keeper initialization. Initializing KB with other data.")
+        character_details_for_kb = [] # Pass empty list if not available
+
+    if not all([novel_id, outline, worldview_db_object, plot_db_object]):
+        msg = "Missing critical data (novel_id, outline, worldview, or plot) for Lore Keeper initialization."
+        return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
 
         try:
             lore_keeper = LoreKeeperAgent(db_name=state.get("db_name", "novel_mvp.db"))
@@ -857,11 +893,11 @@ def execute_context_synthesizer_agent(state: NovelWorkflowState) -> Dict[str, An
     try:
         novel_id = state["novel_id"]
         detailed_plot = state.get("detailed_plot_data")
-        # characters state now holds List[DetailedCharacterProfile]
-        character_profiles = state.get("characters", [])
+        # Use selected_detailed_character_profiles for context
+        character_profiles = state.get("selected_detailed_character_profiles", [])
 
-        if not all([novel_id is not None, detailed_plot, character_profiles is not None]):
-            msg = "Missing data for Context Synthesizer (novel_id, detailed_plot_data, characters)."
+        if not all([novel_id is not None, detailed_plot]): # Characters can be empty list
+            msg = "Missing data for Context Synthesizer (novel_id, detailed_plot_data)."
             return {"error_message": msg, "history": _log_and_update_history(history, msg, True)}
         if not (0 < current_chapter_num <= len(detailed_plot)):
             msg = f"Invalid current_chapter_number {current_chapter_num} for {len(detailed_plot)} detailed plot entries."
@@ -1553,6 +1589,87 @@ def _check_workflow_pause_status(state: NovelWorkflowState) -> str:
     print(f"DEBUG: Workflow status is '{workflow_status}'. Continuing graph execution.")
     return "continue_workflow"
 
+def execute_plot_twist_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = state.get("history", [])
+    novel_id = state.get("novel_id")
+    detailed_plot_data = state.get("detailed_plot_data") # This is List[PlotChapterDetail]
+    current_chapter_number_in_loop = state.get("current_chapter_number", 1) # Chapter currently being processed or just finished
+    total_chapters_to_generate = state.get("total_chapters_to_generate", 0)
+    db_name = state.get("db_name", "novel_mvp.db")
+
+    history = _log_and_update_history(history, "Node: Execute Plot Twist Agent")
+
+    if not all([novel_id, detailed_plot_data]):
+        history = _log_and_update_history(history, "Skipping plot twist generation: Missing novel_id or detailed_plot_data.")
+        return {"history": history, "available_plot_twist_options": None, "chapter_number_for_twist": None}
+
+    # Placeholder Decision Logic: Generate twists for the chapter *after* the current one,
+    # if current is chapter 2 and total chapters >= 3.
+    # This means if we just finished generating chapter 2, we consider twists for chapter 3.
+    # The 'current_chapter_number' in the main loop refers to the chapter *about to be generated*.
+    # So, if current_chapter_number_in_loop is, for example, 2 (meaning we are about to work on chapter 2),
+    # a twist might be for chapter 2 itself or chapter 3.
+    # Let's define "target_chapter_for_twist" as the chapter number we want to generate twists for.
+    # If we are about to generate Chapter 2, and total are >=3, let's generate twists for Chapter 3.
+
+    trigger_twist_generation = False
+    target_chapter_for_twist = None
+
+    # Example logic: If we are about to generate chapter 2, and total chapters are 3 or more,
+    # consider generating a twist for chapter 3.
+    # `current_chapter_number_in_loop` is the chapter number that `context_synthesizer` will prepare for next.
+    if total_chapters_to_generate >= 3 and current_chapter_number_in_loop == 2:
+        target_chapter_for_twist = 3 # We want to generate a twist for Chapter 3
+        if target_chapter_for_twist <= total_chapters_to_generate:
+             trigger_twist_generation = True
+        else:
+            history = _log_and_update_history(history, f"Plot Twist: Target chapter {target_chapter_for_twist} exceeds total chapters {total_chapters_to_generate}. Skipping.")
+
+    # More generic: Generate twist for the *next* chapter if current is, say, the midpoint.
+    # Example: if current_chapter_number_in_loop == total_chapters_to_generate // 2 + 1 and total_chapters_to_generate > 1:
+    #    target_chapter_for_twist = current_chapter_number_in_loop # Twist for the current chapter being planned
+    #    trigger_twist_generation = True
+
+
+    if trigger_twist_generation and target_chapter_for_twist is not None:
+        history = _log_and_update_history(history, f"Condition met: Generating plot twist options for Chapter {target_chapter_for_twist}.")
+        try:
+            from src.agents.plot_twist_agent import PlotTwistAgent # Local import
+            plot_twist_agent = PlotTwistAgent(db_name=db_name) # LLMClient will be default
+
+            # Pass the existing detailed_plot_data (which is List[PlotChapterDetail])
+            twist_options = plot_twist_agent.generate_twist_options(
+                novel_id=novel_id,
+                current_plot_details=detailed_plot_data, # Already List[Dict] or List[PlotChapterDetail]
+                target_chapter_number=target_chapter_for_twist,
+                num_options=2
+            )
+
+            if twist_options:
+                history = _log_and_update_history(history, f"Successfully generated {len(twist_options)} twist options for Chapter {target_chapter_for_twist}.")
+                return {
+                    "history": history,
+                    "available_plot_twist_options": twist_options,
+                    "chapter_number_for_twist": target_chapter_for_twist,
+                    "error_message": None
+                }
+            else:
+                history = _log_and_update_history(history, f"PlotTwistAgent generated no options for Chapter {target_chapter_for_twist}.", True)
+                return {"history": history, "available_plot_twist_options": None, "chapter_number_for_twist": None, "error_message": "Plot twist agent returned no options."}
+
+        except ImportError:
+            error_msg = "PlotTwistAgent could not be imported. Skipping twist generation."
+            history = _log_and_update_history(history, error_msg, True)
+            return {"history": history, "error_message": error_msg, "available_plot_twist_options": None, "chapter_number_for_twist": None}
+        except Exception as e:
+            error_msg = f"Error during plot twist generation: {e}"
+            history = _log_and_update_history(history, error_msg, True)
+            return {"history": history, "error_message": error_msg, "available_plot_twist_options": None, "chapter_number_for_twist": None}
+    else:
+        history = _log_and_update_history(history, "Condition for plot twist generation not met. Skipping.")
+        return {"history": history, "available_plot_twist_options": None, "chapter_number_for_twist": None}
+
+
 def prepare_conflict_review_for_api(state: NovelWorkflowState) -> Dict[str, Any]:
     history = state.get("history", [])
     novel_id = state.get("novel_id")
@@ -1689,6 +1806,335 @@ def prepare_conflict_review_for_api(state: NovelWorkflowState) -> Dict[str, Any]
     state["history"] = history
     return state
 
+def _should_generate_twist(state: NovelWorkflowState) -> str:
+    """
+    Determines if plot twist generation should be attempted.
+    """
+    history = state.get("history", [])
+    current_chapter_number = state.get("current_chapter_number", 1)
+    total_chapters = state.get("total_chapters_to_generate", 0)
+    # Example Logic: Trigger for Chapter 3 if total chapters >= 3
+    # And we are about to generate chapter 2 (so current_chapter_number is 2, meaning next will be 3)
+    # This is a placeholder; more sophisticated logic will be based on Plan Step 3.
+    # The execute_plot_twist_agent itself has similar logic to determine target_chapter_for_twist.
+    # This conditional node simply gates whether execute_plot_twist_agent runs.
+    # If execute_plot_twist_agent runs, it will then check its own conditions for *which* chapter to target.
+
+    # Let's use the same logic as in execute_plot_twist_agent for consistency:
+    # If current_chapter_number is 2 (meaning we are about to work on chapter 2, and a twist could be for chapter 3)
+    # and total_chapters >=3
+    if total_chapters >= 3 and current_chapter_number == 2: # Condition to attempt twist generation for *next* chapter
+        history = _log_and_update_history(history, "Decision: Conditions met to attempt plot twist generation.")
+        state["history"] = history
+        return "generate_twist"
+    else:
+        history = _log_and_update_history(history, "Decision: Conditions not met for plot twist generation. Skipping.")
+        state["history"] = history
+        return "skip_twist"
+
+def _should_generate_branch(state: NovelWorkflowState) -> str: # Added from Subtask 4.2
+    """
+    Determines if plot branch generation should be attempted based on placeholder logic.
+    """
+    history = state.get("history", [])
+    current_chapter_number = state.get("current_chapter_number", 1)
+    total_chapters = state.get("total_chapters_to_generate", 0)
+    # Placeholder Logic: e.g., if current_chapter_number is 3 (about to start chapter 4)
+    # and total_chapters_to_generate >= 7
+    if total_chapters >= 7 and current_chapter_number == 3: # Note: current_chapter_number is the one *about* to be generated
+        history = _log_and_update_history(history, "Decision: Conditions met to attempt plot branch generation.")
+        state["history"] = history
+        return "generate_branch"
+    else:
+        history = _log_and_update_history(history, "Decision: Conditions not met for plot branch generation. Skipping.")
+        state["history"] = history
+        return "skip_branch"
+
+def present_plot_twist_options_for_selection(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Node: Present Plot Twist Options for Selection")
+    print("\n=== Plot Twist Options Selection ===")
+
+    available_options = state.get("available_plot_twist_options")
+    user_input = state.get("user_input", {})
+    auto_engine = state.get("auto_decision_engine")
+    db_name = state.get("db_name", "novel_mvp.db")
+    novel_id = state.get("novel_id")
+    chapter_num_for_twist = state.get("chapter_number_for_twist")
+
+    if not novel_id:
+        error_msg = "Novel ID not found in state for plot twist selection."
+        return {"error_message": error_msg, "history": _log_and_update_history(history, error_msg, True)}
+
+    if not available_options:
+        history = _log_and_update_history(history, "No plot twist options available to select from. Skipping selection.")
+        state["history"] = history
+        state["selected_plot_twist_option"] = None # Ensure it's None
+        return state # Proceed in workflow, apply_selected_plot_twist will also skip.
+
+    interaction_mode = user_input.get("interaction_mode", "cli")
+    auto_mode = user_input.get("auto_mode", False)
+
+    # Handle Resuming from API
+    if interaction_mode == "api" and not auto_mode and state.get("user_made_decision_payload"):
+        payload = state.get("user_made_decision_payload", {})
+        if payload.get("source_decision_type") == "plot_twist_selection":
+            history = _log_and_update_history(history, "API Mode: Resuming plot twist selection from payload.")
+            selected_option_id_from_api = payload.get("selected_option_id") # API sends the chosen option's ID
+
+            if selected_option_id_from_api is None:
+                error_msg = "API Mode: 'selected_option_id' missing in payload for plot_twist_selection."
+                state["error_message"] = error_msg
+                state["history"] = _log_and_update_history(history, error_msg, True)
+                return state
+
+            chosen_option = None
+            for idx, option_detail in enumerate(available_options):
+                # The ID for DecisionOption was 'twist_opt_idx'
+                if f"twist_opt_{idx}" == selected_option_id_from_api:
+                    chosen_option = option_detail
+                    break
+
+            if chosen_option:
+                state["selected_plot_twist_option"] = chosen_option
+                history = _log_and_update_history(history, f"API Mode: Selected plot twist option '{chosen_option.get('title')}' for Chapter {chapter_num_for_twist}.")
+            else:
+                error_msg = f"API Mode: Could not find plot twist option with ID '{selected_option_id_from_api}'."
+                state["error_message"] = error_msg
+                history = _log_and_update_history(history, error_msg, True)
+                # Fallback: select no twist or first option? For now, error out.
+                return state
+
+            state["user_made_decision_payload"] = None
+            state["workflow_status"] = "running_after_plot_twist_selection"
+            state["history"] = history
+            state["error_message"] = None
+            return state
+
+    # Handle Pausing for API
+    if interaction_mode == "api" and not auto_mode:
+        history = _log_and_update_history(history, "API Mode: Pausing for plot twist selection.")
+        options_for_api_decision_node: List[Dict[str, Any]] = []
+        for idx, option_detail in enumerate(available_options):
+            options_for_api_decision_node.append({
+                "id": f"twist_opt_{idx}", # Unique ID for this specific option
+                "text_summary": option_detail.get('title', f"Twist Option {idx+1}") + " - " + option_detail.get('core_scene_summary','Summary N/A')[:100]+"...",
+                "full_data": option_detail # The full PlotChapterDetail dict
+            })
+
+        state["pending_decision_type"] = "plot_twist_selection"
+        state["pending_decision_options"] = options_for_api_decision_node
+        state["pending_decision_prompt"] = f"Please select a plot twist option for Chapter {chapter_num_for_twist} (or choose to ignore twists)."
+        state["workflow_status"] = f"paused_for_plot_twist_selection_ch_{chapter_num_for_twist}"
+
+        try:
+            db_manager = DatabaseManager(db_name=db_name)
+            options_json_for_db = json.dumps(options_for_api_decision_node)
+            prepared_state_for_json = WorkflowManager._prepare_state_for_json_static(dict(state))
+            state_json = json.dumps(prepared_state_for_json)
+            db_manager.update_novel_pause_state(
+                novel_id, state["workflow_status"], state["pending_decision_type"],
+                options_json_for_db, state["pending_decision_prompt"], state_json
+            )
+            history = _log_and_update_history(history, "Successfully saved paused plot twist selection state to DB.")
+        except Exception as db_e:
+            error_msg = f"API Mode: Failed to save paused plot twist selection state to DB: {db_e}"
+            history = _log_and_update_history(history, error_msg, True)
+            state["error_message"] = error_msg
+
+        state["history"] = history
+        return state
+
+    # CLI / Auto Mode
+    chosen_twist_option: Optional[PlotChapterDetail] = None
+    if auto_mode and auto_engine:
+        history = _log_and_update_history(history, f"Auto mode: Selecting plot twist for Chapter {chapter_num_for_twist}.")
+        # Auto-engine could also select an implicit "no twist" option if desired.
+        # For now, it picks one of the available twists.
+        # To allow "no twist", add a dummy "None" option to available_options before calling decide.
+        options_with_no_twist = list(available_options) + [None] # Allow auto-engine to select "no twist"
+
+        chosen_twist_option = auto_engine.decide(
+            options_with_no_twist,
+            context={"decision_type": "plot_twist_selection", "chapter_number": chapter_num_for_twist}
+        )
+        if chosen_twist_option:
+            log_msg = f"Auto mode: Selected twist '{chosen_twist_option.get('title')}' for Chapter {chapter_num_for_twist}."
+        else:
+            log_msg = f"Auto mode: Opted to NOT apply a plot twist for Chapter {chapter_num_for_twist}."
+    elif auto_mode and not auto_engine: # CLI auto mode without engine
+        history = _log_and_update_history(history, f"Auto mode (no engine): Defaulting to first twist option for Chapter {chapter_num_for_twist}.")
+        chosen_twist_option = available_options[0] if available_options else None
+        log_msg = f"Auto mode (no engine): Defaulted to '{chosen_twist_option.get('title') if chosen_twist_option else 'no twist'}' for Chapter {chapter_num_for_twist}."
+    else: # CLI Human Interaction
+        print(f"Available plot twist options for Chapter {chapter_num_for_twist}:")
+        for i, option in enumerate(available_options):
+            print(f"  Option {i + 1}: {option.get('title', 'Untitled Twist')}")
+            print(f"    Summary: {option.get('core_scene_summary', 'N/A')}")
+
+        try:
+            import sys
+            if not sys.stdin.isatty(): # Non-interactive
+                chosen_idx = 0 # Default to first option
+                log_msg = f"Non-interactive: Defaulted to twist option 1 for Chapter {chapter_num_for_twist}."
+            else:
+                choice_str = input(f"Select twist option for Chapter {chapter_num_for_twist} (1-{len(available_options)}), or 0 to apply NO twist: ")
+                choice_int = int(choice_str)
+                if 0 < choice_int <= len(available_options):
+                    chosen_idx = choice_int - 1
+                    log_msg = f"User selected twist option {chosen_idx + 1} for Chapter {chapter_num_for_twist}."
+                else: # User chose 0 or invalid, so no twist
+                    chosen_idx = -1 # Indicates no twist
+                    log_msg = f"User opted for NO plot twist for Chapter {chapter_num_for_twist}."
+        except (ValueError, EOFError, KeyboardInterrupt) as e:
+            chosen_idx = -1 # Default to no twist on error
+            log_msg = f"Input error ({type(e).__name__}) for twist selection, defaulting to NO twist for Chapter {chapter_num_for_twist}."
+
+        chosen_twist_option = available_options[chosen_idx] if chosen_idx != -1 else None
+
+    history = _log_and_update_history(history, log_msg)
+    state["selected_plot_twist_option"] = chosen_twist_option
+    state["history"] = history
+    state["error_message"] = None
+    return state
+
+def apply_selected_plot_twist(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Node: Apply Selected Plot Twist")
+
+    selected_twist: Optional[PlotChapterDetail] = state.get("selected_plot_twist_option")
+    twist_chapter_num: Optional[int] = state.get("chapter_number_for_twist")
+    detailed_plot_data: Optional[List[PlotChapterDetail]] = state.get("detailed_plot_data")
+    plot_id: Optional[int] = state.get("plot_id")
+    db_name: Optional[str] = state.get("db_name")
+
+    if not selected_twist or not twist_chapter_num or not detailed_plot_data or not plot_id or not db_name:
+        history = _log_and_update_history(history, "Skipping application of plot twist: missing selected twist, chapter number, plot data, plot ID, or DB name.")
+        # Clear twist-related fields even if skipping application to prevent carry-over
+        state["available_plot_twist_options"] = None
+        state["selected_plot_twist_option"] = None
+        state["chapter_number_for_twist"] = None
+        state["history"] = history
+        return state
+
+    try:
+        current_plot_list = list(detailed_plot_data) # Make a mutable copy
+        twist_chapter_idx = twist_chapter_num - 1
+
+        if not (0 <= twist_chapter_idx < len(current_plot_list)):
+            error_msg = f"Invalid chapter index {twist_chapter_idx} for applying twist. Plot length: {len(current_plot_list)}."
+            history = _log_and_update_history(history, error_msg, True)
+            state["error_message"] = error_msg
+            return state # Error state
+
+        history = _log_and_update_history(history, f"Applying selected twist '{selected_twist.get('title')}' to Chapter {twist_chapter_num}.")
+
+        # Replace the original chapter details with the twist, and truncate any subsequent chapters.
+        updated_plot_list = current_plot_list[:twist_chapter_idx] + [selected_twist]
+
+        history = _log_and_update_history(history, f"Plot updated up to Chapter {twist_chapter_num}. Subsequent chapters removed due to twist.")
+
+        state["detailed_plot_data"] = updated_plot_list
+
+        # Persist the updated plot to the database
+        db_manager = DatabaseManager(db_name=db_name)
+        updated_plot_json = json.dumps(updated_plot_list, ensure_ascii=False, indent=2)
+        if db_manager.update_plot_summary(plot_id, updated_plot_json):
+            history = _log_and_update_history(history, f"Successfully updated plot in DB (ID: {plot_id}) with applied twist.")
+        else:
+            history = _log_and_update_history(history, f"Warning: Failed to update plot in DB (ID: {plot_id}) after applying twist.", True)
+            # Not necessarily a fatal error for workflow, but good to log.
+
+    except Exception as e:
+        error_msg = f"Error applying plot twist: {e}"
+        history = _log_and_update_history(history, error_msg, True)
+        state["error_message"] = error_msg
+
+    # Clear twist-related state fields after application (or attempted application)
+    state["available_plot_twist_options"] = None
+    state["selected_plot_twist_option"] = None
+    state["chapter_number_for_twist"] = None
+    state["history"] = history
+    return state
+
+def execute_outline_enhancement_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Node: Execute Outline Enhancement Agent")
+    narrative_outline = state.get("narrative_outline_text", "")
+    outline_review = state.get("outline_review") # Contains overall_score and justification
+
+    if not narrative_outline:
+        error_msg = "No narrative outline available to enhance."
+        history = _log_and_update_history(history, error_msg, True)
+        return {**state, "history": history, "error_message": error_msg}
+
+    print(f"Outline Enhancement Agent: Received outline. Review score: {outline_review.get('overall_score') if outline_review else 'N/A'}")
+    # Placeholder logic: Append a note to the outline
+    enhanced_outline = narrative_outline + "\n\n[Note: This outline has been processed by the enhancement placeholder.]"
+
+    # Simulate calling an LLM to enhance based on review (conceptual)
+    # For now, we just log what could be done.
+    if outline_review and outline_review.get('overall_score', 0) < 7.5 : # Assuming 7.5 is the threshold
+        history = _log_and_update_history(history, f"Outline score was {outline_review.get('overall_score')}. Justification: {outline_review.get('justification', 'N/A')}. Placeholder enhancement applied.")
+    else:
+        history = _log_and_update_history(history, "Outline score was sufficient or no review. Placeholder enhancement applied.")
+
+    # Update state
+    updated_state = dict(state)
+    updated_state["narrative_outline_text"] = enhanced_outline
+    updated_state["history"] = _log_and_update_history(history, "Outline enhancement placeholder complete.")
+    updated_state["error_message"] = None # Clear any previous error if this node runs successfully
+    # Potentially, update outline_data and persist changes if this were a real enhancement
+    # For now, only narrative_outline_text in state is updated.
+    # If the enhanced outline needs to be re-saved to DB and active_outline_id updated, that would go here.
+    # For this subtask, modifying state['narrative_outline_text'] is sufficient.
+    return updated_state
+
+def _decide_outline_processing_path(state: NovelWorkflowState) -> str:
+    history = state.get("history", [])
+    outline_review = state.get("outline_review")
+    auto_decision_engine = state.get("auto_decision_engine")
+
+    if outline_review is None or auto_decision_engine is None:
+        history = _log_and_update_history(history, "Warning: Outline review or auto-decision engine not available. Defaulting to 'proceed_to_world_weaver'.", True)
+        state["history"] = history
+        return "proceed_to_world_weaver"
+
+    overall_score = float(outline_review.get("overall_score", 0.0)) # Ensure float for comparison
+
+    # Options for AutoDecisionEngine represent the names of the next nodes or paths
+    options = ["enhance_outline", "proceed_to_world_weaver"] # Note: order matters for AutoDecisionEngine if true path is first
+
+    # Context for score-based decision: If score >= 7.5, proceed. Else, enhance.
+    # So, if score >= 7.5 is TRUE, we take options[0] -> "proceed_to_world_weaver"
+    # If score >= 7.5 is FALSE, we take options[1] -> "enhance_outline"
+    # The AutoDecisionEngine returns options[0] for TRUE, options[1] for FALSE.
+    # So, if op is ">=", options should be ["proceed_to_world_weaver", "enhance_outline"]
+    context = {
+        "decision_type": "score_threshold_branch",
+        "score": overall_score,
+        "threshold": 7.5,
+        "operator": ">="
+    }
+
+    # The AutoDecisionEngine will return options[0] ("enhance_outline") if score >= 7.5 is TRUE
+    # and options[1] ("proceed_to_world_weaver") if score >= 7.5 is FALSE.
+    # This is the opposite of what we want. Let's adjust the options order or the logic.
+    # If score >= 7.5, we want to "proceed_to_world_weaver".
+    # If score < 7.5, we want to "enhance_outline".
+
+    # Let's define paths clearly:
+    path_if_score_meets_threshold = "proceed_to_world_weaver"
+    path_if_score_below_threshold = "enhance_outline"
+
+    # AutoDecisionEngine returns options[0] if op(score, threshold) is True, else options[1]
+    # If operator is ">=", and score >= threshold is True, it returns options[0].
+    # So, options[0] must be path_if_score_meets_threshold.
+    decision_options = [path_if_score_meets_threshold, path_if_score_below_threshold]
+
+    choice = auto_decision_engine.decide(decision_options, context)
+
+    history = _log_and_update_history(history, f"Outline Review Score: {overall_score}. Threshold: >=7.5. Auto-decision: '{choice}'.")
+    state["history"] = history
+    return choice
+
 def execute_conflict_resolution_auto(state: NovelWorkflowState) -> Dict[str, Any]:
     history = state.get("history", [])
     novel_id = state.get("novel_id")
@@ -1763,6 +2209,83 @@ def execute_conflict_resolution_auto(state: NovelWorkflowState) -> Dict[str, Any
     state["history"] = history
     return state
 
+def execute_plot_branching_agent(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = state.get("history", [])
+    novel_id = state.get("novel_id")
+    detailed_plot_data = state.get("detailed_plot_data")
+    current_chapter_num_in_loop = state.get("current_chapter_number", 1) # Chapter about to be processed
+    total_chapters_to_generate = state.get("total_chapters_to_generate", 0)
+    db_name = state.get("db_name", "novel_mvp.db")
+
+    history = _log_and_update_history(history, "Node: Execute Plot Branching Agent")
+
+    if not all([novel_id, detailed_plot_data]):
+        history = _log_and_update_history(history, "Skipping plot branch generation: Missing novel_id or detailed_plot_data.")
+        return {**state, "history": history, "available_plot_branch_options": None, "chapter_number_for_branching": None}
+
+    trigger_branch_generation = False
+    branch_point_chapter_num_for_agent = None
+    num_chapters_per_branch = 3 # Default, can be made configurable
+
+    # Placeholder Decision Logic: e.g., if current_chapter_number is 4 (meaning we are about to start chapter 4)
+    # and total_chapters_to_generate >= 7, then generate branches starting from chapter 4.
+    # current_chapter_number_in_loop is the chapter *about to be generated*.
+    if total_chapters_to_generate >= 7 and current_chapter_num_in_loop == 4:
+        branch_point_chapter_num_for_agent = current_chapter_num_in_loop
+        # Check if generating 3 chapters from this point exceeds total_chapters.
+        # If so, this branching logic might need adjustment or it implies the novel extends.
+        # For now, assume branches can temporarily extend beyond original total_chapters_to_generate,
+        # and selecting a branch might redefine total_chapters.
+        if branch_point_chapter_num_for_agent + num_chapters_per_branch -1 <= total_chapters_to_generate + num_chapters_per_branch: # Allow extension
+            trigger_branch_generation = True
+        else:
+             history = _log_and_update_history(history, f"Plot Branching: Target branch end {branch_point_chapter_num_for_agent + num_chapters_per_branch -1} too far. Skipping.")
+
+
+    if trigger_branch_generation and branch_point_chapter_num_for_agent is not None:
+        history = _log_and_update_history(history, f"Condition met: Generating plot branch options from Chapter {branch_point_chapter_num_for_agent}.")
+        try:
+            from src.agents.plot_branching_agent import PlotBranchingAgent # Local import
+            branching_agent = PlotBranchingAgent(db_name=db_name)
+
+            # current_plot_details should be up to the chapter *before* the branch point.
+            plot_context_for_branching = [
+                chap for chap in detailed_plot_data
+                if chap.get('chapter_number', 0) < branch_point_chapter_num_for_agent
+            ]
+
+            branch_options = branching_agent.generate_branching_plot_options(
+                novel_id=novel_id,
+                current_plot_details=plot_context_for_branching,
+                branch_point_chapter_number=branch_point_chapter_num_for_agent,
+                num_options=2,
+                num_chapters_per_branch=num_chapters_per_branch
+            )
+
+            if branch_options:
+                history = _log_and_update_history(history, f"Successfully generated {len(branch_options)} plot branch options from Chapter {branch_point_chapter_num_for_agent}.")
+                return {
+                    **state, "history": history,
+                    "available_plot_branch_options": branch_options,
+                    "chapter_number_for_branching": branch_point_chapter_num_for_agent,
+                    "error_message": None
+                }
+            else:
+                history = _log_and_update_history(history, f"PlotBranchingAgent generated no options from Chapter {branch_point_chapter_num_for_agent}.", True)
+                return {**state, "history": history, "available_plot_branch_options": None, "chapter_number_for_branching": None, "error_message": "Plot branching agent returned no options."}
+
+        except ImportError:
+            error_msg = "PlotBranchingAgent could not be imported. Skipping branch generation."
+            history = _log_and_update_history(history, error_msg, True)
+            return {**state, "history": history, "error_message": error_msg, "available_plot_branch_options": None, "chapter_number_for_branching": None}
+        except Exception as e:
+            error_msg = f"Error during plot branch generation: {e}"
+            history = _log_and_update_history(history, error_msg, True)
+            return {**state, "history": history, "error_message": error_msg, "available_plot_branch_options": None, "chapter_number_for_branching": None}
+    else:
+        history = _log_and_update_history(history, "Condition for plot branch generation not met or invalid parameters. Skipping.")
+        return {**state, "history": history, "available_plot_branch_options": None, "chapter_number_for_branching": None}
+
 def _decide_after_conflict_detection(state: NovelWorkflowState) -> str:
     history = state.get("history", [])
     conflicts = state.get("current_chapter_conflicts", [])
@@ -1803,38 +2326,147 @@ def _should_retry_chapter(state: NovelWorkflowState) -> str:
     # Default quality_passed to True to avoid retries if the field is somehow missing
     quality_passed = state.get("current_chapter_quality_passed", True)
     current_retry_count_for_this_chapter = state.get("current_chapter_retry_count", 0)
-    # max_chapter_retries should be initialized in the state (e.g., in run_workflow)
-    max_retries = state.get("max_chapter_retries", 1) # Default to 1 if not set in initial state
+    max_retries = state.get("max_chapter_retries", 1)
 
     print(f"DEBUG: _should_retry_chapter - Auto Mode: {auto_mode}, Quality Passed: {quality_passed}, Retries This Chapter: {current_retry_count_for_this_chapter}/{max_retries}")
 
-    if auto_mode and not quality_passed and current_retry_count_for_this_chapter < max_retries:
-        # Increment retry count for the current chapter before starting the retry attempt
-        state["current_chapter_retry_count"] = current_retry_count_for_this_chapter + 1
+    if auto_mode and not quality_passed:
+        if current_retry_count_for_this_chapter < max_retries:
+            state["current_chapter_retry_count"] = current_retry_count_for_this_chapter + 1
+            history = _log_and_update_history(history, f"Chapter failed quality. Auto-retry attempt {state['current_chapter_retry_count']}/{max_retries}.")
+            state["history"] = history
+            return "retry_chapter"
+        else: # Max retries reached in auto_mode and still failed
+            history = _log_and_update_history(history, f"Chapter failed quality after {max_retries} auto-retries. Initiating manual review.")
+            state["history"] = history
+            return "initiate_manual_review"
 
-        history = _log_and_update_history(history, f"Chapter failed quality. Current retry attempt for this chapter was {current_retry_count_for_this_chapter}. Will attempt retry (new attempt number: {state['current_chapter_retry_count']}).")
-        print(f"INFO: Chapter retry attempt {state['current_chapter_retry_count']}/{max_retries} will be made.")
-        state["history"] = history # Persist history update
-        return "retry_chapter"  # Route back to context_synthesizer
+    # If not (auto_mode and not quality_passed) OR if quality_passed:
+    # This means:
+    # 1. Quality passed (in any mode)
+    # 2. Not auto_mode and quality failed (human decides next, no auto-retry or manual review trigger here)
+    # 3. Not auto_mode and quality passed (covered by 1)
+
+    # Reset retry count for the next chapter's first attempt.
+    state["current_chapter_retry_count"] = 0
+    history = _log_and_update_history(history, "Proceeding to KB update (quality passed, or not auto_mode, or retries not applicable).")
+    state["history"] = history
+    return "proceed_to_kb_update"
+
+def prepare_for_manual_chapter_review(state: NovelWorkflowState) -> Dict[str, Any]:
+    history = _log_and_update_history(state.get("history", []), "Node: Prepare for Manual Chapter Review")
+
+    generated_chapters = state.get("generated_chapters", [])
+    if not generated_chapters:
+        error_msg = "Cannot prepare for manual review: No chapters generated."
+        history = _log_and_update_history(history, error_msg, True)
+        return {**state, "history": history, "error_message": error_msg}
+
+    failed_chapter = generated_chapters[-1]
+    chapter_id_to_review = failed_chapter.get('id')
+
+    if chapter_id_to_review is None: # Should ideally not happen if chapter was saved
+        error_msg = "Cannot prepare for manual review: Failed chapter has no ID."
+        history = _log_and_update_history(history, error_msg, True)
+        return {**state, "history": history, "error_message": error_msg}
+
+    state["chapter_pending_manual_review_id"] = chapter_id_to_review
+    state["chapter_content_for_manual_review"] = failed_chapter.get("content")
+    state["chapter_review_feedback_for_manual_review"] = state.get("current_chapter_review") # The review that triggered this
+    state["workflow_status"] = "paused_for_manual_chapter_review"
+    state["pending_decision_type"] = "manual_chapter_review"
+    state["pending_decision_prompt"] = f"Chapter {failed_chapter.get('chapter_number')} ('{failed_chapter.get('title')}') requires manual review after {state.get('max_chapter_retries', 'N/A')} failed auto-retry attempts."
+
+    # Options for the API to present to the user
+    # These are action IDs, not specific content choices.
+    state["pending_decision_options"] = [
+        {"id": "submit_edit", "text_summary": "Submit with edits (content in request body of different endpoint)", "full_data": {"action_description": "User will provide new content for the chapter."}},
+        {"id": "use_as_is", "text_summary": "Use current version as is (no edits needed)", "full_data": {"action_description": "The last generated version of the chapter will be accepted despite quality score."}}
+    ]
+
+    history = _log_and_update_history(history, f"Workflow paused for manual review of Chapter ID: {chapter_id_to_review}.")
+
+    db_manager = DatabaseManager(db_name=state.get("db_name"))
+    options_json = json.dumps(state["pending_decision_options"])
+    prepared_state_for_json = WorkflowManager._prepare_state_for_json_static(dict(state))
+    state_json_for_db = json.dumps(prepared_state_for_json)
+
+    db_manager.update_novel_pause_state(
+        state["novel_id"],
+        state["workflow_status"],
+        state["pending_decision_type"],
+        options_json,
+        state["pending_decision_prompt"],
+        state_json_for_db
+    )
+    history = _log_and_update_history(history, "Manual review pause state saved to DB.")
+    state["history"] = history
+    return state # This will be caught by _check_workflow_pause_status and lead to END
+
+def _route_after_prepare_manual_review(state: NovelWorkflowState) -> str:
+    history = state.get("history", [])
+
+    if state.get("user_made_decision_payload", {}).get("source_decision_type") == "manual_chapter_review":
+        payload = state["user_made_decision_payload"]
+        action = payload.get("action")
+        edited_content_provided = payload.get("edited_content_provided", False) # From API endpoint
+        chapter_id_processed = state.get("chapter_pending_manual_review_id")
+        db_name = state.get("db_name")
+
+        history = _log_and_update_history(history, f"Resuming after manual chapter review. Action: {action}.")
+
+        if action == "submit_edit" and edited_content_provided:
+            # Content update already happened in the API endpoint via db_manager.update_chapter_content
+            # Need to refresh the chapter content in the state's generated_chapters list
+            if chapter_id_processed is not None and db_name:
+                db_manager = DatabaseManager(db_name)
+                updated_chapter_from_db = db_manager.get_chapter_by_id(chapter_id_processed)
+                if updated_chapter_from_db:
+                    found_idx = -1
+                    for i, chap in enumerate(state.get("generated_chapters", [])):
+                        if chap.get("id") == chapter_id_processed:
+                            found_idx = i
+                            break
+                    if found_idx != -1:
+                        state["generated_chapters"][found_idx]["content"] = updated_chapter_from_db["content"]
+                        # Also update its 'creation_date' to reflect the edit time, if desired
+                        state["generated_chapters"][found_idx]["creation_date"] = updated_chapter_from_db["creation_date"]
+                        history = _log_and_update_history(history, f"Chapter ID {chapter_id_processed} content in workflow state updated from DB after manual edit.")
+                    else:
+                         history = _log_and_update_history(history, f"Warning: Chapter ID {chapter_id_processed} not found in state.generated_chapters to update content.", True)
+                else:
+                    history = _log_and_update_history(history, f"Warning: Could not fetch updated chapter {chapter_id_processed} from DB after manual edit.", True)
+
+            state["current_chapter_quality_passed"] = None # Force re-review
+            state["current_chapter_review"] = None
+            next_node = "content_integrity_review" # Send back for re-review
+            history = _log_and_update_history(history, "Manual edit submitted. Routing for re-review.")
+
+        elif action == "use_as_is":
+            history = _log_and_update_history(history, "Chapter accepted 'as is' per manual review. Routing to KB update.")
+            # Chapter quality is still considered "failed" from the last auto-review, but we are overriding that.
+            # The workflow will proceed as if it passed, but the score remains low.
+            # No need to change current_chapter_quality_passed here, as _should_retry_chapter won't run again for this.
+            next_node = "lore_keeper_update_kb"
+        else:
+            history = _log_and_update_history(history, f"Unknown action '{action}' from manual review. Defaulting to KB update.", True)
+            next_node = "lore_keeper_update_kb" # Fallback
+
+        # Clear manual review specific fields
+        state["chapter_pending_manual_review_id"] = None
+        state["chapter_content_for_manual_review"] = None
+        state["chapter_review_feedback_for_manual_review"] = None
+        state["user_made_decision_payload"] = None
+        state["workflow_status"] = f"running_after_manual_review_{action}" # Update status
+        state["history"] = history
+        return next_node
     else:
-        if auto_mode and not quality_passed and current_retry_count_for_this_chapter >= max_retries:
-            history = _log_and_update_history(history, f"Chapter failed quality, and max retries ({max_retries}) reached (current attempt count for this chapter: {current_retry_count_for_this_chapter}). Proceeding without further retry for this chapter.")
-            print(f"WARNING: Max retries reached for this chapter. Proceeding without further retries.")
-        elif not auto_mode and not quality_passed:
-            history = _log_and_update_history(history, "Chapter failed quality, but not in auto_mode. Proceeding without retry for this chapter.")
-            print("INFO: Chapter failed quality, but not in auto_mode. No retry for this chapter.")
-        elif quality_passed:
-            history = _log_and_update_history(history, "Chapter passed quality check. No retry needed for this chapter.")
-            print("INFO: Chapter passed quality. No retry needed for this chapter.")
+        # This is the initial call to prepare_for_manual_chapter_review, setting up the pause.
+        # The actual pause is handled by _check_workflow_pause_status after this node.
+        # So, if we are not resuming, it means we are pausing.
+        state["history"] = history # history already updated by the main part of prepare_for_manual_chapter_review
+        return "PAUSE_FOR_USER" # Special signal for graph to END this invocation.
 
-        # Reset current_chapter_retry_count to 0 for the *next* chapter if we are not retrying *this* one.
-        # This is important so the next chapter starts with a fresh retry count.
-        state["current_chapter_retry_count"] = 0
-        # Clearing of current_chapter_original_content and current_chapter_feedback_for_retry
-        # will be handled by the lore_keeper_update_kb node, as it's the last step for a chapter's processing.
-        state["history"] = history # Persist history update
-        print("DEBUG: _should_retry_chapter - Resetting current_chapter_retry_count to 0 (for the next chapter or if this one is finished). Proceeding to KB update.")
-        return "proceed_to_kb_update" # Route to lore_keeper_update_kb
 
 class WorkflowManager:
     def __init__(self, db_name="novel_mvp.db", mode="human"): # mode is now less relevant here, user_input drives it.
@@ -1881,237 +2513,79 @@ class WorkflowManager:
         else:
             current_state_snapshot["auto_decision_engine"] = None
 
-        # LoreKeeperAgent instance is not stored in state, agents create it as needed.
+        # Ensure db_name is present in the loaded state for agents that need it.
+        # If not already there from initial state, set it from the manager instance.
+        if "db_name" not in current_state_snapshot or not current_state_snapshot["db_name"]:
+            current_state_snapshot["db_name"] = self.db_name
 
-        # It's expected that user_made_decision_payload_json was set by API via record_user_decision
-        # And that pending_decision_type was cleared by record_user_decision
-        # So, the state loaded from DB should reflect that a decision *was* made.
-        # The decision_payload_from_api is the source of truth for applying the decision here.
-
-        # Basic validation (API layer should do more thorough validation against stored pending_decision_type)
-        # This is a sanity check within the resume logic.
-        # The `record_user_decision` in DB manager might have already cleared `pending_decision_type`
-        # so `current_state_snapshot["pending_decision_type"]` might be None here if loaded from DB after `record_user_decision`.
-        # The crucial part is that the API called this `resume_workflow` with the correct `decision_type_from_api`.
-
-        # Store the raw decision payload for the target node to process.
-        # Note: The specific handling below for outline/worldview will overwrite user_made_decision_payload.
-        # This is intentional as those nodes expect a simpler structure than conflict_review.
-        # current_state_snapshot["user_made_decision_payload"] = {"source_decision_type": decision_type_from_api, **decision_payload_from_api}
 
         history = current_state_snapshot.get("history", []) # Get history early for logging
 
+        # Apply the decision payload to the state. This will be processed by the relevant node.
+        current_state_snapshot["user_made_decision_payload"] = {
+            "source_decision_type": decision_type_from_api,
+            **decision_payload_from_api # This now includes custom_data for character_multi_selection
+        }
+
+        # Clear pending decision fields as they are now being processed
+        current_state_snapshot["pending_decision_type"] = None
+        current_state_snapshot["pending_decision_options"] = None
+        current_state_snapshot["pending_decision_prompt"] = None
+        current_state_snapshot["workflow_status"] = f"resuming_after_{decision_type_from_api}" # General resuming status
+        current_state_snapshot["error_message"] = None # Clear previous errors
+
+        history = _log_and_update_history(history, f"Resuming workflow for decision type '{decision_type_from_api}'. Payload set. New status: {current_state_snapshot['workflow_status']}")
+        current_state_snapshot["history"] = history
+        logger.info(f"Resuming workflow for {decision_type_from_api}. Payload: {decision_payload_from_api}. New status: {current_state_snapshot['workflow_status']}")
+
+
+        # Specific payload processing for some decision types if needed before node execution (mostly handled by nodes now)
         if decision_type_from_api == "outline_selection":
-            logger.info(f"Resuming workflow for outline_selection. Payload: {decision_payload_from_api}")
-            selected_id_str = decision_payload_from_api.get("selected_id")
-
-            if selected_id_str is None:
-                raise ValueError("Missing 'selected_id' in decision_payload_from_api for outline_selection.")
-            try:
-                selected_index = int(selected_id_str)
-            except ValueError:
-                raise ValueError(f"Invalid 'selected_id' format: '{selected_id_str}', must be an integer index for outline_selection.")
-
-            all_outlines = current_state_snapshot.get("all_generated_outlines")
-            if not all_outlines or not isinstance(all_outlines, list):
-                raise ValueError("State consistency error: 'all_generated_outlines' not found or not a list in snapshot during outline_selection.")
-            if not (0 <= selected_index < len(all_outlines)):
-                raise ValueError(f"Invalid selected_index {selected_index} for all_generated_outlines (length {len(all_outlines)}).")
-
-            current_state_snapshot["narrative_outline_text"] = all_outlines[selected_index]
-            current_state_snapshot["user_made_decision_payload"] = { # This will be processed by present_outlines_for_selection_cli
-                "source_decision_type": "outline_selection", # Helps the node identify the decision source
-                "selected_option_id": str(selected_index + 1) # present_outlines_cli expects 1-based ID
-            }
-            current_state_snapshot["pending_decision_type"] = None
-            current_state_snapshot["pending_decision_options"] = None
-            current_state_snapshot["pending_decision_prompt"] = None
-            current_state_snapshot["workflow_status"] = "running_after_outline_decision"
-            current_state_snapshot["history"] = _log_and_update_history(history, f"Resumed with API outline selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
-            logger.info(f"Applied outline selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
-
+            # The present_outlines_for_selection_cli node will handle the logic based on user_made_decision_payload
+            pass
         elif decision_type_from_api == "worldview_selection":
-            logger.info(f"Resuming workflow for worldview_selection. Payload: {decision_payload_from_api}")
-            selected_id_str = decision_payload_from_api.get("selected_id")
-
-            if selected_id_str is None:
-                raise ValueError("Missing 'selected_id' in decision_payload_from_api for worldview_selection.")
-            try:
-                selected_index = int(selected_id_str)
-            except ValueError:
-                raise ValueError(f"Invalid 'selected_id' format: '{selected_id_str}', must be an integer index for worldview_selection.")
-
-            all_worldviews = current_state_snapshot.get("all_generated_worldviews")
-            if not all_worldviews or not isinstance(all_worldviews, list):
-                raise ValueError("State consistency error: 'all_generated_worldviews' not found or not a list in snapshot during worldview_selection.")
-            if not (0 <= selected_index < len(all_worldviews)):
-                raise ValueError(f"Invalid selected_index {selected_index} for all_generated_worldviews (length {len(all_worldviews)}).")
-
-            current_state_snapshot["selected_worldview_detail"] = all_worldviews[selected_index]
-            current_state_snapshot["user_made_decision_payload"] = { # This will be processed by present_worldviews_for_selection_cli
-                "source_decision_type": "worldview_selection", # Helps the node identify
-                "selected_option_id": str(selected_index + 1) # present_worldviews_cli expects 1-based ID
-            }
-            current_state_snapshot["pending_decision_type"] = None
-            current_state_snapshot["pending_decision_options"] = None
-            current_state_snapshot["pending_decision_prompt"] = None
-            current_state_snapshot["workflow_status"] = "running_after_worldview_decision"
-            current_state_snapshot["history"] = _log_and_update_history(history, f"Resumed with API worldview selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
-            logger.info(f"Applied worldview selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
-
+            # The present_worldviews_for_selection_cli node will handle this
+            pass
+        elif decision_type_from_api == "character_multi_selection":
+            # The present_character_options_for_selection node will handle this
+            pass
         elif decision_type_from_api == "conflict_review":
-            current_state_snapshot["user_made_decision_payload"] = {"source_decision_type": decision_type_from_api, **decision_payload_from_api} # Ensure full payload for conflict review
-            original_content = current_state_snapshot.get("original_chapter_content_for_conflict_review")
-            conflicts_at_pause = current_state_snapshot.get("current_chapter_conflicts", []) # These are the conflicts presented to user
+            # Conflict review has more complex state changes that might need pre-processing here
+            # or ensure the prepare_conflict_review_for_api node handles it robustly when resuming.
+            # For now, the generic payload setting above is assumed to be sufficient for prepare_conflict_review_for_api
+            # to pick up the user's action.
+            # The logic within resume_workflow for conflict_review (applying suggestions etc.)
+            # needs to be carefully reviewed if it's still needed or if prepare_conflict_review_for_api
+            # should fully manage the state based on user_made_decision_payload.
+            # For this refactor, we assume prepare_conflict_review_for_api handles it.
+            # Removing the extensive conflict_review logic block from here.
+            logger.info(f"Conflict review decision received. Node 'prepare_conflict_review_for_api' will process: {decision_payload_from_api}")
+            # Ensure the user_made_decision_payload is correctly structured for prepare_conflict_review_for_api
+            # The generic setting above should suffice.
+            pass
+        elif decision_type_from_api == "plot_twist_selection":
+            # Ensure payload contains selected_option_id (which is the twist_opt_idx string)
+            # This is already generically handled by the user_made_decision_payload setup.
+            # The present_plot_twist_options_for_selection node will use this.
+            logger.info(f"Plot twist selection decision received. Node 'present_plot_twist_options_for_selection' will process: {decision_payload_from_api}")
+            pass
+        elif decision_type_from_api == "manual_chapter_review":
+            # Payload structure: {"action": "submit_edit" / "use_as_is", "edited_content_provided": bool}
+            # This is already set in user_made_decision_payload by the generic logic.
+            # The _route_after_prepare_manual_review node will process this.
+            logger.info(f"Manual chapter review decision received. Node '_route_after_prepare_manual_review' will process: {decision_payload_from_api}")
+            pass
 
-            # Correctly access action directly from the payload
-            action = decision_payload_from_api.get("action")
-            conflict_id_from_payload = decision_payload_from_api.get("conflict_id")
-            suggestion_index_from_payload = decision_payload_from_api.get("suggestion_index")
-            user_comment = decision_payload_from_api.get("user_comment") # Log this if present
-
-            history = current_state_snapshot.get("history", [])
-            if user_comment:
-                history = _log_and_update_history(history, f"User comment on conflict resolution action '{action}': {user_comment}")
-                current_state_snapshot["history"] = history
-
-            # This is the text that might have been modified by *previous* actions in the same review session
-            current_chapter_text_being_edited = current_state_snapshot.get("generated_chapters", [])[-1]["content"]
-
-            # This is the list of conflicts as presented to the user, potentially with 'llm_suggestions'
-            # We need to update this list in-place for 'resolution_status' for re-pausing.
-            # The options are List[DecisionOption] from API, which has full_data as the conflict dict
-            # So, pending_decision_options is List[Dict] where each dict is a DecisionOption structure.
-            # The actual conflict is in 'full_data' of that.
-            current_conflicts_for_review = current_state_snapshot.get("pending_decision_options", [])
-
-
-            if action == "apply_suggestion":
-                if not conflict_id_from_payload or suggestion_index_from_payload is None:
-                    current_state_snapshot["error_message"] = "apply_suggestion action requires conflict_id and suggestion_index."
-                else:
-                    target_conflict_option = next((c for c in current_conflicts_for_review if c["id"] == conflict_id_from_payload), None)
-                    if target_conflict_option and target_conflict_option["full_data"]:
-                        target_conflict_dict = target_conflict_option["full_data"] # This is the actual conflict dict
-                        original_excerpt = target_conflict_dict.get("excerpt")
-                        suggestions = target_conflict_dict.get("llm_suggestions", [])
-                        if original_excerpt and 0 <= suggestion_index_from_payload < len(suggestions):
-                            chosen_suggestion_text = suggestions[suggestion_index_from_payload]
-
-                            excerpt_start_index = current_chapter_text_being_edited.find(original_excerpt)
-                            if excerpt_start_index != -1:
-                                before_excerpt = current_chapter_text_being_edited[:excerpt_start_index]
-                                after_excerpt = current_chapter_text_being_edited[excerpt_start_index + len(original_excerpt):]
-                                current_chapter_text_being_edited = before_excerpt + chosen_suggestion_text + after_excerpt
-
-                                current_state_snapshot["generated_chapters"][-1]["content"] = current_chapter_text_being_edited
-                                target_conflict_dict["resolution_status"] = "applied_suggestion"
-                                target_conflict_dict["applied_suggestion_text"] = chosen_suggestion_text
-                                history = _log_and_update_history(history, f"Applied suggestion for conflict {conflict_id_from_payload}.")
-                                current_state_snapshot["history"] = history
-                            else:
-                                history = _log_and_update_history(history, f"Warning: Original excerpt for conflict {conflict_id_from_payload} not found in current text. Suggestion not applied.", True)
-                                target_conflict_dict["resolution_status"] = "apply_failed_excerpt_not_found"
-                        else:
-                             history = _log_and_update_history(history, f"Warning: Invalid suggestion index or missing excerpt for conflict {conflict_id_from_payload}.", True)
-                             if target_conflict_dict: target_conflict_dict["resolution_status"] = "apply_failed_invalid_suggestion"
-                    else:
-                        history = _log_and_update_history(history, f"Warning: Conflict ID {conflict_id_from_payload} not found for applying suggestion.", True)
-                # After applying one suggestion, we re-pause to show updated state.
-                current_state_snapshot["workflow_status"] = f"paused_for_conflict_review_ch_{current_state_snapshot.get('current_chapter_number')}"
-                # The user_made_decision_payload needs to signal to prepare_conflict_review_for_api that an action was taken
-                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "apply_suggestion"
-
-
-            elif action == "ignore_conflict":
-                if not conflict_id_from_payload:
-                    current_state_snapshot["error_message"] = "ignore_conflict action requires conflict_id."
-                else:
-                    target_conflict_option = next((c for c in current_conflicts_for_review if c["id"] == conflict_id_from_payload), None)
-                    if target_conflict_option and target_conflict_option["full_data"]:
-                        target_conflict_option["full_data"]["resolution_status"] = "ignored_by_user"
-                        history = _log_and_update_history(history, f"Conflict {conflict_id_from_payload} marked as ignored.")
-                        current_state_snapshot["history"] = history
-                    else:
-                        history = _log_and_update_history(history, f"Warning: Conflict ID {conflict_id_from_payload} not found for ignoring.", True)
-                current_state_snapshot["workflow_status"] = f"paused_for_conflict_review_ch_{current_state_snapshot.get('current_chapter_number')}"
-                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "ignore_conflict"
-
-
-            elif action == "rewrite_all_auto_remaining":
-                history = _log_and_update_history(history, "Attempting auto-resolve for remaining unresolved conflicts.")
-                current_state_snapshot["history"] = history
-
-                unresolved_conflicts = [
-                    c["full_data"] for c in current_conflicts_for_review
-                    if not c.get("full_data", {}).get("resolution_status")
-                ]
-                if unresolved_conflicts:
-                    llm_client = LLMClient()
-                    resolver_agent = ConflictResolutionAgent(llm_client=llm_client, db_name=self.db_name)
-                    novel_context = current_state_snapshot.get("user_input")
-
-                    revised_text = resolver_agent.attempt_auto_resolve(
-                        novel_id, current_chapter_text_being_edited, unresolved_conflicts, novel_context=novel_context
-                    )
-                    if revised_text and revised_text != current_chapter_text_being_edited:
-                        current_state_snapshot["generated_chapters"][-1]["content"] = revised_text
-                        history = _log_and_update_history(history, "Chapter text modified by 'rewrite_all_auto_remaining'.")
-                        current_state_snapshot["history"] = history
-                    else:
-                         history = _log_and_update_history(history, "'rewrite_all_auto_remaining' made no changes to text.")
-                         current_state_snapshot["history"] = history
-                else:
-                    history = _log_and_update_history(history, "No unresolved conflicts found for 'rewrite_all_auto_remaining'.")
-                    current_state_snapshot["history"] = history
-
-                # This action implies we are done with this pause cycle.
-                current_state_snapshot["workflow_status"] = "running_after_conflict_review"
-                current_state_snapshot["pending_decision_type"] = None
-                current_state_snapshot["pending_decision_options"] = None
-                current_state_snapshot["pending_decision_prompt"] = None
-                current_state_snapshot["original_chapter_content_for_conflict_review"] = None
-                current_state_snapshot["current_chapter_conflicts"] = [] # Assume all processed or remaining are accepted as is after auto attempt.
-                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "rewrite_all_auto_remaining"
-
-
-            elif action == "proceed_with_remaining":
-                history = _log_and_update_history(history, "Proceeding with remaining conflicts as they are.")
-                current_state_snapshot["history"] = history
-                # Mark all remaining unresolved conflicts
-                for c_option in current_conflicts_for_review:
-                    if not c_option.get("full_data",{}).get("resolution_status"):
-                        c_option["full_data"]["resolution_status"] = "proceeded_without_change"
-
-                current_state_snapshot["workflow_status"] = "running_after_conflict_review"
-                current_state_snapshot["pending_decision_type"] = None
-                current_state_snapshot["pending_decision_options"] = None # Cleared as we are proceeding
-                current_state_snapshot["pending_decision_prompt"] = None
-                current_state_snapshot["original_chapter_content_for_conflict_review"] = None
-                # current_chapter_conflicts might remain as is in state if some were ignored/proceeded, for record keeping,
-                # but they won't be presented again for this pause cycle. Or clear them. Let's clear.
-                current_state_snapshot["current_chapter_conflicts"] = []
-                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "proceed_with_remaining"
-
-            else: # Default or unknown action
-                history = _log_and_update_history(history, f"Unknown action '{action}' for conflict review. Defaulting to re-pause.")
-                current_state_snapshot["history"] = history
-                current_state_snapshot["workflow_status"] = f"paused_for_conflict_review_ch_{current_state_snapshot.get('current_chapter_number')}"
-                current_state_snapshot["user_made_decision_payload"]["action_taken_in_resume"] = "unknown_action"
-
-
-            # If an individual action was taken ("apply_suggestion", "ignore_conflict") that might re-pause,
-            # we need to update the pending_decision_options in the snapshot before saving it via update_novel_pause_state later.
-            if current_state_snapshot["workflow_status"].startswith("paused_for_conflict_review"):
-                 current_state_snapshot["pending_decision_options"] = current_conflicts_for_review # Save updated statuses
 
         # Common state updates for any decision type before re-invocation (some might be overridden by conflict logic)
         if not current_state_snapshot["workflow_status"].startswith("paused_for_"): # If not specifically re-paused by conflict logic
             current_state_snapshot["workflow_status"] = f"resuming_after_{decision_type_from_api}"
+            # These are already cleared above, but as a safeguard:
             current_state_snapshot["pending_decision_type"] = None
             current_state_snapshot["pending_decision_options"] = None
             current_state_snapshot["pending_decision_prompt"] = None
         current_state_snapshot["error_message"] = None # Clear previous errors before resuming
+
 
         num_chapters = current_state_snapshot.get("user_input", {}).get("chapters", 3)
         # Increment execution_count from the loaded state
@@ -2227,8 +2701,15 @@ class WorkflowManager:
         self.workflow.add_node("plot_architect", execute_plot_architect_agent)
         self.workflow.add_node("persist_plot", persist_plot_node)
         self.workflow.add_node("character_sculptor", execute_character_sculptor_agent)
+        self.workflow.add_node("present_character_options_for_selection", present_character_options_for_selection) # New Node
+        self.workflow.add_node("persist_selected_characters", persist_selected_characters) # New Node
         self.workflow.add_node("lore_keeper_initialize", execute_lore_keeper_initialize)
         self.workflow.add_node("prepare_for_chapter_loop", prepare_for_chapter_loop)
+        # Plot Twist Nodes
+        self.workflow.add_node("execute_plot_twist_agent", execute_plot_twist_agent)
+        self.workflow.add_node("present_plot_twist_options_for_selection", present_plot_twist_options_for_selection)
+        self.workflow.add_node("apply_selected_plot_twist", apply_selected_plot_twist)
+        # Regular Chapter Nodes
         self.workflow.add_node("context_synthesizer", execute_context_synthesizer_agent)
         self.workflow.add_node("chapter_chronicler", execute_chapter_chronicler_agent)
         self.workflow.add_node("content_integrity_review", execute_content_integrity_review) # Existing
@@ -2237,6 +2718,9 @@ class WorkflowManager:
         self.workflow.add_node("conflict_detection", execute_conflict_detection)
         self.workflow.add_node("execute_conflict_resolution_auto", execute_conflict_resolution_auto)
         self.workflow.add_node("prepare_conflict_review_for_api", prepare_conflict_review_for_api) # New node
+        self.workflow.add_node("execute_plot_twist_agent", execute_plot_twist_agent) # New Node
+        self.workflow.add_node("execute_outline_enhancement_agent", execute_outline_enhancement_agent) # New Node
+        self.workflow.add_node("prepare_for_manual_chapter_review", prepare_for_manual_chapter_review) # New Node
         self.workflow.add_node("increment_chapter_number", increment_chapter_number)
         self.workflow.add_node("cleanup_resources", cleanup_resources)
         self.workflow.add_node("generate_kb_visualization_data", generate_kb_visualization_data)
@@ -2252,9 +2736,19 @@ class WorkflowManager:
         # Then _check_node_output for persist_novel_record
         self.workflow.add_conditional_edges("persist_novel_record", _check_node_output, {"continue": "persist_initial_outline", "stop_on_error": END})
 
-        # Updated edges for Quality Guardian
         self.workflow.add_conditional_edges("persist_initial_outline", _check_node_output, {"continue": "outline_quality_guardian", "stop_on_error": END})
-        self.workflow.add_conditional_edges("outline_quality_guardian", _check_node_output, {"continue": "world_weaver", "stop_on_error": END})
+
+        # Outline Quality Guardian now leads to a decision point
+        self.workflow.add_conditional_edges("outline_quality_guardian", _check_node_output, {"continue": "_decide_outline_processing_path", "stop_on_error": END})
+        self.workflow.add_conditional_edges(
+            "_decide_outline_processing_path",
+            _decide_outline_processing_path,
+            {
+                "proceed_to_world_weaver": "world_weaver",
+                "enhance_outline": "execute_outline_enhancement_agent"
+            }
+        )
+        self.workflow.add_conditional_edges("execute_outline_enhancement_agent", _check_node_output, {"continue": "world_weaver", "stop_on_error": END})
 
         self.workflow.add_conditional_edges("world_weaver", _check_node_output, {"continue": "present_worldviews_cli", "stop_on_error": END})
 
@@ -2268,9 +2762,32 @@ class WorkflowManager:
 
         self.workflow.add_conditional_edges("plot_architect", _check_node_output, {"continue": "persist_plot", "stop_on_error": END})
         self.workflow.add_conditional_edges("persist_plot", _check_node_output, {"continue": "character_sculptor", "stop_on_error": END})
-        self.workflow.add_conditional_edges("character_sculptor", _check_node_output, {"continue": "lore_keeper_initialize", "stop_on_error": END})
+
+        # Character sculptor now leads to selection, then persistence
+        self.workflow.add_conditional_edges("character_sculptor", _check_node_output, {"continue": "present_character_options_for_selection", "stop_on_error": END})
+        self.workflow.add_conditional_edges("present_character_options_for_selection", _check_workflow_pause_status, {"WORKFLOW_PAUSED": END, "continue_workflow": "persist_selected_characters"})
+        self.workflow.add_conditional_edges("persist_selected_characters", _check_node_output, {"continue": "lore_keeper_initialize", "stop_on_error": END})
+
         self.workflow.add_conditional_edges("lore_keeper_initialize", _check_node_output, {"continue": "prepare_for_chapter_loop", "stop_on_error": END})
-        self.workflow.add_conditional_edges("prepare_for_chapter_loop", _check_node_output, {"continue": "context_synthesizer", "stop_on_error": END})
+
+        # Chapter Loop Start (from prepare_for_chapter_loop or increment_chapter_number)
+        # Instead of going directly to context_synthesizer, it first checks if a twist should be generated.
+        self.workflow.add_conditional_edges("prepare_for_chapter_loop", _check_node_output, {"continue": "_should_generate_twist", "stop_on_error": END})
+
+        self.workflow.add_conditional_edges(
+            "_should_generate_twist",
+            _should_generate_twist,
+            {
+                "generate_twist": "execute_plot_twist_agent",
+                "skip_twist": "context_synthesizer" # Skip to normal chapter flow
+            }
+        )
+
+        self.workflow.add_conditional_edges("execute_plot_twist_agent", _check_node_output, {"continue": "present_plot_twist_options_for_selection", "stop_on_error": "context_synthesizer"}) # If twist agent errors, fallback to normal flow
+        self.workflow.add_conditional_edges("present_plot_twist_options_for_selection", _check_workflow_pause_status, {"WORKFLOW_PAUSED": END, "continue_workflow": "apply_selected_plot_twist"})
+        self.workflow.add_conditional_edges("apply_selected_plot_twist", _check_node_output, {"continue": "context_synthesizer", "stop_on_error": END}) # After applying twist, proceed to context for (potentially new) chapter
+
+        # Regular chapter flow nodes
         self.workflow.add_conditional_edges("context_synthesizer", _check_node_output, {"continue": "chapter_chronicler", "stop_on_error": END})
         self.workflow.add_conditional_edges("chapter_chronicler", _check_node_output, {"continue": "content_integrity_review", "stop_on_error": END})
 
@@ -2281,10 +2798,27 @@ class WorkflowManager:
         })
 
         # should_retry_chapter conditional edges
-        self.workflow.add_conditional_edges("should_retry_chapter", _should_retry_chapter, {
-            "retry_chapter": "context_synthesizer",         # Loops back to context_synthesizer
-            "proceed_to_kb_update": "lore_keeper_update_kb" # Proceeds to lore_keeper_update_kb
-        })
+        self.workflow.add_conditional_edges(
+            "should_retry_chapter",
+            _should_retry_chapter,
+            {
+                "retry_chapter": "context_synthesizer",
+                "initiate_manual_review": "prepare_for_manual_chapter_review", # New path
+                "proceed_to_kb_update": "lore_keeper_update_kb"
+            }
+        )
+
+        # Edges for prepare_for_manual_chapter_review
+        # This node now uses a dedicated router function to handle both pausing and resuming logic.
+        self.workflow.add_conditional_edges(
+            "prepare_for_manual_chapter_review",
+            _route_after_prepare_manual_review,
+            {
+                "PAUSE_FOR_USER": END, # If pausing, end this graph run.
+                "RESUME_TO_REINTEGRITY_REVIEW": "content_integrity_review", # If resumed and chose edit
+                "RESUME_TO_KB_UPDATE": "lore_keeper_update_kb" # If resumed and chose use_as_is
+            }
+        )
 
         self.workflow.add_conditional_edges("lore_keeper_update_kb", _check_node_output, {"continue": "conflict_detection", "stop_on_error": END})
 
@@ -2315,15 +2849,15 @@ class WorkflowManager:
         })
 
         self.workflow.add_conditional_edges(
-            "increment_chapter_number", _should_continue_chapter_loop,
+            "increment_chapter_number", _should_continue_chapter_loop, # _should_continue_chapter_loop decides where to go next
             {
-                "continue_loop": "context_synthesizer",
+                "continue_loop": "_should_generate_twist", # Back to check for twist before next chapter
                 "end_loop": "cleanup_resources",
                 "end_loop_on_error": "cleanup_resources",
-                "end_loop_on_safety": "cleanup_resources"  # 新增安全退出条件
+                "end_loop_on_safety": "cleanup_resources"
             }
         )
-        self.workflow.add_conditional_edges("cleanup_resources", _check_node_output,
+        self.workflow.add_conditional_edges("cleanup_resources", _check_node_output, # type: ignore
                                            {"continue": "generate_kb_visualization_data",
                                             "stop_on_error": "generate_kb_visualization_data"}) # Try to generate data even if cleanup had issues
         self.workflow.add_conditional_edges("generate_kb_visualization_data", _check_node_output,
@@ -2356,7 +2890,10 @@ class WorkflowManager:
             all_generated_worldviews=None, selected_worldview_detail=None,
             worldview_id=None, worldview_data=None,
             plot_id=None, detailed_plot_data=None, plot_data=None,
-            characters=None, lore_keeper_initialized=False,
+            all_generated_character_options=None, # Initialize new field
+            selected_detailed_character_profiles=None, # Initialize new field
+            saved_characters_db_model=None, # Initialize renamed field
+            lore_keeper_initialized=False,
             current_chapter_number=0,
             total_chapters_to_generate=num_chapters,  # Use user-specified number
             generated_chapters=[],
@@ -2382,6 +2919,18 @@ class WorkflowManager:
             pending_decision_prompt=None,
             user_made_decision_payload=None,
             original_chapter_content_for_conflict_review=None,
+            # Plot Twist State Fields
+            available_plot_twist_options=None,
+            selected_plot_twist_option=None,
+            chapter_number_for_twist=None,
+            # Plot Branching State Fields
+            available_plot_branch_options=None,
+            selected_plot_branch_path=None,
+            chapter_number_for_branching=None,
+            # Manual Chapter Review State Fields
+            chapter_pending_manual_review_id=None,
+            chapter_content_for_manual_review=None,
+            chapter_review_feedback_for_manual_review=None,
             # 循环安全参数
             loop_iteration_count=0,
             max_loop_iterations=max(10, num_chapters * 3),  # 设置合理的最大迭代次数
@@ -2446,14 +2995,20 @@ if __name__ == "__main__":
             if isinstance(value, dict):
                 for r_key, r_value in value.items(): print(f"  {r_key.replace('_',' ').capitalize()}: {r_value}")
             else: print(f"  {value}")
-        elif key in ["all_generated_outlines", "all_generated_worldviews", "detailed_plot_data", "generated_chapters", "characters"] and isinstance(value, list):
+        elif key in ["all_generated_outlines", "all_generated_worldviews", "detailed_plot_data", "generated_chapters", "saved_characters_db_model", "selected_detailed_character_profiles"] and isinstance(value, list):
             print(f"{key.replace('_', ' ').capitalize()}: ({len(value)} items)")
             if value and isinstance(value[0], dict):
                 for i, item_dict in enumerate(value):
-                    item_summary = item_dict.get('title', item_dict.get('name', f"Item {i+1}"))
+                    item_summary = item_dict.get('title', item_dict.get('name', f"Item {i+1}")) # 'name' for characters
                     print(f"  - {item_summary} (details in full state if needed)")
-            elif value and isinstance(value[0], str):
+            elif value and isinstance(value[0], str): # e.g. for all_generated_outlines
                  for i, item_str in enumerate(value): print(f"  - Outline {i+1} Snippet: {item_str[:70]}...")
+        elif key == "all_generated_character_options" and isinstance(value, dict):
+            print(f"{key.replace('_', ' ').capitalize()}: ({sum(len(opts) for opts in value.values())} total options for {len(value)} concepts)")
+            for concept, opts_list in value.items():
+                print(f"  Concept '{concept}': {len(opts_list)} options")
+                if opts_list and isinstance(opts_list[0], dict):
+                    print(f"    - Option 1 Name: {opts_list[0].get('name', 'N/A')}")
         elif key == "knowledge_graph_data" and value:
             print("Knowledge Graph Data:")
             if isinstance(value, dict):

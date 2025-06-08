@@ -9,6 +9,7 @@ import json # Required for selected_worldview_detail in deprecated endpoint
 from src.orchestration.workflow_manager import WorkflowManager, NovelWorkflowState # Added NovelWorkflowState for typing
 from src.persistence.database_manager import DatabaseManager # Added DatabaseManager
 from src.agents.lore_keeper_agent import LoreKeeperAgent # Added for Knowledge Graph endpoint
+from src.core.models import PlotChapterDetail # Added for Plot Editing
 
 
 # --- Pydantic Models for API Request and Response ---
@@ -109,6 +110,49 @@ class CharacterResponse(BaseModel):
     role_in_story: Optional[str] = None
     raw_llm_output_for_character: Optional[str] = None
 
+# --- Pydantic Models for Plot Editing ---
+class PlotChapterDetailResponse(BaseModel):
+    chapter_number: int
+    title: str
+    estimated_words: Optional[int] = None
+    core_scene_summary: Optional[str] = None
+    characters_present: Optional[List[str]] = None
+    key_events_and_plot_progression: Optional[str] = None
+    goal_and_conflict: Optional[str] = None
+    turning_point: Optional[str] = None
+    tone_and_style_notes: Optional[str] = None
+    suspense_or_hook: Optional[str] = None
+    raw_llm_output_for_chapter: Optional[str] = None
+
+class PlotChapterDetailUpdateRequest(BaseModel):
+    chapter_number: Optional[int] = None
+    title: Optional[str] = None
+    estimated_words: Optional[int] = None
+    core_scene_summary: Optional[str] = None
+    characters_present: Optional[List[str]] = None
+    key_events_and_plot_progression: Optional[str] = None
+    goal_and_conflict: Optional[str] = None
+    turning_point: Optional[str] = None
+    tone_and_style_notes: Optional[str] = None
+    suspense_or_hook: Optional[str] = None
+    raw_llm_output_for_chapter: Optional[str] = None
+
+class PlotAddChapterDetailRequest(BaseModel):
+    chapter_number: int
+    title: str
+    estimated_words: Optional[int] = None
+    core_scene_summary: Optional[str] = None
+    characters_present: Optional[List[str]] = None
+    key_events_and_plot_progression: Optional[str] = None
+    goal_and_conflict: Optional[str] = None
+    turning_point: Optional[str] = None
+    tone_and_style_notes: Optional[str] = None
+    suspense_or_hook: Optional[str] = None
+    raw_llm_output_for_chapter: Optional[str] = None
+
+class PlotReorderRequest(BaseModel):
+    plot_chapter_details: List[PlotChapterDetailResponse]
+
 
 # --- New/Updated Pydantic Models for Novel Generation ---
 
@@ -145,16 +189,19 @@ class DecisionPromptResponse(BaseModel):
     prompt_message: Optional[str] = None
     options: Optional[List[DecisionOption]] = None
     workflow_status: str # e.g. "paused_for_outline_selection", "running", "completed"
+    context_data: Optional[Dict[str, Any]] = None # For providing additional data like chapter content for review
+
+class ManualChapterReviewRequest(BaseModel):
+    edited_content: Optional[str] = None
+    action: str # e.g., "submit_edit", "use_as_is"
 
 class DecisionSubmissionRequest(BaseModel):
     action: str  # e.g., "apply_suggestion", "ignore_conflict", "rewrite_all_auto_remaining", "proceed_with_remaining"
     conflict_id: Optional[str] = None # ID of the specific conflict, if action is conflict-specific
     suggestion_index: Optional[int] = None # Index of the LLM suggestion, if action is "apply_suggestion"
     user_comment: Optional[str] = None # Optional notes from user
-    # selected_option_id is removed as conflict_id is more specific for this context.
-    # custom_data is removed in favor of specific fields for conflict decisions.
-    # If this model is used for other decision types later, it might need to be more generic
-    # or have other models for other decision types. For now, tailor to conflict review.
+    selected_id: Optional[str] = None # For single-choice selections like outline/worldview
+    custom_data: Optional[Dict[str, Any]] = None # For multi-part selections like character concepts
 
 class ResumeWorkflowResponse(BaseModel):
     novel_id: int
@@ -398,9 +445,27 @@ async def get_next_human_decision(novel_id: int):
                     text_summary=conflict_dict.get("description", "N/A")[:150],
                     full_data=conflict_dict
                 ))
-        elif options_list: # For other decision types like outline/worldview
-             api_ready_options = [DecisionOption(**opt) for opt in options_list]
-
+        elif options_list and pending_decision_type == "character_multi_selection":
+            # options_data for character_multi_selection is List[Dict],
+            # where each dict has "concept_id", "concept_display_name", "profiles" (List[Dict])
+            # We need to transform this into List[DecisionOption] for the API.
+            # Each DecisionOption will represent one "concept" to choose for.
+            for concept_choice_group in options_data: # options_data was parsed from options_json
+                api_ready_options.append(DecisionOption(
+                    id=concept_choice_group.get("concept_id", str(uuid.uuid4())), # ID for the concept choice itself
+                    text_summary=f"Select character for: {concept_choice_group.get('concept_display_name', 'Unknown Concept')}",
+                    full_data=concept_choice_group.get("profiles", []) # This is List[{option_id, name, summary}]
+                ))
+        elif options_list and pending_decision_type == "plot_twist_selection":
+            # options_data for plot_twist_selection is already List[DecisionOption-like dicts]
+            # Each dict has "id", "text_summary", "full_data" (which is the PlotChapterDetail dict)
+            api_ready_options = [DecisionOption(**opt) for opt in options_data]
+        elif options_list and pending_decision_type == "plot_branch_selection":
+            # Similar to plot_twist_selection, options_data is List[DecisionOption-like dicts]
+            # Each dict has "id", "text_summary", and "full_data" (which could be the first chapter of the branch or summary)
+            api_ready_options = [DecisionOption(**opt) for opt in options_data]
+        elif options_list: # For other existing decision types like outline/worldview
+             api_ready_options = [DecisionOption(**opt) for opt in options_data] # Use options_data directly
 
         return DecisionPromptResponse(
             novel_id=novel_id,
@@ -418,6 +483,45 @@ async def get_next_human_decision(novel_id: int):
             options=[],
             workflow_status=workflow_status
         )
+
+    elif workflow_status and workflow_status.startswith("paused_for_manual_chapter_review") and pending_decision_type == "manual_chapter_review":
+        # For manual_chapter_review, the options are actions, and context_data holds the chapter details
+        context_data_for_response = {}
+        if decision_info.get("full_workflow_state_json"):
+            try:
+                full_state = json.loads(decision_info["full_workflow_state_json"])
+                context_data_for_response = {
+                    "chapter_pending_manual_review_id": full_state.get("chapter_pending_manual_review_id"),
+                    "chapter_content_for_manual_review": full_state.get("chapter_content_for_manual_review"),
+                    "chapter_review_feedback_for_manual_review": full_state.get("chapter_review_feedback_for_manual_review")
+                }
+            except json.JSONDecodeError:
+                print(f"API Error: Could not parse full_workflow_state_json for manual_chapter_review context for novel {novel_id}")
+                # Not raising HTTPException here, but context_data might be incomplete.
+
+        # Define fixed options for manual_chapter_review
+        api_ready_options = [
+            DecisionOption(id="submit_edit", text_summary="Submit with edits (provide edited_content in request body)"),
+            DecisionOption(id="use_as_is", text_summary="Use current version as is (no edits needed)")
+        ]
+
+        return DecisionPromptResponse(
+            novel_id=novel_id,
+            decision_type=pending_decision_type,
+            prompt_message=prompt_message or f"Chapter requires manual review. Please take an action.",
+            options=api_ready_options,
+            workflow_status=workflow_status,
+            context_data=context_data_for_response
+        )
+    else: # Default case if no specific paused state matches but decision_info was found
+        return DecisionPromptResponse(
+            novel_id=novel_id,
+            decision_type=pending_decision_type, # May be None
+            prompt_message=prompt_message or "Workflow is in an intermediate state.",
+            options=api_ready_options if 'api_ready_options' in locals() and api_ready_options is not None else [], # Ensure api_ready_options is defined
+            workflow_status=workflow_status
+        )
+
 
 def resume_novel_workflow_task(novel_id: int, decision_type: str, decision_payload_dict: dict, db_name_for_task: str):
     print(f"Background task to RESUME workflow for novel_id: {novel_id}, decision: {decision_type}")
@@ -496,12 +600,26 @@ async def submit_human_decision(
         if payload.selected_id is None: # selected_id is on DecisionSubmissionRequest but Optional
             raise HTTPException(status_code=422, detail=f"For '{decision_type_param}' action '{action}', 'selected_id' is required.")
     elif decision_type_param == "worldview_selection":
-        if payload.selected_id is None:
+        if payload.selected_id is None: # Assuming 'selected_id' is used for single choice outline/worldview
             raise HTTPException(status_code=422, detail=f"For '{decision_type_param}' action '{action}', 'selected_id' is required.")
+    elif decision_type_param == "character_multi_selection":
+        if not payload.custom_data or not isinstance(payload.custom_data, dict):
+            raise HTTPException(status_code=422, detail=f"For 'character_multi_selection', 'custom_data' dictionary is required with selections.")
+        # Further validation of custom_data structure can be added here if needed
+        # e.g. ensuring it's {"concept_id": "profile_option_id", ...}
+        # WorkflowManager node will handle the actual logic of these selections.
+    elif decision_type_param == "plot_twist_selection":
+        if payload.selected_id is None: # A single choice (one twist option, or "no twist")
+            raise HTTPException(status_code=422, detail=f"For 'plot_twist_selection', 'selected_id' is required.")
+    elif decision_type_param == "plot_branch_selection":
+        if payload.selected_id is None: # A single choice (one branch path, or "no branch")
+            raise HTTPException(status_code=422, detail=f"For 'plot_branch_selection', 'selected_id' is required.")
+    # Note: "manual_chapter_review" is handled by a different endpoint, so no specific validation here.
 
     # Add more decision_type_param checks and their required payload fields as necessary.
 
-    user_decision_payload_json = payload.model_dump_json(exclude_none=True)
+    # user_decision_payload_json will include custom_data due to exclude_none=False (default) or if custom_data is not None
+    user_decision_payload_json = payload.model_dump_json(exclude_none=True) # Keep exclude_none=True if that's desired policy
     new_db_status = f"resuming_with_decision_{decision_type_param}"
 
     try:
@@ -520,6 +638,65 @@ async def submit_human_decision(
         status_after_resume_trigger=new_db_status
     )
 
+@app.post("/novels/{novel_id}/chapters/{chapter_db_id}/manual_review", response_model=ResumeWorkflowResponse, tags=["Human Decisions"])
+async def submit_manual_chapter_review(
+    novel_id: int,
+    chapter_db_id: int,
+    payload: ManualChapterReviewRequest,
+    background_tasks: BackgroundTasks
+):
+    print(f"API: Received manual review for Novel ID {novel_id}, Chapter DB ID {chapter_db_id}, Action: {payload.action}")
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+
+    novel_check = db_manager.get_novel_by_id(novel_id)
+    if not novel_check:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    loaded_info = db_manager.load_workflow_snapshot_and_decision_info(novel_id)
+    if not loaded_info or loaded_info.get("workflow_status") != "paused_for_manual_chapter_review" or loaded_info.get("pending_decision_type") != "manual_chapter_review":
+        raise HTTPException(status_code=409, detail=f"Novel {novel_id} is not currently awaiting manual chapter review or decision type mismatch.")
+
+    if not loaded_info.get("full_workflow_state_json"):
+        raise HTTPException(status_code=500, detail="Full workflow state JSON missing for manual review validation.")
+
+    try:
+        workflow_state = json.loads(loaded_info["full_workflow_state_json"])
+        state_chapter_id = workflow_state.get('chapter_pending_manual_review_id')
+        if state_chapter_id != chapter_db_id:
+            raise HTTPException(status_code=409, detail=f"Conflict: Manual review submitted for chapter {chapter_db_id}, but workflow is paused for chapter {state_chapter_id}.")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse workflow state for validation.")
+
+    if payload.action == "submit_edit":
+        if payload.edited_content is None:
+            raise HTTPException(status_code=422, detail="For 'submit_edit' action, 'edited_content' is required.")
+        try:
+            if not db_manager.update_chapter_content(chapter_db_id, payload.edited_content):
+                # This might happen if chapter_db_id is invalid, though prior checks should catch novel-level issues.
+                raise HTTPException(status_code=500, detail=f"Failed to update chapter content in database for chapter ID {chapter_db_id}.")
+            print(f"API: Chapter {chapter_db_id} content updated successfully via manual review.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Database error updating chapter content: {e}")
+    elif payload.action == "use_as_is":
+        print(f"API: Chapter {chapter_db_id} to be used as is, per manual review.")
+    else:
+        raise HTTPException(status_code=422, detail=f"Invalid action: '{payload.action}'. Must be 'submit_edit' or 'use_as_is'.")
+
+    decision_data_for_workflow = {"action": payload.action, "edited_content_provided": payload.edited_content is not None}
+    new_db_status = f"resuming_with_manual_review_{payload.action}"
+
+    try:
+        db_manager.record_user_decision(novel_id, "manual_chapter_review", json.dumps(decision_data_for_workflow), new_workflow_status=new_db_status)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to record manual review decision in database: {e}")
+
+    background_tasks.add_task(resume_novel_workflow_task, novel_id, "manual_chapter_review", decision_data_for_workflow, DB_FILE_NAME)
+
+    return ResumeWorkflowResponse(
+        novel_id=novel_id,
+        message=f"Manual review decision for chapter {chapter_db_id} ('{payload.action}') received. Workflow resumption triggered.",
+        status_after_resume_trigger=new_db_status
+    )
 
 # --- Existing Endpoints (Kept for now) ---
 @app.post("/generate/narrative_outline", response_model=NarrativeResponse, deprecated=True)
@@ -872,6 +1049,235 @@ async def update_novel_worldview(novel_id: int, worldview_id: int, payload: Worl
         return WorldviewResponse(**updated_worldview_data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred while updating worldview: {str(e)}")
+
+# --- Plot Editing Endpoints ---
+@app.get("/novels/{novel_id}/plot", response_model=List[PlotChapterDetailResponse], tags=["Plot Editing"])
+async def get_novel_plot(novel_id: int):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    # Assume get_novel_by_id also checks existence
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    plot_record = db_manager.get_active_plot_for_novel(novel_id) # Conceptual
+    if not plot_record:
+        # If no plot record, it might mean no plot details yet. Return empty list.
+        return []
+
+    try:
+        plot_details_dicts = json.loads(plot_record['plot_summary']) if plot_record['plot_summary'] else []
+        return [PlotChapterDetailResponse(**detail) for detail in plot_details_dicts]
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse plot summary from database.")
+    except Exception as e:
+        # import traceback; traceback.print_exc();
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+
+@app.post("/novels/{novel_id}/plot/chapters", response_model=PlotChapterDetailResponse, status_code=201, tags=["Plot Editing"])
+async def add_plot_chapter_detail(novel_id: int, payload: PlotAddChapterDetailRequest):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    plot_record = db_manager.get_active_plot_for_novel(novel_id) # Conceptual
+    if not plot_record:
+        # If no plot exists, we might need to create one.
+        # For now, assume this means the plot_summary is empty or needs to be initialized.
+        # This part depends on how active_plot_id is managed and if a Plot entry is created with a novel.
+        # Let's assume a plot record MUST exist, and if it's new, plot_summary is empty.
+        # If get_active_plot_for_novel can return None, and a new plot needs to be created,
+        # that logic would be here or in the DB manager.
+        # For this subtask, we'll assume plot_record is fetched or created by get_active_plot_for_novel,
+        # and if it's truly new, its plot_summary is an empty list JSON.
+        # If get_active_plot_for_novel itself raises an error if no plot infrastructure, that's also fine.
+        # Let's proceed assuming plot_record is valid, and plot_summary can be '[]' or null.
+        # A more robust solution might be:
+        # plot_id = novel.get('active_plot_id')
+        # if not plot_id:
+        #     plot_id = db_manager.create_plot_for_novel(novel_id) # Conceptual
+        #     db_manager.set_active_plot_for_novel(novel_id, plot_id) # Conceptual
+        # plot_record = db_manager.get_plot_by_id(plot_id) # Conceptual
+        # For now, we simplify: if no plot_record, raise error, or expect it to be creatable by DB methods.
+        # Let's stick to the prompt: "Fetches the active plot for the novel. If none, potentially create... or raise..."
+        # Raising an error if no plot record exists is simpler for now.
+        raise HTTPException(status_code=404, detail=f"Active plot not found for novel {novel_id}. Cannot add chapter detail.")
+
+
+    try:
+        plot_details_list = json.loads(plot_record['plot_summary']) if plot_record['plot_summary'] else []
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse existing plot summary.")
+
+    new_chapter_number = payload.chapter_number
+    # Check if chapter number already exists
+    if any(pcd['chapter_number'] == new_chapter_number for pcd in plot_details_list):
+        raise HTTPException(status_code=409, detail=f"Chapter number {new_chapter_number} already exists in the plot.")
+
+    new_plot_chapter_detail = PlotChapterDetail(**payload.model_dump())
+    plot_details_list.append(new_plot_chapter_detail)
+    # Ensure list is sorted by chapter_number before saving, though append might be to a specific place if not just end.
+    # The prompt for POST implies adding, and chapter_number is in payload.
+    # A better UX might be to auto-assign chapter_number if not provided, or always re-sort.
+    # For now, trust payload's chapter_number and check for conflict.
+    plot_details_list.sort(key=lambda x: x['chapter_number'])
+
+
+    updated_plot_summary_json = json.dumps(plot_details_list)
+    # Conceptual: db_manager.update_plot_summary(plot_id, updated_plot_summary_json)
+    success = db_manager.update_plot_summary(plot_record['id'], updated_plot_summary_json) # Conceptual
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update plot summary in database.")
+
+    return PlotChapterDetailResponse(**new_plot_chapter_detail)
+
+
+@app.put("/novels/{novel_id}/plot/chapters/{chapter_number}", response_model=PlotChapterDetailResponse, tags=["Plot Editing"])
+async def update_plot_chapter_detail(novel_id: int, chapter_number: int, payload: PlotChapterDetailUpdateRequest):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    plot_record = db_manager.get_active_plot_for_novel(novel_id) # Conceptual
+    if not plot_record or not plot_record['plot_summary']:
+        raise HTTPException(status_code=404, detail=f"No plot details found for novel {novel_id} to update.")
+
+    try:
+        plot_details_list = json.loads(plot_record['plot_summary'])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse plot summary from database.")
+
+    target_chapter_dict = None
+    chapter_index = -1
+    for i, pcd_dict in enumerate(plot_details_list):
+        if pcd_dict.get('chapter_number') == chapter_number:
+            target_chapter_dict = pcd_dict
+            chapter_index = i
+            break
+
+    if not target_chapter_dict:
+        raise HTTPException(status_code=404, detail=f"Chapter {chapter_number} not found in plot for novel {novel_id}.")
+
+    update_data = payload.model_dump(exclude_unset=True) # Get only provided fields
+
+    # If chapter_number is being updated, check for conflict
+    if 'chapter_number' in update_data and update_data['chapter_number'] != chapter_number:
+        new_cn = update_data['chapter_number']
+        if any(pcd['chapter_number'] == new_cn for pcd in plot_details_list if pcd['chapter_number'] != chapter_number):
+            raise HTTPException(status_code=409, detail=f"Desired chapter number {new_cn} already exists.")
+
+    # Update the dictionary
+    for key, value in update_data.items():
+        target_chapter_dict[key] = value
+
+    # If chapter_number changed, re-sort
+    if 'chapter_number' in update_data:
+        plot_details_list.sort(key=lambda x: x['chapter_number'])
+
+
+    updated_plot_summary_json = json.dumps(plot_details_list)
+    # Conceptual: db_manager.update_plot_summary(plot_id, updated_plot_summary_json)
+    success = db_manager.update_plot_summary(plot_record['id'], updated_plot_summary_json) # Conceptual
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update plot summary in database.")
+
+    # Find the potentially moved chapter to return its latest state
+    # This is a bit inefficient but ensures we return the correct, possibly re-sorted, item
+    final_target_chapter_dict = None
+    for pcd_dict in plot_details_list:
+        # If chapter_number was part of update_data, use its new value for search, else old chapter_number
+        search_cn = update_data.get('chapter_number', chapter_number)
+        if pcd_dict.get('chapter_number') == search_cn:
+             final_target_chapter_dict = pcd_dict
+             break
+
+    if not final_target_chapter_dict:
+        # Should not happen if update was successful and list is consistent
+        raise HTTPException(status_code=500, detail="Error retrieving updated chapter details post-update.")
+
+
+    return PlotChapterDetailResponse(**final_target_chapter_dict)
+
+
+@app.delete("/novels/{novel_id}/plot/chapters/{chapter_number}", status_code=204, tags=["Plot Editing"])
+async def delete_plot_chapter_detail(novel_id: int, chapter_number: int):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    plot_record = db_manager.get_active_plot_for_novel(novel_id) # Conceptual
+    if not plot_record or not plot_record['plot_summary']:
+        raise HTTPException(status_code=404, detail=f"No plot details found for novel {novel_id} to delete from.")
+
+    try:
+        plot_details_list = json.loads(plot_record['plot_summary'])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse plot summary from database.")
+
+    initial_len = len(plot_details_list)
+    plot_details_list = [pcd for pcd in plot_details_list if pcd.get('chapter_number') != chapter_number]
+
+    if len(plot_details_list) == initial_len:
+        raise HTTPException(status_code=404, detail=f"Chapter {chapter_number} not found in plot for novel {novel_id}.")
+
+    # Re-number chapters to ensure they are sequential
+    plot_details_list.sort(key=lambda x: x['chapter_number']) # Sort first in case they weren't (e.g. after a PUT)
+    for i, pcd_dict in enumerate(plot_details_list):
+        pcd_dict['chapter_number'] = i + 1
+
+    updated_plot_summary_json = json.dumps(plot_details_list)
+    # Conceptual: db_manager.update_plot_summary(plot_id, updated_plot_summary_json)
+    success = db_manager.update_plot_summary(plot_record['id'], updated_plot_summary_json) # Conceptual
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update plot summary in database after deletion.")
+
+    return None # FastAPI will return 204 No Content
+
+
+@app.put("/novels/{novel_id}/plot/reorder", response_model=List[PlotChapterDetailResponse], tags=["Plot Editing"])
+async def reorder_plot_chapters(novel_id: int, payload: PlotReorderRequest):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    plot_record = db_manager.get_active_plot_for_novel(novel_id) # Conceptual
+    if not plot_record: # If there's no plot record, there's nothing to reorder.
+        raise HTTPException(status_code=404, detail=f"Active plot not found for novel {novel_id}. Cannot reorder.")
+
+    try:
+        existing_plot_details = json.loads(plot_record['plot_summary']) if plot_record['plot_summary'] else []
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse existing plot summary from database.")
+
+    if len(payload.plot_chapter_details) != len(existing_plot_details):
+        raise HTTPException(status_code=400, detail="Reorder list length does not match existing plot details length.")
+
+    # Convert Pydantic models from payload to dicts for PlotChapterDetail structure
+    # Assuming PlotChapterDetailResponse has all fields of PlotChapterDetail or can be cast
+    reordered_plot_dicts = []
+    for i, pcd_response_model in enumerate(payload.plot_chapter_details):
+        # Convert Pydantic model to dict. Ensure all fields required by PlotChapterDetail are present.
+        # This might require careful mapping if PlotChapterDetailResponse diverges significantly.
+        # For now, direct model_dump is used.
+        new_detail_dict = pcd_response_model.model_dump()
+        new_detail_dict['chapter_number'] = i + 1 # Assign new chapter number based on order
+        reordered_plot_dicts.append(new_detail_dict)
+
+    # Validate that all original chapter numbers are present in the new order, if strictness is needed.
+    # For now, we trust the client sends all items.
+
+    updated_plot_summary_json = json.dumps(reordered_plot_dicts)
+    # Conceptual: db_manager.update_plot_summary(plot_id, updated_plot_summary_json)
+    success = db_manager.update_plot_summary(plot_record['id'], updated_plot_summary_json) # Conceptual
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update reordered plot summary in database.")
+
+    # Return the reordered list as PlotChapterDetailResponse
+    return [PlotChapterDetailResponse(**detail) for detail in reordered_plot_dicts]
 
 
 # --- Main Application Execution ---
