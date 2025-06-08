@@ -5,6 +5,7 @@ import json
 
 from src.orchestration.workflow_manager import WorkflowManager, NovelWorkflowState, UserInput, _should_retry_chapter
 from src.persistence.database_manager import DatabaseManager
+from src.core.auto_decision_engine import AutoDecisionEngine # Added for isinstance check
 # It's good practice to mock the actual classes you intend to mock later
 from src.agents.content_integrity_agent import ContentIntegrityAgent
 from src.agents.conflict_detection_agent import ConflictDetectionAgent
@@ -715,18 +716,24 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         mock_db_instance = MockDatabaseManager.return_value
 
         paused_state_snapshot = self._get_minimal_state_for_api_decision_pause(decision_type="outline_selection")
+        # Set auto_mode to True in the user_input of the snapshot for this test
+        paused_state_snapshot['user_input']['auto_mode'] = True
+
         paused_state_snapshot.update({
             "all_generated_outlines": ["Outline 1 text", "Outline 2 text", "Outline 3 text"],
             "pending_decision_type": "outline_selection",
             "workflow_status": "paused_for_outline_selection",
-            "execution_count": 1
+            "execution_count": 1,
         })
 
         mock_db_instance.load_workflow_snapshot_and_decision_info.return_value = {
             "full_workflow_state_json": json.dumps(paused_state_snapshot)
         }
 
-        manager = WorkflowManager(db_name=self.db_name)
+        # Instantiate manager in "auto" mode so it has its own self.auto_decision_engine
+        manager = WorkflowManager(db_name=self.db_name, mode="auto")
+        self.assertIsNotNone(manager.auto_decision_engine, "Manager should have an ADE instance in auto mode")
+
         manager.app = MagicMock()
         manager.app.invoke.side_effect = lambda state, config: state
 
@@ -745,6 +752,13 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         self.assertEqual(state_passed_to_invoke["user_made_decision_payload"]["selected_option_id"], "2")
         self.assertEqual(state_passed_to_invoke["user_made_decision_payload"]["source_decision_type"], "outline_selection")
         self.assertEqual(state_passed_to_invoke["execution_count"], 2)
+
+        # Assertions for auto_decision_engine re-initialization
+        # Given paused_state_snapshot['user_input']['auto_mode'] = True and manager was init in "auto" mode
+        self.assertIsNotNone(state_passed_to_invoke.get("auto_decision_engine"),
+                             "auto_decision_engine should be re-initialized in state if auto_mode is True.")
+        self.assertEqual(state_passed_to_invoke.get("auto_decision_engine"), manager.auto_decision_engine,
+                             "auto_decision_engine in state should be the same instance as manager's ADE when manager is in auto_mode.")
 
         mock_db_instance.update_novel_status_after_resume.assert_called_once()
         args_db_update = mock_db_instance.update_novel_status_after_resume.call_args[0]

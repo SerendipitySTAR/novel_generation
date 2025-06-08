@@ -27,7 +27,7 @@ This document tracks the implementation status of features and components descri
     *   `[x]` Chapter generation loop structure implemented.
     *   `[x]` Global state management within workflow (MVP level).
     *   [p] Automated chapter quality control via ContentIntegrityAgent scores, including a retry mechanism for low-quality chapters in Auto-Mode.
-    *   [p] Integration of human input nodes for user decisions: API-driven human mode for Outline and Worldview selection is now functional (WorkflowManager pauses, saves state to DB, and resumes with API-provided choice; unit tested). Conflict review capabilities also include API pause/resume with granular actions and LLM suggestions. Full E2E backend testing for all human decision types is the next step for refinement.
+    *   [p] Integration of human input nodes for user decisions: API-driven human mode for Outline, Worldview, and Conflict Review decisions is functional with backend logic and unit tests in place. An initial cycle of (conceptual) E2E testing and refinement for these API flows has been completed (addressing state serialization, API error handling). Continuous E2E testing and further refinement needed.
     *   [p] Mode-specific conflict handling: Auto-Mode now attempts auto-resolution via (stub) `ConflictResolutionAgent`. Human-Mode (API) now prepares conflict data using (stub) `ConflictResolutionAgent` and pauses for user decision via API.
 *   **[p] Agent Layer (AL - README 4.3)**
     *   (Individual agent status below)
@@ -171,7 +171,7 @@ This document tracks the implementation status of features and components descri
 *   **[p] Phase 3.A: Real-Use Enablement - Live Workflow Hardening & Quality Pass (Revised Focus)**
     *   `[x]` Enhance RAG Context Logging.
     *   `[x]` Initial Quality Pass on Prompts (Content Focus for PlotArchitect, CharacterSculptor, ChapterChronicler DONE).
-    *   [p] (Implicit) Intensive Live End-to-End Workflow Testing: CLI (`main.py`) testing ongoing. API E2E test scripts (`scripts/e2e_tests/`) developed. Execution, analysis of results, and subsequent code refinement are now key activities.
+    *   [p] (Implicit) Intensive Live End-to-End Workflow Testing: CLI (`main.py`) testing ongoing. API E2E test scripts (`scripts/e2e_tests/`) developed and an initial cycle of (conceptual) execution and backend code refinement has been performed. Continuous execution and further refinement based on real-world/simulated usage needed.
     *   [ ] (Implicit) Critical Bug Fixing & Parser Robustness (Iterative) - Initial major pass done, ongoing as needed.
     *   [ ] (Implicit) RAG System - Live Functional Check - Basic logging in place, deeper functional check & tuning needed.
     *   [ ] (Implicit) Basic Coherence Review - Initial conceptual review done, ongoing with live tests.
@@ -179,7 +179,7 @@ This document tracks the implementation status of features and components descri
     *   `[p]` Develop the core features of the Web interface:
         *   `[p]` FastAPI backend: Implemented `POST /novels/` for async generation start.
         *   `[p]` FastAPI backend: Implemented `GET /novels/{novel_id}/status` for status checks.
-        *   [p] FastAPI backend: Implemented `GET /decisions/next` and `POST /decisions/{type}` endpoints. `WorkflowManager` now fully supports API-driven pause/resume for Outline, Worldview, and Conflict Review decisions (including granular conflict actions and re-pausing). Backend logic and unit tests are complete. E2E test scripts (`scripts/e2e_tests/`) developed for these API flows; execution and iterative refinement based on test results is next.
+        *   [p] FastAPI backend: Core endpoints for async generation, status, KB viz, and human decisions (Outline, Worldview, Conflict Review with granular actions and re-pausing) are implemented. `WorkflowManager` supports these API-driven flows with DB state persistence. Unit tests and E2E test scripts are in place. Initial cycle of (conceptual) E2E testing and backend refinement completed. Further E2E testing and hardening ongoing.
         *   `[ ]` Frontend UI (React/Vue/Svelte etc.) (TODO).
     *   `[p]` Implement visual management of the knowledge base:
         *   `[p]` FastAPI backend: Implemented `GET /novels/{novel_id}/knowledge_graph` to serve KB data.
@@ -204,7 +204,7 @@ This document tracks the implementation status of features and components descri
 *   **[p] Testing & Quality Assurance (README 11)**
     *   [p] Unit tests (Basic `if __name__ == '__main__'` tests for agents; More comprehensive unittest suites for key agents like ConflictDetectionAgent, ContextSynthesizerAgent).
     *   `[p]` Integration tests (Workflow manager tests with mocked/live agent interactions).
-    *   [p]` End-to-end tests (CLI `main.py` for basic E2E. Python scripts in `scripts/e2e_tests/` created for API-driven Auto-Mode (AM-1 full run, AM-3 conflict path) and Human-Mode (HM-1 full lifecycle including multi-step conflict review, HM-2 API error handling). Execution and refinement of these API E2E tests is next).
+    *   [p]` End-to-end tests (CLI `main.py` for basic E2E. Python scripts in `scripts/e2e_tests/` cover API-driven Auto-Mode and Human-Mode scenarios. Initial (conceptual) execution cycle completed, leading to backend refinements for state serialization and API error handling. Continuous E2E testing needed).
     *   `[ ]` Dedicated KB testing, consistency testing, prompt performance testing, UAT (TODO).
 *   **[ ] Deployment & Ops (README 12)** (TODO).
 

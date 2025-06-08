@@ -371,18 +371,48 @@ async def submit_human_decision(
     print(f"API: Received decision for Novel ID {novel_id}, Type: {decision_type_param}, Payload: {payload.model_dump_json(exclude_none=True)}")
     db_manager = DatabaseManager(db_name=DB_FILE_NAME)
 
+    # Explicit novel existence check (though load_workflow_snapshot_and_decision_info often implies it)
+    novel_check = db_manager.get_novel_by_id(novel_id)
+    if not novel_check:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
     # Validate if the novel is actually awaiting this decision
-    decision_info = db_manager.load_workflow_snapshot_and_decision_info(novel_id)
-    if not decision_info:
-        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found or has no workflow state.")
+    loaded_info = db_manager.load_workflow_snapshot_and_decision_info(novel_id)
+    if not loaded_info or not loaded_info.get("workflow_status"):
+        raise HTTPException(status_code=404, detail=f"Workflow state not found for novel ID {novel_id} or novel is in an invalid state (e.g., no status).")
 
-    current_workflow_status = decision_info.get("workflow_status")
-    current_pending_decision_type = decision_info.get("pending_decision_type")
+    current_workflow_status = loaded_info["workflow_status"]
+    expected_decision_type = loaded_info.get("pending_decision_type")
 
-    if not current_workflow_status or not current_workflow_status.startswith("paused_for_") or current_pending_decision_type != decision_type_param:
-        raise HTTPException(status_code=409, # Conflict
-                            detail=f"Novel {novel_id} is not awaiting a decision of type '{decision_type_param}'. "
-                                   f"Current status: '{current_workflow_status}', awaiting: '{current_pending_decision_type}'.")
+    if not current_workflow_status.startswith("paused_for_"):
+        raise HTTPException(status_code=409, detail=f"Novel {novel_id} is not currently awaiting a decision. Current status: {current_workflow_status}")
+
+    if expected_decision_type != decision_type_param:
+        raise HTTPException(status_code=409, detail=f"Novel {novel_id} is awaiting decision type '{expected_decision_type}', but received decision for '{decision_type_param}'.")
+
+    # Action-specific payload validation
+    action = payload.action
+    if decision_type_param == "conflict_review": # Specific checks for conflict_review actions
+        if action == "apply_suggestion":
+            if payload.conflict_id is None or payload.suggestion_index is None:
+                raise HTTPException(status_code=422, detail="For 'apply_suggestion' action, 'conflict_id' and 'suggestion_index' are required.")
+        elif action == "ignore_conflict":
+            if payload.conflict_id is None:
+                raise HTTPException(status_code=422, detail="For 'ignore_conflict' action, 'conflict_id' is required.")
+        # Actions like "rewrite_all_auto_remaining" or "proceed_with_remaining" might not need extra fields from payload here.
+
+    # Generic selected_id check for other decision types (e.g., outline_selection, worldview_selection)
+    # The API path decision_type_param should match the expected type.
+    # These are conceptual action names; actual names might differ based on API design.
+    elif decision_type_param == "outline_selection": # Assuming action in payload distinguishes if needed, or is implicit
+        # Example: if payload.action was "select_specific_outline"
+        if payload.selected_id is None: # selected_id is on DecisionSubmissionRequest but Optional
+            raise HTTPException(status_code=422, detail=f"For '{decision_type_param}' action '{action}', 'selected_id' is required.")
+    elif decision_type_param == "worldview_selection":
+        if payload.selected_id is None:
+            raise HTTPException(status_code=422, detail=f"For '{decision_type_param}' action '{action}', 'selected_id' is required.")
+
+    # Add more decision_type_param checks and their required payload fields as necessary.
 
     user_decision_payload_json = payload.model_dump_json(exclude_none=True)
     new_db_status = f"resuming_with_decision_{decision_type_param}"

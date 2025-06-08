@@ -293,11 +293,10 @@ def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
             try:
                 db_manager = DatabaseManager(db_name=state.get("db_name", "novel_mvp.db"))
                 options_json = json.dumps(options_for_api)
-                # Create a serializable version of the state for JSON dump
-                # This is tricky because state can contain non-serializable objects like agent instances
-                # For now, we'll attempt a direct dump, but this might need a custom encoder or selective serialization
-                serializable_state = {k: v for k, v in state.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))}
-                state_json = json.dumps(serializable_state) # Might fail if state has complex objects
+
+                prepared_state_for_json = WorkflowManager._prepare_state_for_json_static(dict(state))
+                state_json = json.dumps(prepared_state_for_json)
+
                 db_manager.update_novel_pause_state(
                     state["novel_id"], state["workflow_status"], state["pending_decision_type"],
                     options_json, state["pending_decision_prompt"], state_json
@@ -564,8 +563,10 @@ def present_worldviews_for_selection_cli(state: NovelWorkflowState) -> dict:
             try:
                 db_manager = DatabaseManager(db_name=state.get("db_name", "novel_mvp.db"))
                 options_json = json.dumps(options_for_api)
-                serializable_state = {k: v for k, v in state.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))}
-                state_json = json.dumps(serializable_state)
+
+                prepared_state_for_json = WorkflowManager._prepare_state_for_json_static(dict(state))
+                state_json = json.dumps(prepared_state_for_json)
+
                 db_manager.update_novel_pause_state(
                     state["novel_id"], state["workflow_status"], state["pending_decision_type"],
                     options_json, state["pending_decision_prompt"], state_json
@@ -1670,8 +1671,9 @@ def prepare_conflict_review_for_api(state: NovelWorkflowState) -> Dict[str, Any]
 
         db_manager = DatabaseManager(db_name=db_name)
         options_json = json.dumps(api_options)
-        serializable_state = {k: v for k, v in state.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))}
-        full_state_json = json.dumps(serializable_state)
+
+        prepared_state_for_json = WorkflowManager._prepare_state_for_json_static(dict(state))
+        full_state_json = json.dumps(prepared_state_for_json)
 
         db_manager.update_novel_pause_state(
             novel_id, state["workflow_status"], state["pending_decision_type"],
@@ -1837,13 +1839,11 @@ def _should_retry_chapter(state: NovelWorkflowState) -> str:
 class WorkflowManager:
     def __init__(self, db_name="novel_mvp.db", mode="human"): # mode is now less relevant here, user_input drives it.
         self.db_name = db_name
-        # self.mode = mode # Keep for now if auto_decision_engine relies on it
-        # self.auto_decision_engine = AutoDecisionEngine() if self.mode == "auto" else None
-        # The auto_decision_engine should be part of the state if it's mode-dependent
-        # For now, assume it's instantiated if needed based on state.user_input.auto_mode
+        self.mode = mode
+        self.auto_decision_engine = AutoDecisionEngine() if self.mode == "auto" else None
 
-        print(f"WorkflowManager initialized (DB: {self.db_name}).")
-        self.initial_history = [f"WorkflowManager initialized (DB: {self.db_name}) and graph compiled."]
+        print(f"WorkflowManager initialized (DB: {self.db_name}, Mode: {self.mode}).") # Added mode to log
+        self.initial_history = [f"WorkflowManager initialized (DB: {self.db_name}, Mode: {self.mode}) and graph compiled."]
         self.workflow = StateGraph(NovelWorkflowState)
         self._build_graph()
         self.app = self.workflow.compile()
@@ -1869,6 +1869,19 @@ class WorkflowManager:
             raise ValueError(error_msg) # Or return a specific error state dict
 
         current_state_snapshot: NovelWorkflowState = json.loads(loaded_data["full_workflow_state_json"])
+
+        # Re-initialize transient fields after loading from JSON
+        user_input_loaded = current_state_snapshot.get("user_input", {})
+        if user_input_loaded.get("auto_mode", False):
+            # If the manager instance itself was created in 'auto' mode matching the state's mode, use its ADE
+            if self.mode == "auto" and self.auto_decision_engine:
+                 current_state_snapshot["auto_decision_engine"] = self.auto_decision_engine
+            else: # Otherwise, (e.g. manager is 'human' mode, or state is 'auto' but manager's ADE is None) create a fresh ADE
+                 current_state_snapshot["auto_decision_engine"] = AutoDecisionEngine()
+        else:
+            current_state_snapshot["auto_decision_engine"] = None
+
+        # LoreKeeperAgent instance is not stored in state, agents create it as needed.
 
         # It's expected that user_made_decision_payload_json was set by API via record_user_decision
         # And that pending_decision_type was cleared by record_user_decision
@@ -2120,27 +2133,53 @@ class WorkflowManager:
 
         # After invocation, handle DB update based on the outcome
         final_status = final_state_after_resume.get("workflow_status", "unknown_after_resume")
-        final_snapshot_json_for_db = json.dumps({k: v for k, v in final_state_after_resume.items() if isinstance(v, (type(None), str, int, float, bool, list, dict))})
+
+        # Use static helper to prepare final state for JSON storage
+        prepared_final_state_for_json_dict = WorkflowManager._prepare_state_for_json_static(dict(final_state_after_resume))
+        final_snapshot_json_for_db = json.dumps(prepared_final_state_for_json_dict)
 
         if final_status and final_status.startswith("paused_for_"):
-            # If it paused again, update_novel_pause_state will be called from the decision node itself.
-            # So, this specific call might be redundant if the decision node handles its own pause saving.
-            # However, if invoke ends due to recursion limit before hitting a save point, this save is crucial.
+            # If it paused again, update_novel_pause_state should have been called from the decision node itself
+            # which should use the _prepare_state_for_json method.
+            # Re-saving here is a fallback or for cases where invoke ends before a node's explicit save.
             print(f"Workflow for novel {novel_id} resumed and then paused again for: {final_status}")
-            # The decision node (e.g. present_outlines_cli) should have already saved its pause state.
-            # If we save here, ensure it's the absolute latest state.
+            # The decision node that re-paused should have already saved the *prepared* state.
+            # This save here is a safety net if the pause was due to recursion limit or unexpected exit.
+            # If this save is truly needed, it should also get the latest pending_decision fields from final_state_after_resume
+            # and pass the *prepared* final_snapshot_json_for_db.
+            # For now, assuming decision nodes handle their own saving of prepared state if they pause.
+            # If a generic save is needed here for an unexpected pause, it should be the prepared JSON:
             # db_manager.update_novel_pause_state(
             #     novel_id, final_status,
             #     final_state_after_resume.get("pending_decision_type"),
-            #     json.dumps(final_state_after_resume.get("pending_decision_options")) if final_state_after_resume.get("pending_decision_options") else None,
+            #     json.dumps(self._prepare_state_for_json(final_state_after_resume.get("pending_decision_options", []))), # Ensure options are also prepared if complex
             #     final_state_after_resume.get("pending_decision_prompt"),
-            #     final_snapshot_json_for_db
+            #     final_snapshot_json_for_db # This is already prepared
             # )
+            pass # Assuming decision node handled its own saving of prepared state.
         else: # Completed, failed, or other terminal/intermediate state that isn't a formal pause
             print(f"Workflow for novel {novel_id} resumed. Final status: {final_status}.")
             db_manager.update_novel_status_after_resume(novel_id, final_status, final_snapshot_json_for_db)
 
         return final_state_after_resume
+
+    @staticmethod
+    def _prepare_state_for_json_static(state_dict: Dict) -> Dict:
+        """Removes non-serializable fields from a state dictionary before JSON dump."""
+        serializable_state = dict(state_dict).copy() # Ensure it's a dict and copy
+        serializable_state.pop("auto_decision_engine", None)
+        serializable_state.pop("lore_keeper_instance", None) # Defensive, though not in TypedDict
+        # Add any other runtime objects that shouldn't be serialized by popping them here
+        return serializable_state
+
+    # Keep the instance method version if it's used by other instance methods directly,
+    # or refactor those calls as well. For now, resume_workflow was updated to use static.
+    # This instance method can be removed if no other *instance* methods of WorkflowManager call it.
+    # For now, let's keep it simple and assume _prepare_state_for_json_static is the primary one.
+    # If self._prepare_state_for_json is called by another instance method, it will correctly delegate.
+    # def _prepare_state_for_json(self, state_dict: Dict) -> Dict:
+    #     return WorkflowManager._prepare_state_for_json_static(state_dict)
+    # Removing the instance method as it's not strictly needed if all calls go to static.
 
     def _should_prompt_user(self, decision_point: Optional[str] = None) -> bool:
         """
