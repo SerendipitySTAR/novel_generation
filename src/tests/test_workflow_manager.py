@@ -14,7 +14,11 @@ from src.agents.chapter_chronicler_agent import ChapterChroniclerAgent
 from src.agents.lore_keeper_agent import LoreKeeperAgent
 from src.core.models import Chapter, PlotChapterDetail, Character, Outline, WorldView, Plot, Novel
 # Import the specific functions to be tested directly if they are module-level
-from src.orchestration.workflow_manager import _decide_after_conflict_detection, execute_conflict_resolution_auto, prepare_conflict_review_for_api
+from src.orchestration.workflow_manager import (_decide_after_conflict_detection,
+                                                execute_conflict_resolution_auto,
+                                                prepare_conflict_review_for_api,
+                                                present_outlines_for_selection_cli,
+                                                present_worldviews_for_selection_cli)
 
 
 class TestWorkflowManagerExtensions(unittest.TestCase):
@@ -43,7 +47,7 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         }
         # Minimal state that might be needed by some nodes if not fully mocked
         self.base_initial_state_extras = {
-            "novel_id": 1,
+            "novel_id": "novel1", # Changed to string for consistency with helper
             "outline_id": 1,
             "worldview_id": 1,
             "plot_id": 1,
@@ -69,11 +73,40 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
     def tearDown(self):
         # Close any open connections by the db_manager if necessary
         # For simple file DBs, removal is often enough
-        del self.db_manager # Allow __del__ to close if it has one
+        if hasattr(self, 'db_manager') and self.db_manager:
+            del self.db_manager
         if os.path.exists(self.db_name):
             os.remove(self.db_name)
         if os.path.exists(f"{self.db_name}-journal"):
              os.remove(f"{self.db_name}-journal")
+
+    def _get_minimal_state_for_api_decision_pause(self, decision_type: str) -> NovelWorkflowState:
+        # Using a dictionary that NovelWorkflowState can unpack
+        state_dict = {
+            "novel_id": "novel1",
+            "db_name": self.db_name,
+            "history": [],
+            "user_input": UserInput(interaction_mode="api", auto_mode=False, theme="Test Theme", style_preferences="Test Style", chapters=1, words_per_chapter=50),
+            "all_generated_outlines": ["Outline 1", "Outline 2"] if decision_type == "outline_selection" else None,
+            "all_generated_worldviews": [{"world_name": "WV1", "core_concept": "Concept1"}, {"world_name": "WV2", "core_concept": "Concept2"}] if decision_type == "worldview_selection" else None,
+            "workflow_status": "running",
+            "current_chapter_number": 1,
+            "total_chapters_to_generate": 1,
+            "error_message": None, "novel_data": None, "outline_id": None, "outline_data": None, "outline_review": None,
+            "worldview_id": None, "worldview_data": None, "plot_id": None, "detailed_plot_data": None, "plot_data": None,
+            "characters": None, "lore_keeper_initialized": False, "generated_chapters": [],
+            "active_character_ids_for_chapter": None, "current_plot_focus_for_chronicler": None, "chapter_brief": None,
+            "current_chapter_review": None, "current_chapter_quality_passed": None, "current_chapter_conflicts": None,
+            "auto_decision_engine": None, "knowledge_graph_data": None, "current_chapter_retry_count": 0,
+            "max_chapter_retries": 1, "current_chapter_original_content": None, "current_chapter_feedback_for_retry": None,
+            "pending_decision_type": None, "pending_decision_options": None, "pending_decision_prompt": None,
+            "user_made_decision_payload": None, "original_chapter_content_for_conflict_review": None,
+            "loop_iteration_count": 0, "max_loop_iterations": 10, "execution_count": 0,
+            # Specific for testing: Ensure these are distinct for worldview if needed by tests
+            "narrative_outline_text": "Some default outline" if decision_type == "worldview_selection" else None,
+            "selected_worldview_detail": None,
+        }
+        return NovelWorkflowState(**state_dict) # type: ignore
 
     def _get_minimal_state_for_chapter_loop_start(self, manager: WorkflowManager, user_input_dict: dict) -> NovelWorkflowState:
         """
@@ -672,7 +705,204 @@ class TestWorkflowManagerExtensions(unittest.TestCase):
         self.assertEqual(args_db_update[0], 1) # novel_id
         self.assertEqual(args_db_update[1], "running_after_conflict_review_all_resolved_or_ignored") # final status
         self.assertIn(rewritten_text, args_db_update[2]) # final_snapshot_json
+        self.assertIsNone(invoked_state_arg["pending_decision_type"])
+        self.assertIsNone(invoked_state_arg["pending_decision_options"])
 
+    # --- New Tests for resume_workflow (Outline/Worldview Selection) ---
+    @patch.object(WorkflowManager, '_build_graph')
+    @patch('src.orchestration.workflow_manager.DatabaseManager')
+    def test_resume_workflow_outline_selection(self, MockDatabaseManager, mock_build_graph_ignored):
+        mock_db_instance = MockDatabaseManager.return_value
+
+        paused_state_snapshot = self._get_minimal_state_for_api_decision_pause(decision_type="outline_selection")
+        paused_state_snapshot.update({
+            "all_generated_outlines": ["Outline 1 text", "Outline 2 text", "Outline 3 text"],
+            "pending_decision_type": "outline_selection",
+            "workflow_status": "paused_for_outline_selection",
+            "execution_count": 1
+        })
+
+        mock_db_instance.load_workflow_snapshot_and_decision_info.return_value = {
+            "full_workflow_state_json": json.dumps(paused_state_snapshot)
+        }
+
+        manager = WorkflowManager(db_name=self.db_name)
+        manager.app = MagicMock()
+        manager.app.invoke.side_effect = lambda state, config: state
+
+        decision_payload = {"selected_id": "1"} # API sends 0-based index "1" (meaning second item)
+
+        final_state = manager.resume_workflow(paused_state_snapshot["novel_id"], "outline_selection", decision_payload)
+
+        manager.app.invoke.assert_called_once()
+        state_passed_to_invoke = manager.app.invoke.call_args[0][0]
+
+        self.assertEqual(state_passed_to_invoke.get("narrative_outline_text"), "Outline 2 text")
+        self.assertEqual(state_passed_to_invoke.get("workflow_status"), "running_after_outline_decision")
+        self.assertIsNone(state_passed_to_invoke.get("pending_decision_type"))
+        self.assertIsNotNone(state_passed_to_invoke.get("user_made_decision_payload"))
+        # resume_workflow sets selected_option_id as 1-based for node consumption
+        self.assertEqual(state_passed_to_invoke["user_made_decision_payload"]["selected_option_id"], "2")
+        self.assertEqual(state_passed_to_invoke["user_made_decision_payload"]["source_decision_type"], "outline_selection")
+        self.assertEqual(state_passed_to_invoke["execution_count"], 2)
+
+        mock_db_instance.update_novel_status_after_resume.assert_called_once()
+        args_db_update = mock_db_instance.update_novel_status_after_resume.call_args[0]
+        self.assertEqual(args_db_update[0], paused_state_snapshot["novel_id"])
+        self.assertEqual(args_db_update[1], "running_after_outline_decision")
+        resumed_state_json = json.loads(args_db_update[2])
+        self.assertEqual(resumed_state_json["narrative_outline_text"], "Outline 2 text")
+
+    @patch.object(WorkflowManager, '_build_graph')
+    @patch('src.orchestration.workflow_manager.DatabaseManager')
+    def test_resume_workflow_worldview_selection(self, MockDatabaseManager, mock_build_graph_ignored):
+        mock_db_instance = MockDatabaseManager.return_value
+
+        all_worldviews_data = [{"world_name": "WV1", "core_concept": "Concept1"}, {"world_name": "WV2", "core_concept": "Concept2"}]
+        paused_state_snapshot = self._get_minimal_state_for_api_decision_pause(decision_type="worldview_selection")
+        paused_state_snapshot.update({
+            "all_generated_worldviews": all_worldviews_data,
+            "pending_decision_type": "worldview_selection",
+            "workflow_status": "paused_for_worldview_selection",
+            "execution_count": 1
+        })
+
+        mock_db_instance.load_workflow_snapshot_and_decision_info.return_value = {
+            "full_workflow_state_json": json.dumps(paused_state_snapshot)
+        }
+
+        manager = WorkflowManager(db_name=self.db_name)
+        manager.app = MagicMock()
+        manager.app.invoke.side_effect = lambda state, config: state
+
+        decision_payload = {"selected_id": "0"} # User selects WV1 (0-based index)
+
+        final_state = manager.resume_workflow(paused_state_snapshot["novel_id"], "worldview_selection", decision_payload)
+
+        manager.app.invoke.assert_called_once()
+        state_passed_to_invoke = manager.app.invoke.call_args[0][0]
+
+        self.assertEqual(state_passed_to_invoke.get("selected_worldview_detail"), all_worldviews_data[0])
+        self.assertEqual(state_passed_to_invoke.get("workflow_status"), "running_after_worldview_decision")
+        self.assertIsNone(state_passed_to_invoke.get("pending_decision_type"))
+        self.assertIsNotNone(state_passed_to_invoke.get("user_made_decision_payload"))
+        self.assertEqual(state_passed_to_invoke["user_made_decision_payload"]["selected_option_id"], "1") # 1-based for node
+        self.assertEqual(state_passed_to_invoke["user_made_decision_payload"]["source_decision_type"], "worldview_selection")
+        self.assertEqual(state_passed_to_invoke["execution_count"], 2)
+
+        mock_db_instance.update_novel_status_after_resume.assert_called_once()
+        args_db_update = mock_db_instance.update_novel_status_after_resume.call_args[0]
+        self.assertEqual(args_db_update[0], paused_state_snapshot["novel_id"])
+        self.assertEqual(args_db_update[1], "running_after_worldview_decision")
+        resumed_state_json = json.loads(args_db_update[2])
+        self.assertEqual(resumed_state_json["selected_worldview_detail"]["world_name"], "WV1")
+
+    # --- Tests for present_outlines_for_selection_cli (API Mode) ---
+    @patch('src.orchestration.workflow_manager.DatabaseManager')
+    def test_present_outlines_api_mode_pauses_correctly(self, MockDatabaseManager):
+        mock_db_instance = MockDatabaseManager.return_value
+        outlines = ["Outline A", "Outline B Is Longer"]
+        initial_state = self._get_minimal_state_for_api_decision_pause("outline_selection")
+        initial_state.update({ # Ensure these are correctly set for the test
+            "all_generated_outlines": outlines,
+            "novel_id": "novel1", # from helper
+            "db_name": self.db_name, # from helper
+            "user_input": UserInput(interaction_mode="api", auto_mode=False, theme="Test", style_preferences="", chapters=1, words_per_chapter=50),
+        })
+
+        returned_state = present_outlines_for_selection_cli(initial_state)
+
+        self.assertEqual(returned_state["workflow_status"], "paused_for_outline_selection")
+        self.assertEqual(returned_state["pending_decision_type"], "outline_selection")
+        self.assertEqual(returned_state["pending_decision_prompt"], "Please select a narrative outline for the novel.")
+
+        expected_options = [
+            {"id": "0", "text_summary": "Outline A"[:150]+"...", "full_data": "Outline A"},
+            {"id": "1", "text_summary": "Outline B Is Longer"[:150]+"...", "full_data": "Outline B Is Longer"}
+        ]
+        self.assertEqual(returned_state["pending_decision_options"], expected_options)
+
+        mock_db_instance.update_novel_pause_state.assert_called_once()
+        call_args = mock_db_instance.update_novel_pause_state.call_args[0]
+        self.assertEqual(call_args[0], initial_state["novel_id"])
+        self.assertEqual(call_args[1], "paused_for_outline_selection")
+        self.assertEqual(call_args[2], "outline_selection")
+        self.assertEqual(json.loads(call_args[3]), expected_options)
+
+    def test_present_outlines_api_mode_resumes_correctly(self):
+        all_outlines_data = ["Outline X", "Outline Y"]
+        state = self._get_minimal_state_for_api_decision_pause("outline_selection")
+        state.update({
+            "all_generated_outlines": all_outlines_data,
+            # resume_workflow sets 'selected_option_id' as 1-based string for the node
+            "user_made_decision_payload": {"source_decision_type": "outline_selection", "selected_option_id": "2"} # User selected "Outline Y" (index 1)
+        })
+        # user_input for API mode is already set by the helper
+
+        returned_state = present_outlines_for_selection_cli(state)
+
+        self.assertEqual(returned_state.get("narrative_outline_text"), all_outlines_data[1])
+        self.assertIsNone(returned_state.get("user_made_decision_payload"))
+        self.assertEqual(returned_state.get("workflow_status"), "running")
+        self.assertIsNone(returned_state.get("error_message"))
+        self.assertIn("API Human-Mode: Outline 2", "".join(returned_state.get("history", [])))
+
+    # --- Tests for present_worldviews_for_selection_cli (API Mode) ---
+    @patch('src.orchestration.workflow_manager.DatabaseManager')
+    def test_present_worldviews_api_mode_pauses_correctly(self, MockDatabaseManager):
+        mock_db_instance = MockDatabaseManager.return_value
+        worldviews_data = [
+            {"world_name": "WV One", "core_concept": "Concept Alpha", "key_elements":["elemA"], "atmosphere":"Atmo A"},
+            {"world_name": "WV Two", "core_concept": "Concept Beta", "key_elements":["elemB"], "atmosphere":"Atmo B"}
+        ]
+
+        initial_state = self._get_minimal_state_for_api_decision_pause("worldview_selection")
+        initial_state.update({
+            "all_generated_worldviews": worldviews_data, # Already set by helper, but explicit here for clarity
+            "user_input": UserInput(interaction_mode="api", auto_mode=False, theme="Test", style_preferences="", chapters=1, words_per_chapter=50),
+        })
+
+        returned_state = present_worldviews_for_selection_cli(initial_state)
+
+        self.assertEqual(returned_state["workflow_status"], "paused_for_worldview_selection")
+        self.assertEqual(returned_state["pending_decision_type"], "worldview_selection")
+        self.assertEqual(returned_state["pending_decision_prompt"], "Please select a worldview for the novel.")
+
+        expected_options = [
+            {"id": "0", "text_summary": "WV One: Concept Alpha"[:100]+"...", "full_data": worldviews_data[0]},
+            {"id": "1", "text_summary": "WV Two: Concept Beta"[:100]+"...", "full_data": worldviews_data[1]}
+        ]
+
+        self.assertEqual(len(returned_state["pending_decision_options"]), len(expected_options))
+        for i, opt in enumerate(returned_state["pending_decision_options"]):
+            self.assertEqual(opt["id"], expected_options[i]["id"])
+            # Check summary construction (name + core_concept)
+            expected_summary_start = f"{worldviews_data[i]['world_name']}: {worldviews_data[i]['core_concept']}"
+            self.assertTrue(opt["text_summary"].startswith(expected_summary_start[:100]))
+            self.assertEqual(opt["full_data"], expected_options[i]["full_data"])
+
+        mock_db_instance.update_novel_pause_state.assert_called_once()
+
+    def test_present_worldviews_api_mode_resumes_correctly(self):
+        worldviews_as_dicts = [
+            {"world_name": "WV One", "core_concept": "Concept Alpha"},
+            {"world_name": "WV Two", "core_concept": "Concept Beta"}
+        ]
+
+        state = self._get_minimal_state_for_api_decision_pause("worldview_selection")
+        state.update({
+            "all_generated_worldviews": worldviews_as_dicts,
+            # resume_workflow sets 'selected_option_id' as 1-based string for the node
+            "user_made_decision_payload": {"source_decision_type": "worldview_selection", "selected_option_id": "1"} # User selected WV One (index 0)
+        })
+
+        returned_state = present_worldviews_for_selection_cli(state)
+
+        self.assertEqual(returned_state.get("selected_worldview_detail"), worldviews_as_dicts[0])
+        self.assertIsNone(returned_state.get("user_made_decision_payload"))
+        self.assertEqual(returned_state.get("workflow_status"), "running")
+        self.assertIsNone(returned_state.get("error_message"))
+        self.assertIn("API Human-Mode: Worldview 'WV One' selected via API.", "".join(returned_state.get("history", [])))
 
 if __name__ == '__main__':
     unittest.main()
