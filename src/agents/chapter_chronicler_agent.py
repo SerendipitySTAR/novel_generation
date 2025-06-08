@@ -25,19 +25,29 @@ class ChapterChroniclerAgent:
     def _construct_prompt(self, chapter_brief: str, current_chapter_plot_summary: str, style_preferences: str, words_per_chapter: int = 1000) -> str:
         # Prompt refined to be more explicit about using the plot summary and brief,
         # and the RAG context if demarcated in the brief.
-        prompt = f"""You are a novelist writing a chapter. Adhere to the style: {style_preferences}.
 
-Chapter Brief (context, characters, lore):
+        retry_instruction = ""
+        if "--- IMPORTANT: THIS IS A RETRY ATTEMPT ---" in chapter_brief:
+            retry_instruction = (
+                "You are revising a previous draft of this chapter. Specific feedback has been provided below, "
+                "extracted from the quality review of the previous version. Pay close attention to addressing ALL "
+                "points mentioned in this feedback to improve the chapter. Ensure the new version corrects the "
+                "identified issues while maintaining narrative coherence and quality.\n\n"
+            )
+
+        prompt = f"""{retry_instruction}You are a novelist writing a chapter. Adhere to the style: {style_preferences}.
+
+Chapter Brief (context, characters, lore, and potentially retry feedback):
 --- BEGIN CHAPTER BRIEF ---
 {chapter_brief}
 --- END CHAPTER BRIEF ---
 
 Specific Plot for THIS Chapter: {current_chapter_plot_summary}
 
-Your primary goal for this chapter's content is to flesh out the 'Specific Plot for THIS Chapter'.
-Use the 'Chapter Brief' for essential background, character states, and relevant lore to ensure consistency.
-Weave these elements together to write a compelling narrative for this chapter.
-Refer to any 'Relevant Lore and Context' (often demarcated by '--- RELEVANT LORE AND CONTEXT ---') provided in the brief.
+Your primary goal for this chapter's content is to flesh out the 'Specific Plot for THIS Chapter'. This is the driving force of the chapter.
+Use the 'Chapter Brief' for essential background, character states, relevant lore, and any provided feedback on previous versions to ensure consistency and improvement.
+If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly integrate these facts/lore snippets where they naturally fit within the narrative flow. Do not list them or directly refer to them as 'lore' or 'from the knowledge base'. The integration should feel organic and enhance the story.
+Weave all these elements together to write a compelling narrative for this chapter.
 
 IMPORTANT: Your response must follow this EXACT format. Do not include any other text or explanations:
 
@@ -49,8 +59,14 @@ Content:
 - Show, Don't Tell: Focus on vivid descriptions of settings, character actions, and emotions.
 - Dialogue: Incorporate meaningful dialogue that reveals character personality, motivations, and advances the plot.
 - Character Consistency: Ensure character behaviors, decisions, and speech patterns are consistent with their detailed profiles and motivations as described in the 'Chapter Brief'.
-- Utilize Context: If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly weave these details into the narrative where appropriate to enhance world-building and consistency. Avoid large blocks of exposition (info-dumping).
+- Utilize Context: If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly weave these details into the narrative where appropriate to enhance world-building and consistency. Avoid large blocks of exposition (info-dumping). Ensure all provided RAG context is used effectively and subtly.
 - Pacing and Flow: Maintain a good narrative pace suitable for the chapter's events and tone.]
+
+Self-Correction Checklist (Before Finalizing):
+- Is dialogue impactful and character-revealing?
+- Are descriptions vivid and immersive?
+- Is all provided RAG context used effectively and subtly?
+- Does the chapter primarily advance the 'Specific Plot for THIS Chapter'?
 
 Summary:
 [Write a concise 2-3 sentence summary of the key plot advancements, character developments, and critical outcomes that occurred within this chapter only]

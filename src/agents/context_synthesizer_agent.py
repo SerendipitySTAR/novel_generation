@@ -23,13 +23,20 @@ class ContextSynthesizerAgent:
             return [plot_summary]
 
         prompt = (
-            f"Given the following plot summary for an upcoming novel chapter:\n"
-            f"\"{plot_summary}\"\n\n"
-            f"Generate a list of 3-5 concise and distinct search query strings or key questions that would be most effective for querying a knowledge base to retrieve relevant background information, lore, character details, or world details needed to write this chapter.\n"
-            f"Output these queries as a comma-separated list. For example: \"Sunstone location, Dragon's Peak defenses, Kael's previous encounter with dragons\""
+            f"You are assisting a novelist in gathering background information for an upcoming chapter. "
+            f"Based on the following plot summary for the chapter:\n"
+            f"--- PLOT SUMMARY ---\n{plot_summary}\n--- END PLOT SUMMARY ---\n\n"
+            f"Generate 3-5 distinct search queries or key questions that will be used to retrieve relevant information from a knowledge base. "
+            f"These queries should cover various aspects such as:\n"
+            f"- Relevant character motivations or backstories that might influence their actions in this chapter.\n"
+            f"- Important locations or objects mentioned and their significance or history.\n"
+            f"- Underlying lore, past events, or world rules that could impact the unfolding plot.\n"
+            f"- Potential consequences or implications of the events described.\n"
+            f"The queries should be concise and focused on information that would enrich the chapter's narrative depth and consistency.\n"
+            f"Output these queries as a comma-separated list. For example: \"Kael's childhood fear of heights, History of the Sunstone, Rules of magic in Eldoria, Dragon's Peak defensive strategies, Prophecy of the Shadowed Crown\""
         )
         try:
-            response_text = self.lore_keeper.llm_client.generate_text(prompt, max_tokens=150, temperature=0.5)
+            response_text = self.lore_keeper.llm_client.generate_text(prompt, max_tokens=200, temperature=0.6) # Increased max_tokens slightly for potentially more detailed queries
             if response_text:
                 queries = [q.strip() for q in response_text.split(',') if q.strip()]
                 if queries:
@@ -197,15 +204,20 @@ class ContextSynthesizerAgent:
                 try:
                     # print(f"ContextSynthesizer: RAG Query: '{query_str}'")
                     kb_results_for_query = self.lore_keeper.kb_manager.query_knowledge_base(
-                        novel_id, query_str, n_results=2 # Fetch 2 results per focused query
+                        novel_id, query_str, n_results=3 # Fetch 3 results per focused query to allow for filtering
                     )
                     if kb_results_for_query:
                         for doc_content, score in kb_results_for_query:
-                            if doc_content not in seen_kb_document_contents:
-                                aggregated_kb_results_content.append(
-                                    f"- {doc_content} (Source query: '{query_str[:50].strip()}...', Similarity: {score:.2f})"
-                                )
-                                seen_kb_document_contents.add(doc_content)
+                            if score >= 0.7: # Filter by similarity score
+                                if doc_content not in seen_kb_document_contents:
+                                    aggregated_kb_results_content.append(
+                                        f"- {doc_content} (Source query: '{query_str[:50].strip()}...', Similarity: {score:.2f})"
+                                    )
+                                    seen_kb_document_contents.add(doc_content)
+                                else:
+                                    print(f"ContextSynthesizer: Skipping duplicate RAG result (content already seen). Score: {score:.2f}")
+                            else:
+                                print(f"ContextSynthesizer: Skipping RAG result due to low similarity score: {score:.2f} (Query: '{query_str[:50].strip()}...')")
                 except Exception as e:
                     print(f"ContextSynthesizer: Error during RAG query for '{query_str}': {e}")
 

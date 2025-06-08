@@ -123,6 +123,35 @@ class DatabaseManager:
                         UNIQUE(source_chapter_id, target_chapter_id)
                     )
                 """)
+                # --- KB Validation Requests Table ---
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS kb_validation_requests (
+                        id TEXT PRIMARY KEY,
+                        novel_id INTEGER NOT NULL,
+                        request_type TEXT NOT NULL,
+                        source_reference TEXT,
+                        source_text_snippet TEXT,
+                        item_under_review_json TEXT NOT NULL,
+                        validation_question TEXT NOT NULL,
+                        system_suggestion_json TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending_review',
+                        user_decision TEXT,
+                        user_corrected_value_json TEXT,
+                        user_comment TEXT,
+                        creation_date TEXT NOT NULL,
+                        resolution_date TEXT,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+                    )
+                """)
+                # --- Knowledge Graphs Table ---
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS knowledge_graphs (
+                        novel_id INTEGER PRIMARY KEY,
+                        graph_json TEXT NOT NULL,
+                        last_updated TEXT NOT NULL,
+                        FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
+                    )
+                """)
                 conn.commit()
             print(f"Database '{self.db_name}' initialized successfully. All tables are ready.")
         except sqlite3.Error as e:
@@ -202,6 +231,26 @@ class DatabaseManager:
                 conn.commit()
         except sqlite3.Error as e: print(f"Error updating active outline: {e}"); raise
 
+    def update_outline(self, outline_id: int, overview_text: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # Get novel_id for updating novel's last_updated_date
+                cursor.execute("SELECT novel_id FROM outlines WHERE id = ?", (outline_id,))
+                row = cursor.fetchone()
+                if not row:
+                    print(f"Error updating outline: Outline ID {outline_id} not found.")
+                    return False
+                novel_id = row['novel_id']
+
+                cursor.execute("UPDATE outlines SET overview_text = ? WHERE id = ?", (overview_text, outline_id))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error updating outline ID {outline_id}: {e}")
+            return False
+
 
     # --- WorldView Methods ---
     # ... (add_worldview, get_worldview_by_id, update_novel_active_worldview remain the same)
@@ -236,6 +285,26 @@ class DatabaseManager:
                 self._update_novel_last_updated(novel_id, conn)
                 conn.commit()
         except sqlite3.Error as e: print(f"Error updating active worldview: {e}"); raise
+
+    def update_worldview(self, worldview_id: int, description_text: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # Get novel_id for updating novel's last_updated_date
+                cursor.execute("SELECT novel_id FROM worldviews WHERE id = ?", (worldview_id,))
+                row = cursor.fetchone()
+                if not row:
+                    print(f"Error updating worldview: Worldview ID {worldview_id} not found.")
+                    return False
+                novel_id = row['novel_id']
+
+                cursor.execute("UPDATE worldviews SET description_text = ? WHERE id = ?", (description_text, worldview_id))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error updating worldview ID {worldview_id}: {e}")
+            return False
 
     # --- Plot Methods ---
     # ... (add_plot, get_plot_by_id, update_novel_active_plot remain the same)
@@ -272,6 +341,67 @@ class DatabaseManager:
                 conn.commit()
         except sqlite3.Error as e: print(f"Error updating active plot: {e}"); raise
 
+    def get_active_plot_for_novel(self, novel_id: int) -> Optional[Dict]:
+        novel = self.get_novel_by_id(novel_id)
+        if novel and novel.get('active_plot_id') is not None:
+            plot = self.get_plot_by_id(novel['active_plot_id'])
+            return plot if plot else None
+        return None
+
+    def update_plot_summary(self, plot_id: int, new_plot_summary_json: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # Get novel_id for updating novel's last_updated_date
+                cursor.execute("SELECT novel_id FROM plots WHERE id = ?", (plot_id,))
+                row = cursor.fetchone()
+                if not row:
+                    print(f"Error updating plot summary: Plot ID {plot_id} not found.")
+                    return False
+                novel_id = row['novel_id']
+
+                cursor.execute("UPDATE plots SET plot_summary = ? WHERE id = ?", (new_plot_summary_json, plot_id))
+                if cursor.rowcount > 0:
+                    self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error updating plot summary for plot ID {plot_id}: {e}")
+            return False
+
+    def ensure_novel_has_active_plot(self, novel_id: int) -> int:
+        novel = self.get_novel_by_id(novel_id)
+        if not novel:
+            raise ValueError(f"Novel with ID {novel_id} not found.")
+
+        if novel.get('active_plot_id') is not None:
+            # Verify the plot actually exists, otherwise it's a dangling ID
+            plot_check = self.get_plot_by_id(novel['active_plot_id'])
+            if plot_check:
+                return novel['active_plot_id']
+            else:
+                # Dangling active_plot_id, proceed to create a new one
+                print(f"Warning: Novel {novel_id} had a dangling active_plot_id {novel['active_plot_id']}. Creating a new plot.")
+
+
+        # If active_plot_id is None or was dangling, create a new plot
+        new_plot_id = self.add_plot(novel_id, "[]") # Store empty list as JSON string
+
+        # Update the novel to set this new plot as active
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE novels SET active_plot_id = ? WHERE id = ?", (new_plot_id, novel_id))
+                # _update_novel_last_updated is already called by add_plot,
+                # but setting active_plot_id is also an update to the novel itself.
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+            return new_plot_id
+        except sqlite3.Error as e:
+            print(f"Error setting new active plot {new_plot_id} for novel {novel_id}: {e}")
+            # Potentially roll back add_plot or handle orphan plot if critical
+            raise
+
 
     # --- Character Methods ---
     def add_character(self, novel_id: int, name: str, description: str, role_in_story: str) -> int:
@@ -291,6 +421,37 @@ class DatabaseManager:
                 return int(new_id)
         except sqlite3.Error as e:
             print(f"Error adding character for novel {novel_id}: {e}")
+            raise
+
+    def add_character_detailed(self, novel_id: int, profile_data: Dict[str, Any]) -> int:
+        name = profile_data.get('name', 'Unnamed Character')
+        role_in_story = profile_data.get('role_in_story', 'Default Role')
+        # Ensure creation_date is set in the profile_data if not already there, for consistency in JSON
+        if 'creation_date' not in profile_data or not profile_data['creation_date']:
+            profile_data['creation_date'] = datetime.now(timezone.utc).isoformat()
+
+        # Remove fields that are columns in the DB from the JSON to avoid redundancy,
+        # or ensure your get_character_by_id logic correctly prioritizes column data over JSON data for these.
+        # For now, let's store the whole profile_data dict as passed, which might include name/role again.
+        # The get_character_by_id method already prioritizes DB columns for name, role, id, novel_id, creation_date.
+        description_json = json.dumps(profile_data, ensure_ascii=False, indent=2)
+        creation_date_str = profile_data['creation_date'] # Use the one from profile_data
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO characters (novel_id, name, role_in_story, description, creation_date)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (novel_id, name, role_in_story, description_json, creation_date_str))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                new_id = cursor.lastrowid
+                if new_id is None:
+                    raise sqlite3.Error("Failed to retrieve ID for detailed character.")
+                return int(new_id)
+        except sqlite3.Error as e:
+            print(f"Error adding detailed character for novel {novel_id}: {e}")
             raise
 
     def delete_character(self, character_id: int) -> bool:
@@ -328,11 +489,24 @@ class DatabaseManager:
 
                 params.append(character_id)
                 query = f"UPDATE characters SET {', '.join(updates)} WHERE id = ?"
+
+                # Get novel_id for updating novel's last_updated_date BEFORE committing the character update
+                # This ensures we have novel_id even if the update itself affects no rows (e.g. same data)
+                # but we still want to bump last_updated_date if an attempt was made.
+                cursor.execute("SELECT novel_id FROM characters WHERE id = ?", (character_id,))
+                row = cursor.fetchone()
+                if not row:
+                    print(f"Error updating character: Character ID {character_id} not found.")
+                    return False
+                novel_id = row['novel_id']
+
                 cursor.execute(query, params)
+                if cursor.rowcount > 0: # Only update novel timestamp if character was actually changed
+                    self._update_novel_last_updated(novel_id, conn)
                 conn.commit()
                 return cursor.rowcount > 0
         except sqlite3.Error as e:
-            print(f"Error updating character: {e}")
+            print(f"Error updating character ID {character_id}: {e}")
             return False
 
     def clear_characters_for_novel(self, novel_id: int) -> bool:
@@ -494,6 +668,34 @@ class DatabaseManager:
         except sqlite3.Error as e:
             print(f"Error retrieving chapter novel_id={novel_id}, chapter_number={chapter_number}: {e}")
             return None
+
+    def update_chapter_content(self, chapter_id: int, new_content: str) -> bool:
+        """Updates the content of a specific chapter."""
+        current_timestamp = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # Also update last_updated_date of the novel
+                cursor.execute("SELECT novel_id FROM chapters WHERE id = ?", (chapter_id,))
+                row = cursor.fetchone()
+                if not row:
+                    print(f"Error updating chapter content: Chapter ID {chapter_id} not found.")
+                    return False
+                novel_id = row['novel_id']
+
+                cursor.execute("""
+                    UPDATE chapters
+                    SET content = ?, creation_date = ?
+                    WHERE id = ?
+                """, (new_content, current_timestamp, chapter_id)) # Using creation_date column also as last_updated for chapter
+
+                if cursor.rowcount > 0:
+                    self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error updating content for chapter ID {chapter_id}: {e}")
+            return False
 
     def update_novel_status(self, novel_id: int, workflow_status: str, current_step_details: Optional[str] = None, error_message: Optional[str] = None, history_log_json: Optional[str] = None):
         """
@@ -970,3 +1172,118 @@ if __name__ == "__main__":
         os.remove(test_db_name)
     print(f"\nCleaned up '{test_db_name}'.")
     print("--- DatabaseManager (with DetailedCharacterProfile handling) Test Finished ---")
+
+
+    # --- KB Validation Request Methods ---
+    def add_kb_validation_request(self, validation_id: str, novel_id: int, request_type: str,
+                                  item_under_review_json: str, validation_question: str,
+                                  source_reference: Optional[str] = None,
+                                  source_text_snippet: Optional[str] = None,
+                                  system_suggestion_json: Optional[str] = None) -> str:
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO kb_validation_requests (
+                        id, novel_id, request_type, source_reference, source_text_snippet,
+                        item_under_review_json, validation_question, system_suggestion_json,
+                        status, creation_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (validation_id, novel_id, request_type, source_reference, source_text_snippet,
+                      item_under_review_json, validation_question, system_suggestion_json,
+                      'pending_review', ts))
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                return validation_id
+        except sqlite3.Error as e:
+            print(f"Error adding KB validation request for novel {novel_id}: {e}")
+            raise
+
+    def get_pending_kb_validation_requests(self, novel_id: int) -> List[Dict]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM kb_validation_requests
+                    WHERE novel_id = ? AND status = 'pending_review'
+                    ORDER BY creation_date ASC
+                """, (novel_id,))
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"Error retrieving pending KB validation requests for novel {novel_id}: {e}")
+            return []
+
+    def get_kb_validation_request_by_id(self, validation_id: str) -> Optional[Dict]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM kb_validation_requests WHERE id = ?", (validation_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except sqlite3.Error as e:
+            print(f"Error retrieving KB validation request by ID {validation_id}: {e}")
+            return None
+
+    def resolve_kb_validation_request(self, validation_id: str, decision: str, status: str,
+                                      corrected_value_json: Optional[str] = None,
+                                      user_comment: Optional[str] = None) -> bool:
+        resolution_ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # First, fetch the novel_id for _update_novel_last_updated
+                cursor.execute("SELECT novel_id FROM kb_validation_requests WHERE id = ?", (validation_id,))
+                row = cursor.fetchone()
+                if not row:
+                    print(f"Error resolving KB validation: Request ID {validation_id} not found.")
+                    return False
+                novel_id = row['novel_id']
+
+                cursor.execute("""
+                    UPDATE kb_validation_requests SET
+                        user_decision = ?,
+                        user_corrected_value_json = ?,
+                        user_comment = ?,
+                        status = ?,
+                        resolution_date = ?
+                    WHERE id = ?
+                """, (decision, corrected_value_json, user_comment, status, resolution_ts, validation_id))
+
+                self._update_novel_last_updated(novel_id, conn)
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error resolving KB validation request ID {validation_id}: {e}")
+            raise
+
+    # --- Knowledge Graph Methods ---
+    def save_knowledge_graph(self, novel_id: int, graph_json: str) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO knowledge_graphs (novel_id, graph_json, last_updated)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(novel_id) DO UPDATE SET
+                        graph_json = excluded.graph_json,
+                        last_updated = excluded.last_updated
+                """, (novel_id, graph_json, ts))
+                self._update_novel_last_updated(novel_id, conn) # Also update novel's own last_updated timestamp
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error saving knowledge graph for novel {novel_id}: {e}")
+            raise
+
+    def load_knowledge_graph(self, novel_id: int) -> Optional[str]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT graph_json FROM knowledge_graphs WHERE novel_id = ?", (novel_id,))
+                row = cursor.fetchone()
+                return row['graph_json'] if row else None
+        except sqlite3.Error as e:
+            print(f"Error loading knowledge graph for novel {novel_id}: {e}")
+            return None

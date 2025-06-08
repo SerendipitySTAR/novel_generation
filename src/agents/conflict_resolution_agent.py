@@ -43,22 +43,29 @@ class ConflictResolutionAgent:
             context_end_for_llm = min(len(modified_text), excerpt_start_index + len(original_excerpt) + window_chars)
             text_window_for_llm = modified_text[context_start_for_llm:context_end_for_llm]
 
+            # Safely prepare conflict description for prompt (e.g., truncate if extremely long)
+            conflict_description_for_prompt = conflict.get('description', 'N/A')
+            if len(conflict_description_for_prompt) > 500: # Arbitrary limit, adjust as needed
+                conflict_description_for_prompt = conflict_description_for_prompt[:497] + "..."
+
             prompt = (
                 f"A chapter text contains a conflict that needs to be resolved.\n"
                 f"Novel Context (Theme/Style): {novel_context.get('theme', 'N/A') if novel_context else 'N/A'} / {novel_context.get('style_preferences', 'N/A') if novel_context else 'N/A'}\n"
                 f"Conflict Type: {conflict.get('type', 'N/A')}\n"
-                f"Conflict Description: {conflict.get('description', 'N/A')}\n"
+                # Conflict Description is now integrated more directly below.
                 f"Knowledge Base Reference (if any): {conflict.get('kb_reference', 'N/A')}\n\n"
-                f"The problematic excerpt is: \"{original_excerpt}\"\n\n"
+                f"The problematic excerpt is: \"{original_excerpt}\"\n"
+                f"This excerpt has been identified as conflicting because: '{conflict_description_for_prompt}'.\n\n"
                 f"This excerpt appears in the following broader context from the chapter:\n"
                 f"--- CONTEXT BEGIN ---\n{text_window_for_llm}\n--- CONTEXT END ---\n\n"
                 f"Your task: Rewrite ONLY the problematic excerpt (i.e., \"{original_excerpt}\") "
-                f"to resolve the described conflict. Ensure the revision fits naturally into the surrounding context, "
+                f"to specifically address and resolve the described conflict: '{conflict_description_for_prompt}'. "
+                f"Ensure the revision fits naturally into the surrounding context, "
                 f"maintains the narrative style, and is grammatically correct. "
                 f"Return ONLY the revised version of the excerpt. "
-                f"If you believe the original excerpt doesn't need to be changed to resolve this specific conflict, "
-                f"or if a minimal targeted change to only the excerpt cannot resolve it, "
-                f"return the original excerpt verbatim: \"{original_excerpt}\""
+                f"If you believe the original excerpt (\"{original_excerpt}\") doesn't need to be changed to resolve this specific conflict, "
+                f"or if a targeted change to ONLY this excerpt cannot resolve the conflict, "
+                f"then return the original excerpt verbatim: \"{original_excerpt}\"."
             )
 
             try:
@@ -147,7 +154,7 @@ class ConflictResolutionAgent:
                 f"Prefix each suggestion clearly, like \"Suggestion 1: [Rewritten excerpt]\" or \"Suggestion: [Rewritten excerpt]\".\n"
                 f"If providing two suggestions, separate them with '---' (three hyphens).\n"
                 f"If you believe no change to the excerpt is necessary or cannot formulate a good targeted suggestion for just the excerpt, respond with \"No specific rewrite suggestion for this excerpt.\"\n\n"
-                f"Suggestions:"
+                f"Please provide your rewrite suggestions for ONLY the problematic excerpt (\"{original_excerpt}\") below, adhering to the format requested (Suggestion 1: ..., Suggestion 2: ... separated by ---):"
             )
 
             try:
