@@ -6,6 +6,9 @@ import json
 import gc
 from dotenv import load_dotenv
 from src.core.auto_decision_engine import AutoDecisionEngine
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 尝试导入 psutil，如果不可用则使用基本的内存监控
 try:
@@ -238,52 +241,46 @@ def present_outlines_for_selection_cli(state: NovelWorkflowState) -> dict:
 
     # API Interaction Mode (Human makes decision via API)
     if interaction_mode == "api" and not auto_mode:
-        decision_payload = state.get("user_made_decision_payload")
-        if decision_payload and decision_payload.get("selected_option_id"):
-            # Resuming from API decision
+        payload = state.get("user_made_decision_payload", {})
+        # Check if resuming from an API decision specific to outline selection
+        # The selected_option_id is set by resume_workflow and is 1-based.
+        if payload.get("source_decision_type") == "outline_selection" and payload.get("selected_option_id") is not None:
+            history = state.get("history", [])
+            selected_id_str = payload.get("selected_option_id")
+
             try:
-                selected_option_id_str = decision_payload["selected_option_id"]
-                # Find the selected outline by its ID (which is stringified index+1)
-                # This assumes options were presented with ID "1", "2", ...
-                selected_outline_text = None
-                original_options = state.get("all_generated_outlines", [])
-                for i, outline_text_option in enumerate(original_options):
-                    if str(i+1) == selected_option_id_str:
-                        selected_outline_text = outline_text_option
-                        selected_index = i # For logging
-                        break
-
-                if selected_outline_text is None:
-                    raise ValueError(f"Selected option ID '{selected_option_id_str}' not found in available outlines.")
-
-                log_msg = f"API Mode: Resumed with selected Outline {selected_index + 1}."
-                history = _log_and_update_history(history, log_msg)
-                state["narrative_outline_text"] = selected_outline_text
-                state["user_made_decision_payload"] = None # Clear consumed decision
-                state["workflow_status"] = "running_after_outline_decision"
-                # Clear pending decision fields that were set for pausing
-                state["pending_decision_type"] = None
-                state["pending_decision_options"] = None
-                state["pending_decision_prompt"] = None
-                state["history"] = history
-                state["error_message"] = None
-                state["execution_count"] = execution_count
-                return state
-            except (ValueError, TypeError) as e:
-                msg = f"API Mode: Error processing outline decision: {e}. Invalid payload: {decision_payload}"
-                state["error_message"] = msg
-                state["history"] = _log_and_update_history(history, msg, True)
-                state["execution_count"] = execution_count
+                # Convert 1-based selected_option_id to 0-based index
+                selected_index = int(selected_id_str) - 1
+            except ValueError:
+                error_msg = f"API Mode: Invalid 'selected_option_id' format: '{selected_id_str}' for outline_selection. Must be an integer."
+                state["error_message"] = error_msg
+                state["history"] = _log_and_update_history(history, error_msg, True)
                 return state # Error state will be caught by _check_node_output
+
+            all_outlines_from_state = state.get("all_generated_outlines")
+            if not all_outlines_from_state or not isinstance(all_outlines_from_state, list):
+                error_msg = "API Mode: 'all_generated_outlines' not found or not a list in state for outline selection resume."
+                state["error_message"] = error_msg
+                state["history"] = _log_and_update_history(history, error_msg, True)
+                return state
+
+            if not (0 <= selected_index < len(all_outlines_from_state)):
+                error_msg = f"API Mode: Invalid selected_index {selected_index} (from ID {selected_id_str}) for outlines (length {len(all_outlines_from_state)})."
+                state["error_message"] = error_msg
+                state["history"] = _log_and_update_history(history, error_msg, True)
+                return state
+
+            state["narrative_outline_text"] = all_outlines_from_state[selected_index]
+            state["history"] = _log_and_update_history(history, f"API Human-Mode: Outline {selected_index + 1} ('{state['narrative_outline_text'][:50]}...') selected via API.")
+            state["workflow_status"] = "running" # Generic running status
+            state["user_made_decision_payload"] = None # Clear consumed decision
+            # Pending decision fields are cleared in resume_workflow, so no need here if logic holds
+            state["error_message"] = None
+            # execution_count is already incremented at the start of the function
+            return state
         else:
-            # Pausing for API decision
-            options_for_api = []
-            for i, outline_text_option in enumerate(all_outlines):
-                options_for_api.append({
-                    "id": str(i + 1), # API decision will refer to this ID
-                    "text_summary": outline_text_option[:150] + "...",
-                    "full_data": outline_text_option
-                })
+            # Pausing for API decision: options should be 0-indexed for API consistency
+            options_for_api = [{"id": str(i), "text_summary": str(o)[:150]+"...", "full_data": str(o)} for i, o in enumerate(all_outlines)]
             state["pending_decision_type"] = "outline_selection"
             state["pending_decision_options"] = options_for_api
             state["pending_decision_prompt"] = "Please select a narrative outline for the novel."
@@ -517,48 +514,45 @@ def present_worldviews_for_selection_cli(state: NovelWorkflowState) -> dict:
 
     # API Interaction Mode (Human makes decision via API)
     if interaction_mode == "api" and not auto_mode:
-        decision_payload = state.get("user_made_decision_payload")
-        if decision_payload and decision_payload.get("selected_option_id"):
-            # Resuming from API decision
+        payload = state.get("user_made_decision_payload", {})
+        # Check if resuming from an API decision specific to worldview selection
+        # The selected_option_id is set by resume_workflow and is 1-based.
+        if payload.get("source_decision_type") == "worldview_selection" and payload.get("selected_option_id") is not None:
+            history = state.get("history", []) # Get current history
+            selected_id_str = payload.get("selected_option_id")
+
             try:
-                selected_option_id_str = decision_payload["selected_option_id"]
-                selected_wv_detail = None
-                original_options = state.get("all_generated_worldviews", [])
-                for i, wv_option in enumerate(original_options):
-                    if str(i+1) == selected_option_id_str:
-                        selected_wv_detail = wv_option
-                        selected_index = i # for logging
-                        break
-
-                if selected_wv_detail is None:
-                    raise ValueError(f"Selected option ID '{selected_option_id_str}' not found in available worldviews.")
-
-                log_msg = f"API Mode: Resumed with selected Worldview {selected_index + 1} ('{selected_wv_detail.get('world_name', 'N/A')}')."
-                history = _log_and_update_history(history, log_msg)
-                state["selected_worldview_detail"] = selected_wv_detail
-                state["user_made_decision_payload"] = None # Clear consumed decision
-                state["workflow_status"] = "running_after_worldview_decision"
-                # Clear pending decision fields
-                state["pending_decision_type"] = None
-                state["pending_decision_options"] = None
-                state["pending_decision_prompt"] = None
-                state["history"] = history
-                state["error_message"] = None
-                return state # Return the full state dict
-            except (ValueError, TypeError) as e:
-                msg = f"API Mode: Error processing worldview decision: {e}. Invalid payload: {decision_payload}"
-                state["error_message"] = msg
-                state["history"] = _log_and_update_history(history, msg, True)
+                # Convert 1-based selected_option_id to 0-based index
+                selected_index = int(selected_id_str) - 1
+            except ValueError:
+                error_msg = f"API Mode: Invalid 'selected_option_id' format: '{selected_id_str}' for worldview_selection. Must be an integer."
+                state["error_message"] = error_msg
+                state["history"] = _log_and_update_history(history, error_msg, True)
                 return state # Error state will be caught by _check_node_output
+
+            all_worldviews_from_state = state.get("all_generated_worldviews") # Renamed to avoid conflict
+            if not all_worldviews_from_state or not isinstance(all_worldviews_from_state, list):
+                error_msg = "API Mode: 'all_generated_worldviews' not found or not a list in state for worldview selection resume."
+                state["error_message"] = error_msg
+                state["history"] = _log_and_update_history(history, error_msg, True)
+                return state
+
+            if not (0 <= selected_index < len(all_worldviews_from_state)):
+                error_msg = f"API Mode: Invalid selected_index {selected_index} (from ID {selected_id_str}) for worldviews (length {len(all_worldviews_from_state)})."
+                state["error_message"] = error_msg
+                state["history"] = _log_and_update_history(history, error_msg, True)
+                return state
+
+            state["selected_worldview_detail"] = all_worldviews_from_state[selected_index]
+            wv_name = state["selected_worldview_detail"].get('world_name', f'Option {selected_index + 1}')
+            state["history"] = _log_and_update_history(history, f"API Human-Mode: Worldview '{wv_name}' selected via API.")
+            state["workflow_status"] = "running" # Generic running status
+            state["user_made_decision_payload"] = None # Clear consumed decision
+            state["error_message"] = None
+            return state
         else:
-            # Pausing for API decision
-            options_for_api = []
-            for i, wv_detail_option in enumerate(all_worldviews):
-                options_for_api.append({
-                    "id": str(i + 1),
-                    "text_summary": f"{wv_detail_option.get('world_name', 'N/A')} - {wv_detail_option.get('core_concept', 'N/A')[:100]}...",
-                    "full_data": wv_detail_option
-                })
+            # Pausing for API decision: options should be 0-indexed for API consistency
+            options_for_api = [{"id": str(i), "text_summary": wv.get('world_name', f'Worldview {i+1}') + ": " + wv.get('core_concept', '')[:100]+"...", "full_data": wv} for i, wv in enumerate(all_worldviews)]
             state["pending_decision_type"] = "worldview_selection"
             state["pending_decision_options"] = options_for_api
             state["pending_decision_prompt"] = "Please select a worldview for the novel."
@@ -1887,10 +1881,73 @@ class WorkflowManager:
         # so `current_state_snapshot["pending_decision_type"]` might be None here if loaded from DB after `record_user_decision`.
         # The crucial part is that the API called this `resume_workflow` with the correct `decision_type_from_api`.
 
-        # Store the raw decision payload for the target node to process
-        current_state_snapshot["user_made_decision_payload"] = {"source_decision_type": decision_type_from_api, **decision_payload_from_api}
+        # Store the raw decision payload for the target node to process.
+        # Note: The specific handling below for outline/worldview will overwrite user_made_decision_payload.
+        # This is intentional as those nodes expect a simpler structure than conflict_review.
+        # current_state_snapshot["user_made_decision_payload"] = {"source_decision_type": decision_type_from_api, **decision_payload_from_api}
 
-        if decision_type_from_api == "conflict_review":
+        history = current_state_snapshot.get("history", []) # Get history early for logging
+
+        if decision_type_from_api == "outline_selection":
+            logger.info(f"Resuming workflow for outline_selection. Payload: {decision_payload_from_api}")
+            selected_id_str = decision_payload_from_api.get("selected_id")
+
+            if selected_id_str is None:
+                raise ValueError("Missing 'selected_id' in decision_payload_from_api for outline_selection.")
+            try:
+                selected_index = int(selected_id_str)
+            except ValueError:
+                raise ValueError(f"Invalid 'selected_id' format: '{selected_id_str}', must be an integer index for outline_selection.")
+
+            all_outlines = current_state_snapshot.get("all_generated_outlines")
+            if not all_outlines or not isinstance(all_outlines, list):
+                raise ValueError("State consistency error: 'all_generated_outlines' not found or not a list in snapshot during outline_selection.")
+            if not (0 <= selected_index < len(all_outlines)):
+                raise ValueError(f"Invalid selected_index {selected_index} for all_generated_outlines (length {len(all_outlines)}).")
+
+            current_state_snapshot["narrative_outline_text"] = all_outlines[selected_index]
+            current_state_snapshot["user_made_decision_payload"] = { # This will be processed by present_outlines_for_selection_cli
+                "source_decision_type": "outline_selection", # Helps the node identify the decision source
+                "selected_option_id": str(selected_index + 1) # present_outlines_cli expects 1-based ID
+            }
+            current_state_snapshot["pending_decision_type"] = None
+            current_state_snapshot["pending_decision_options"] = None
+            current_state_snapshot["pending_decision_prompt"] = None
+            current_state_snapshot["workflow_status"] = "running_after_outline_decision"
+            current_state_snapshot["history"] = _log_and_update_history(history, f"Resumed with API outline selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
+            logger.info(f"Applied outline selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
+
+        elif decision_type_from_api == "worldview_selection":
+            logger.info(f"Resuming workflow for worldview_selection. Payload: {decision_payload_from_api}")
+            selected_id_str = decision_payload_from_api.get("selected_id")
+
+            if selected_id_str is None:
+                raise ValueError("Missing 'selected_id' in decision_payload_from_api for worldview_selection.")
+            try:
+                selected_index = int(selected_id_str)
+            except ValueError:
+                raise ValueError(f"Invalid 'selected_id' format: '{selected_id_str}', must be an integer index for worldview_selection.")
+
+            all_worldviews = current_state_snapshot.get("all_generated_worldviews")
+            if not all_worldviews or not isinstance(all_worldviews, list):
+                raise ValueError("State consistency error: 'all_generated_worldviews' not found or not a list in snapshot during worldview_selection.")
+            if not (0 <= selected_index < len(all_worldviews)):
+                raise ValueError(f"Invalid selected_index {selected_index} for all_generated_worldviews (length {len(all_worldviews)}).")
+
+            current_state_snapshot["selected_worldview_detail"] = all_worldviews[selected_index]
+            current_state_snapshot["user_made_decision_payload"] = { # This will be processed by present_worldviews_for_selection_cli
+                "source_decision_type": "worldview_selection", # Helps the node identify
+                "selected_option_id": str(selected_index + 1) # present_worldviews_cli expects 1-based ID
+            }
+            current_state_snapshot["pending_decision_type"] = None
+            current_state_snapshot["pending_decision_options"] = None
+            current_state_snapshot["pending_decision_prompt"] = None
+            current_state_snapshot["workflow_status"] = "running_after_worldview_decision"
+            current_state_snapshot["history"] = _log_and_update_history(history, f"Resumed with API worldview selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
+            logger.info(f"Applied worldview selection (index {selected_index}). New status: {current_state_snapshot['workflow_status']}")
+
+        elif decision_type_from_api == "conflict_review":
+            current_state_snapshot["user_made_decision_payload"] = {"source_decision_type": decision_type_from_api, **decision_payload_from_api} # Ensure full payload for conflict review
             original_content = current_state_snapshot.get("original_chapter_content_for_conflict_review")
             conflicts_at_pause = current_state_snapshot.get("current_chapter_conflicts", []) # These are the conflicts presented to user
 
