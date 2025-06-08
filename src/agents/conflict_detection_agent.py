@@ -37,6 +37,40 @@ class ConflictDetectionAgent:
         if not self.lore_keeper and not self.db_name:
             print("ConflictDetectionAgent: Warning - Neither LoreKeeper instance nor db_name provided. KB context will be unavailable.")
 
+    def _extract_key_entities_for_kb_query(self, chapter_text: str) -> List[str]:
+        """
+        Extracts key entities (characters, locations, items) from chapter text for targeted KB queries.
+        """
+        if not self.llm_client:
+            print("ConflictDetectionAgent: LLMClient not available for entity extraction.")
+            return []
+
+        prompt = f"""Given the following chapter text, list the key character names, important locations, and crucial items or unique concepts mentioned that would be most relevant for checking against a knowledge base for consistency.
+Focus on proper nouns and elements central to the plot or descriptions in this text.
+Return a comma-separated list of these entities. If no specific entities stand out, return an empty string.
+
+Text:
+---
+{chapter_text[:2000]}
+---
+Entities:""" # Limit text length to manage LLM token usage for this quick extraction
+
+        try:
+            response_text = self.llm_client.generate_text(prompt, max_tokens=150, temperature=0.3)
+            if response_text:
+                entities = [e.strip() for e in response_text.split(',') if e.strip()]
+                if entities:
+                    print(f"ConflictDetectionAgent: Extracted key entities for KB query: {entities}")
+                    return entities
+                else:
+                    print("ConflictDetectionAgent: No specific entities extracted by LLM for targeted KB query.")
+                    return []
+            else:
+                print("ConflictDetectionAgent: LLM returned no response for entity extraction.")
+                return []
+        except Exception as e:
+            print(f"ConflictDetectionAgent: Error during LLM call for entity extraction: {e}")
+            return []
 
     def _construct_conflict_prompt(self, chapter_number: int, chapter_text: str, kb_context_str: str, novel_theme_style: Optional[Dict[str, Any]]) -> str:
         theme_style_info = ""
@@ -201,30 +235,61 @@ List all conflicts you find.
 
         # Retrieve Knowledge Base Context
         retrieved_kb_context_str = "Knowledge Base context not available."
-        if lore_keeper_instance:
+        all_kb_chunks_with_scores: Dict[str, float] = {} # Use dict to store unique doc content and its highest score
+
+        if lore_keeper_instance and hasattr(lore_keeper_instance, 'kb_manager') and lore_keeper_instance.kb_manager:
             try:
-                print(f"ConflictDetectionAgent: Querying Knowledge Base for context related to Chapter {current_chapter_number} content.")
-                # Using a segment of chapter text for broader context query
-                query_text = current_chapter_text[:1500] # Query with start of chapter
+                # 1. Targeted Entity Queries
+                extracted_entities = self._extract_key_entities_for_kb_query(current_chapter_text)
+                if extracted_entities:
+                    print(f"ConflictDetectionAgent: Performing targeted KB queries for entities: {extracted_entities}")
+                    for entity in set(extracted_entities): # Use set to avoid duplicate queries for same entity
+                        if not entity: continue
+                        entity_query_results = lore_keeper_instance.kb_manager.query_knowledge_base(
+                            novel_id,
+                            f"Detailed information about '{entity}' including relationships, characteristics, and past events.",
+                            n_results=2 # Fetch a few relevant snippets per entity
+                        )
+                        if entity_query_results:
+                            for doc, score in entity_query_results:
+                                if doc not in all_kb_chunks_with_scores or score > all_kb_chunks_with_scores[doc]:
+                                    all_kb_chunks_with_scores[doc] = score
+                            print(f"ConflictDetectionAgent: Found {len(entity_query_results)} KB snippets for entity '{entity}'.")
 
-                # Add specific entity queries if identifiable, for now broad query
-                # Example: Extract character names from chapter text and query for their KB entries.
+                # 2. Broad Context Query
+                print(f"ConflictDetectionAgent: Performing broad KB query for Chapter {current_chapter_number} content.")
+                broad_query_text = current_chapter_text[:1500] # Query with start of chapter
+                broad_kb_results = lore_keeper_instance.kb_manager.query_knowledge_base(
+                    novel_id,
+                    broad_query_text,
+                    n_results=4 # Reduced from 7, as targeted queries supplement
+                )
+                if broad_kb_results:
+                    for doc, score in broad_kb_results:
+                        if doc not in all_kb_chunks_with_scores or score > all_kb_chunks_with_scores[doc]:
+                            all_kb_chunks_with_scores[doc] = score
+                    print(f"ConflictDetectionAgent: Found {len(broad_kb_results)} KB snippets from broad query.")
 
-                kb_results = lore_keeper_instance.kb_manager.query_knowledge_base(novel_id, query_text, n_results=7) # Increased n_results for broader context
+                # 3. Format and Combine
+                if all_kb_chunks_with_scores:
+                    # Sort by score descending to prioritize more relevant info if context gets too long
+                    sorted_kb_items = sorted(all_kb_chunks_with_scores.items(), key=lambda item: item[1], reverse=True)
 
-                if kb_results:
                     formatted_results = []
-                    for doc, score in kb_results:
-                        # Simple formatting, could be more sophisticated (e.g. add source if available)
+                    for doc, score in sorted_kb_items:
                         formatted_results.append(f"- {doc} (Similarity: {score:.2f})")
                     retrieved_kb_context_str = "\n".join(formatted_results)
-                    print(f"ConflictDetectionAgent: Retrieved {len(kb_results)} item(s) from KB.")
+                    print(f"ConflictDetectionAgent: Total unique KB items for context: {len(sorted_kb_items)}.")
                 else:
                     retrieved_kb_context_str = "No specific information retrieved from Knowledge Base for this chapter context."
-                    print("ConflictDetectionAgent: No items retrieved from KB for the query.")
+                    print("ConflictDetectionAgent: No items retrieved from KB from any query type.")
+
             except Exception as e:
                 print(f"ConflictDetectionAgent: Error querying Knowledge Base: {e}. Proceeding with limited context.")
                 retrieved_kb_context_str = f"Error accessing Knowledge Base: {e}"
+        else:
+            print("ConflictDetectionAgent: LoreKeeperAgent or KBManager not available. Skipping KB queries.")
+
 
         # Construct and Execute LLM Prompt
         prompt = self._construct_conflict_prompt(current_chapter_number, current_chapter_text, retrieved_kb_context_str, novel_context)
@@ -280,40 +345,94 @@ if __name__ == '__main__':
     # Mock LoreKeeper and its KnowledgeBaseManager
     class MockKnowledgeBaseManager:
         def query_knowledge_base(self, novel_id: int, query_text: str, n_results: int = 3) -> List[tuple[str, float]]:
-            print(f"MockKBManager: Querying for novel {novel_id} with text '{query_text[:50]}...' (n_results={n_results})")
-            if "blue" in query_text.lower(): # Simulate finding relevant KB entry
-                return [("Character Z is blue. Fairies are real.", 0.95)]
+            print(f"MockKBManager: Querying for novel {novel_id} with query '{query_text[:60]}...' (n_results={n_results})")
+            if "Character Z" in query_text or "blue" in query_text.lower():
+                return [("KB: Character Z is consistently portrayed as blue.", 0.95),
+                        ("KB: Character Z is known for their calm demeanor.", 0.80)]
+            if "fairies" in query_text.lower():
+                 return [("KB: Fairies are mythical creatures in this world, rarely seen.", 0.90)]
             if "hero" in query_text.lower():
-                return [("The prophecy states only the chosen hero can defeat the dragon.", 0.88),
-                        ("Heroes in this land are always male.", 0.75)]
+                return [("KB: The prophecy states only the chosen hero can defeat the dragon.", 0.88),
+                        ("KB: Heroes in this land are always male, by ancient decree.", 0.75)]
+            # Default for broad query if no specific match
+            if "Character Z, who was famously red" in query_text: # Simulating broad query from chapter text
+                 return [("KB: General world lore snippet about colors and their meanings.", 0.70)]
             return []
 
     class MockLoreKeeperAgent:
-        def __init__(self, db_name: Optional[str] = None, llm_client: Optional[Any] = None):
+        def __init__(self, db_name: Optional[str] = None, llm_client: Optional[Any] = None): # llm_client param added to match LKA's potential init
             self.kb_manager = MockKnowledgeBaseManager()
+            # self.llm_client = llm_client # Store if LKA uses it directly, though CDA passes its own for entity extraction
             print(f"MockLoreKeeperAgent initialized (db_name='{db_name}')")
 
-    # Test Case 1: Contradiction with KB
-    print("\n--- Test Case 1: Contradiction with KB ---")
-    llm_client_kb_conflict = MockLLMClientForConflict(fixed_response="""Conflict 1:
+    # Updated MockLLMClient to handle entity extraction prompt
+    class MockLLMClientForConflict:
+        def __init__(self, fixed_response_conflict=None, fixed_response_entities=None):
+            self.fixed_response_conflict = fixed_response_conflict
+            self.fixed_response_entities = fixed_response_entities
+            self.call_count = 0
+
+        def generate_text(self, prompt: str, max_tokens: int, temperature: Optional[float]=None) -> str:
+            self.call_count += 1
+            if "Entities:" in prompt: # This is the entity extraction call
+                print(f"MockLLMClient (Entity Extraction call {self.call_count}): Received entity prompt.")
+                if self.fixed_response_entities is not None:
+                    return self.fixed_response_entities
+                if "Character Z" in prompt and "Fairies" in prompt:
+                    return "Character Z, Fairies"
+                if "Maria" in prompt:
+                    return "Maria"
+                return "" # Default no entities
+            else: # This is the conflict detection call
+                print(f"MockLLMClient (Conflict Detection call {self.call_count}): Received conflict prompt.")
+                if self.fixed_response_conflict:
+                    return self.fixed_response_conflict
+                if "Character Z is blue" in prompt and "Character Z is red" in prompt: # Check if KB context made it to prompt
+                    return """Conflict 1:
+      Description: Character Z is described as blue in KB but red in chapter.
+      Excerpt: Character Z is red.
+      KB_Reference: KB: Character Z is consistently portrayed as blue.
+      Conflict_Type: Factual Inconsistency with KB
+      Severity: Medium
+    ---"""
+                return "No significant conflicts detected."
+
+
+    # Test Case 1: Contradiction with KB (testing new entity extraction path)
+    print("\n--- Test Case 1: Contradiction with KB (with Entity Extraction) ---")
+    # Specific fixed responses for this test:
+    # 1. For entity extraction: "Character Z, Fairies"
+    # 2. For conflict detection: The detailed conflict string
+    llm_conflict_response_tc1 = """Conflict 1:
   Description: Character Z is described as blue in the Knowledge Base, but the chapter states they are red.
   Excerpt: "Character Z, who was famously red, entered the room."
-  KB_Reference: "Character Z is blue."
+  KB_Reference: "KB: Character Z is consistently portrayed as blue."
   Conflict_Type: Factual Inconsistency with KB
   Severity: Medium
----""")
-    agent1 = ConflictDetectionAgent(llm_client=llm_client_kb_conflict, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
+---"""
+    llm_client_tc1 = MockLLMClientForConflict(
+        fixed_response_conflict=llm_conflict_response_tc1,
+        fixed_response_entities="Character Z, Fairies" # Entities LLM should extract
+    )
+    agent1 = ConflictDetectionAgent(llm_client=llm_client_tc1, lore_keeper=MockLoreKeeperAgent(db_name="test_db_tc1"))
     novel_context1 = {"theme": "Fantasy", "style_preferences": "Epic"}
     chapter_text1 = "Character Z, who was famously red, entered the room. Fairies danced around."
-    conflicts1 = agent1.detect_conflicts(novel_id=1, current_chapter_text=chapter_text1, current_chapter_number=1, novel_context=novel_context1)
-    print(f"Found conflicts: {len(conflicts1)}")
-    for conflict in conflicts1: print(conflict)
 
-    # Test Case 2: No conflicts
-    print("\n--- Test Case 2: No Conflicts ---")
-    llm_client_no_conflict = MockLLMClientForConflict(fixed_response="No significant conflicts detected.")
-    agent2 = ConflictDetectionAgent(llm_client=llm_client_no_conflict, lore_keeper=MockLoreKeeperAgent(db_name="test_db"))
-    chapter_text2 = "The weather was pleasant, and everyone had a good day."
+    conflicts1 = agent1.detect_conflicts(novel_id=1, current_chapter_text=chapter_text1, current_chapter_number=1, novel_context=novel_context1)
+    print(f"Found conflicts for TC1: {len(conflicts1)}")
+    for conflict in conflicts1: print(conflict)
+    assert len(conflicts1) == 1
+    assert conflicts1[0]['description'] == "Character Z is described as blue in the Knowledge Base, but the chapter states they are red."
+    assert llm_client_tc1.call_count == 2 # 1 for entities, 1 for conflict
+
+    # Test Case 2: No conflicts (ensure entity extraction still runs)
+    print("\n--- Test Case 2: No Conflicts (with Entity Extraction) ---")
+    llm_client_tc2 = MockLLMClientForConflict(
+        fixed_response_conflict="No significant conflicts detected.",
+        fixed_response_entities="Some Entity" # Simulate some entity being extracted
+    )
+    agent2 = ConflictDetectionAgent(llm_client=llm_client_tc2, lore_keeper=MockLoreKeeperAgent(db_name="test_db_tc2"))
+    chapter_text2 = "The weather was pleasant, and everyone had a good day. Some Entity was there."
     conflicts2 = agent2.detect_conflicts(novel_id=1, current_chapter_text=chapter_text2, current_chapter_number=2, novel_context=novel_context1)
     print(f"Found conflicts: {len(conflicts2)}")
     for conflict in conflicts2: print(conflict)

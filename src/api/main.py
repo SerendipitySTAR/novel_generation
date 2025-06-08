@@ -24,6 +24,92 @@ class NarrativeResponse(BaseModel): # Kept for existing endpoint
     error_message: Optional[str] = None
     history: Optional[List[str]] = None
 
+# --- Pydantic Models for KB Validation ---
+class KBValidationRequestItem(BaseModel):
+    id: str
+    novel_id: int
+    request_type: str
+    source_reference: Optional[str] = None
+    source_text_snippet: Optional[str] = None
+    item_under_review_json: str
+    validation_question: str
+    system_suggestion_json: Optional[str] = None
+    status: str
+    creation_date: str
+
+class KBValidationRequestDetail(KBValidationRequestItem): # Inherits all fields, can add more if needed
+    user_decision: Optional[str] = None
+    user_corrected_value_json: Optional[str] = None
+    user_comment: Optional[str] = None
+    resolution_date: Optional[str] = None
+
+class KBValidationResolutionPayload(BaseModel):
+    decision: str # e.g., "confirmed", "rejected", "edited"
+    corrected_value_json: Optional[str] = None # JSON string of user's correction
+    user_comment: Optional[str] = None
+    # Status will be determined server-side based on decision
+
+# --- Pydantic Models for Outline and Worldview Editing ---
+class OutlineUpdatePayload(BaseModel):
+    overview_text: str
+
+class OutlineResponse(BaseModel):
+    id: int
+    novel_id: int
+    overview_text: str
+    creation_date: str # Keep as string for API consistency, FastAPI handles datetime conversion
+
+class WorldviewUpdatePayload(BaseModel):
+    description_text: str # Core concept
+
+class WorldviewResponse(BaseModel):
+    id: int
+    novel_id: int
+    description_text: str
+    creation_date: str
+
+# --- Pydantic Models for Character Editing ---
+class CharacterUpdatePayload(BaseModel):
+    name: Optional[str] = None
+    role_in_story: Optional[str] = None
+    # Client sends the full JSON string of profile attributes (DetailedCharacterProfile fields)
+    description_json: Optional[str] = None
+
+# Re-using DetailedCharacterProfile from src.core.models for response.
+# If it were complex or needed API-specific views, a CharacterResponse Pydantic model would be made here.
+# For now, we'll assume DetailedCharacterProfile can be returned directly by FastAPI.
+# If DetailedCharacterProfile is a TypedDict, FastAPI might handle it, or we might need a Pydantic version.
+# For robustness, let's define a Pydantic version of DetailedCharacterProfile for responses.
+
+class CharacterResponse(BaseModel):
+    character_id: Optional[int] = None
+    novel_id: Optional[int] = None
+    creation_date: Optional[str] = None
+    name: str
+    gender: Optional[str] = None
+    age: Optional[str] = None
+    race_or_species: Optional[str] = None
+    appearance_summary: Optional[str] = None
+    clothing_style: Optional[str] = None
+    background_story: Optional[str] = None
+    personality_traits: Optional[str] = None
+    values_and_beliefs: Optional[str] = None
+    strengths: Optional[List[str]] = None
+    weaknesses: Optional[List[str]] = None
+    quirks_or_mannerisms: Optional[List[str]] = None
+    catchphrase_or_verbal_style: Optional[str] = None
+    skills_and_abilities: Optional[List[str]] = None
+    special_powers: Optional[List[str]] = None
+    power_level_assessment: Optional[str] = None
+    motivations_deep_drive: Optional[str] = None
+    goal_short_term: Optional[str] = None
+    goal_long_term: Optional[str] = None
+    character_arc_potential: Optional[str] = None
+    relationships_initial_notes: Optional[str] = None
+    role_in_story: Optional[str] = None
+    raw_llm_output_for_character: Optional[str] = None
+
+
 # --- New/Updated Pydantic Models for Novel Generation ---
 
 class NovelGenerationRequest(BaseModel):
@@ -96,6 +182,7 @@ class KnowledgeGraphResponse(BaseModel): # Kept for existing endpoint
     error_message: Optional[str] = None
 
 
+# --- FastAPI App Initialization ---
 app = FastAPI(
     title="Automatic Novel Generator API",
     description="API for managing and interacting with the novel generation process.",
@@ -564,6 +651,230 @@ async def get_novel_knowledge_graph(novel_id: int):
         )
 
 
+# --- KB Validation Endpoints ---
+@app.get("/novels/{novel_id}/kb_validation_requests", response_model=List[KBValidationRequestItem])
+async def list_pending_kb_validation_requests(novel_id: int):
+    print(f"API: Request for pending KB validation requests for Novel ID {novel_id}")
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel_check = db_manager.get_novel_by_id(novel_id)
+    if not novel_check:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    try:
+        pending_requests_db = db_manager.get_pending_kb_validation_requests(novel_id)
+        # Convert list of dicts from DB to list of Pydantic models
+        response_items = [KBValidationRequestItem(**req) for req in pending_requests_db]
+        return response_items
+    except Exception as e:
+        print(f"API: Error retrieving pending KB validation requests for novel {novel_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve KB validation requests.")
+
+@app.post("/novels/{novel_id}/kb_validation_requests/{validation_id}/resolve", response_model=KBValidationRequestDetail)
+async def resolve_kb_validation_request_endpoint(
+    novel_id: int,
+    validation_id: str,
+    payload: KBValidationResolutionPayload
+):
+    print(f"API: Request to resolve KB validation ID {validation_id} for Novel ID {novel_id} with decision: {payload.decision}")
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+
+    # Check if novel and validation request exist
+    novel_check = db_manager.get_novel_by_id(novel_id)
+    if not novel_check:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    validation_request = db_manager.get_kb_validation_request_by_id(validation_id)
+    if not validation_request:
+        raise HTTPException(status_code=404, detail=f"KB Validation Request with ID {validation_id} not found.")
+
+    if validation_request['novel_id'] != novel_id:
+        raise HTTPException(status_code=400, detail=f"Validation request {validation_id} does not belong to novel {novel_id}.")
+
+    if validation_request['status'] != 'pending_review':
+        raise HTTPException(status_code=409, detail=f"Validation request {validation_id} is not pending review. Current status: {validation_request['status']}.")
+
+    # Determine new status based on decision
+    new_status = "unknown"
+    if payload.decision == "confirmed":
+        new_status = "user_confirmed"
+    elif payload.decision == "rejected":
+        new_status = "user_rejected"
+    elif payload.decision == "edited":
+        new_status = "user_edited"
+        if payload.corrected_value_json is None:
+            raise HTTPException(status_code=422, detail="For 'edited' decision, 'corrected_value_json' is required.")
+    else:
+        raise HTTPException(status_code=422, detail=f"Invalid decision type: '{payload.decision}'. Must be 'confirmed', 'rejected', or 'edited'.")
+
+    try:
+        success = db_manager.resolve_kb_validation_request(
+            validation_id=validation_id,
+            decision=payload.decision,
+            status=new_status,
+            corrected_value_json=payload.corrected_value_json,
+            user_comment=payload.user_comment
+        )
+        if not success:
+            # This might happen if rowcount was 0, e.g., validation_id disappeared
+            raise HTTPException(status_code=500, detail="Failed to update validation request in database (e.g. not found or no change made).")
+
+        updated_request = db_manager.get_kb_validation_request_by_id(validation_id)
+        if not updated_request: # Should not happen if success was true
+            raise HTTPException(status_code=500, detail="Failed to retrieve updated validation request.")
+
+        # Placeholder: Trigger LoreKeeperAgent processing of this decision
+        # This would ideally be a background task or part of a larger workflow step.
+        # For now, just logging it.
+        print(f"TODO: Trigger LoreKeeperAgent to process validation ID {validation_id} with decision '{payload.decision}' and new status '{new_status}'.")
+        # Example (conceptual, actual call might differ):
+        # lore_keeper = LoreKeeperAgent(db_name=DB_FILE_NAME)
+        # background_tasks.add_task(lore_keeper.process_user_kb_validation_decision, validation_id, payload.decision, json.loads(payload.corrected_value_json) if payload.corrected_value_json else None)
+
+        return KBValidationRequestDetail(**updated_request)
+
+    except Exception as e:
+        print(f"API: Error resolving KB validation request {validation_id}: {e}")
+        # import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to resolve KB validation request: {str(e)}")
+
+
+# --- Character Editing Endpoints ---
+@app.get("/novels/{novel_id}/characters/{character_id}", response_model=CharacterResponse)
+async def get_character_details(novel_id: int, character_id: int):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    character_profile_dict = db_manager.get_character_by_id(character_id) # This returns DetailedCharacterProfile (a TypedDict)
+    if not character_profile_dict or character_profile_dict['novel_id'] != novel_id:
+        raise HTTPException(status_code=404, detail=f"Character with ID {character_id} not found for novel {novel_id}.")
+
+    # Convert TypedDict to Pydantic model for response
+    return CharacterResponse(**character_profile_dict)
+
+
+@app.put("/novels/{novel_id}/characters/{character_id}", response_model=CharacterResponse)
+async def update_novel_character(novel_id: int, character_id: int, payload: CharacterUpdatePayload):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+
+    if payload.name is None and payload.role_in_story is None and payload.description_json is None:
+        raise HTTPException(status_code=422, detail="No update data provided. At least one of 'name', 'role_in_story', or 'description_json' must be supplied.")
+
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    # Check if character exists and belongs to the novel
+    existing_character = db_manager.get_character_by_id(character_id) # Returns DetailedCharacterProfile
+    if not existing_character or existing_character['novel_id'] != novel_id:
+        raise HTTPException(status_code=404, detail=f"Character with ID {character_id} not found for novel {novel_id}.")
+
+    # Validate description_json if provided
+    if payload.description_json is not None:
+        try:
+            json.loads(payload.description_json) # Validate if it's proper JSON
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=422, detail="Invalid 'description_json' format. Must be a valid JSON string.")
+
+    try:
+        success = db_manager.update_character(
+            character_id=character_id,
+            name=payload.name,
+            description=payload.description_json, # Pass the JSON string directly
+            role_in_story=payload.role_in_story
+        )
+        if not success:
+            # This could mean character_id not found, or no actual change in data resulted in 0 affected rows.
+            # The db_manager.update_character fetches novel_id before update attempt,
+            # so if character_id was invalid, it would have returned False from there.
+            # If data is same, rowcount is 0, but it's not an error. We can re-fetch to confirm.
+            # For simplicity, if update returns False but no exception, assume data was same or ID invalid (already checked).
+             pass # Allow re-fetch to return current state
+
+        updated_character_data = db_manager.get_character_by_id(character_id)
+        if not updated_character_data: # Should not happen if initial checks passed
+             raise HTTPException(status_code=500, detail="Failed to retrieve updated character after update attempt.")
+        return CharacterResponse(**updated_character_data)
+    except Exception as e:
+        # import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An error occurred while updating character: {str(e)}")
+
+
+# --- Outline and Worldview Editing Endpoints ---
+@app.get("/novels/{novel_id}/outlines/{outline_id}", response_model=OutlineResponse)
+async def get_outline_details(novel_id: int, outline_id: int):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    outline = db_manager.get_outline_by_id(outline_id)
+    if not outline or outline['novel_id'] != novel_id:
+        raise HTTPException(status_code=404, detail=f"Outline with ID {outline_id} not found for novel {novel_id}.")
+    return OutlineResponse(**outline)
+
+@app.put("/novels/{novel_id}/outlines/{outline_id}", response_model=OutlineResponse)
+async def update_novel_outline(novel_id: int, outline_id: int, payload: OutlineUpdatePayload):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    # Check if outline exists and belongs to the novel
+    existing_outline = db_manager.get_outline_by_id(outline_id)
+    if not existing_outline or existing_outline['novel_id'] != novel_id:
+        raise HTTPException(status_code=404, detail=f"Outline with ID {outline_id} not found for novel {novel_id}.")
+
+    try:
+        success = db_manager.update_outline(outline_id, payload.overview_text)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update outline in database.")
+
+        updated_outline_data = db_manager.get_outline_by_id(outline_id)
+        if not updated_outline_data: # Should not happen if update was successful
+             raise HTTPException(status_code=500, detail="Failed to retrieve updated outline.")
+        return OutlineResponse(**updated_outline_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while updating outline: {str(e)}")
+
+@app.get("/novels/{novel_id}/worldviews/{worldview_id}", response_model=WorldviewResponse)
+async def get_worldview_details(novel_id: int, worldview_id: int):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    worldview = db_manager.get_worldview_by_id(worldview_id)
+    if not worldview or worldview['novel_id'] != novel_id:
+        raise HTTPException(status_code=404, detail=f"Worldview with ID {worldview_id} not found for novel {novel_id}.")
+    return WorldviewResponse(**worldview)
+
+@app.put("/novels/{novel_id}/worldviews/{worldview_id}", response_model=WorldviewResponse)
+async def update_novel_worldview(novel_id: int, worldview_id: int, payload: WorldviewUpdatePayload):
+    db_manager = DatabaseManager(db_name=DB_FILE_NAME)
+    novel = db_manager.get_novel_by_id(novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail=f"Novel with ID {novel_id} not found.")
+
+    existing_worldview = db_manager.get_worldview_by_id(worldview_id)
+    if not existing_worldview or existing_worldview['novel_id'] != novel_id:
+        raise HTTPException(status_code=404, detail=f"Worldview with ID {worldview_id} not found for novel {novel_id}.")
+
+    try:
+        success = db_manager.update_worldview(worldview_id, payload.description_text)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update worldview in database.")
+
+        updated_worldview_data = db_manager.get_worldview_by_id(worldview_id)
+        if not updated_worldview_data:
+             raise HTTPException(status_code=500, detail="Failed to retrieve updated worldview.")
+        return WorldviewResponse(**updated_worldview_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while updating worldview: {str(e)}")
+
+
+# --- Main Application Execution ---
 if __name__ == "__main__":
     # Create a default DB if it doesn't exist for local testing
     print(f"Initializing database '{DB_FILE_NAME}' for API...")

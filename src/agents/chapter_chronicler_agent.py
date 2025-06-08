@@ -34,10 +34,10 @@ Chapter Brief (context, characters, lore):
 
 Specific Plot for THIS Chapter: {current_chapter_plot_summary}
 
-Your primary goal for this chapter's content is to flesh out the 'Specific Plot for THIS Chapter'.
+Your primary goal for this chapter's content is to flesh out the 'Specific Plot for THIS Chapter'. This is the driving force of the chapter.
 Use the 'Chapter Brief' for essential background, character states, and relevant lore to ensure consistency.
-Weave these elements together to write a compelling narrative for this chapter.
-Refer to any 'Relevant Lore and Context' (often demarcated by '--- RELEVANT LORE AND CONTEXT ---') provided in the brief.
+If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly integrate these facts/lore snippets where they naturally fit within the narrative flow. Do not list them or directly refer to them as 'lore' or 'from the knowledge base'. The integration should feel organic and enhance the story.
+Weave all these elements together to write a compelling narrative for this chapter.
 
 IMPORTANT: Your response must follow this EXACT format. Do not include any other text or explanations:
 
@@ -49,8 +49,14 @@ Content:
 - Show, Don't Tell: Focus on vivid descriptions of settings, character actions, and emotions.
 - Dialogue: Incorporate meaningful dialogue that reveals character personality, motivations, and advances the plot.
 - Character Consistency: Ensure character behaviors, decisions, and speech patterns are consistent with their detailed profiles and motivations as described in the 'Chapter Brief'.
-- Utilize Context: If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly weave these details into the narrative where appropriate to enhance world-building and consistency. Avoid large blocks of exposition (info-dumping).
+- Utilize Context: If the 'Chapter Brief' includes a 'RELEVANT LORE AND CONTEXT (from Knowledge Base)' section, subtly weave these details into the narrative where appropriate to enhance world-building and consistency. Avoid large blocks of exposition (info-dumping). Ensure all provided RAG context is used effectively and subtly.
 - Pacing and Flow: Maintain a good narrative pace suitable for the chapter's events and tone.]
+
+Self-Correction Checklist (Before Finalizing):
+- Is dialogue impactful and character-revealing?
+- Are descriptions vivid and immersive?
+- Is all provided RAG context used effectively and subtly?
+- Does the chapter primarily advance the 'Specific Plot for THIS Chapter'?
 
 Summary:
 [Write a concise 2-3 sentence summary of the key plot advancements, character developments, and critical outcomes that occurred within this chapter only]
