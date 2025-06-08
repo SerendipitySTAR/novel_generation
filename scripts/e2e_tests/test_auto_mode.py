@@ -96,6 +96,59 @@ class TestAutoModeE2E(unittest.TestCase):
         print(f"Database verifications passed for novel_id {novel_id}.")
         print("--- E2E Test AM-1 Completed Successfully ---")
 
+    def test_auto_mode_conflict_path_am3(self):
+        print("\n--- Running E2E Test: Auto-Mode Conflict Detection/Resolution Path (AM-3) ---")
+
+        # Theme designed to potentially introduce mild, detectable inconsistencies or need for KB lookup
+        novel_payload = {
+            "theme": "A historian discovers an ancient map detailing a lost city that supposedly vanished due to a magical cataclysm. His notes say the city was coastal, but the map places it deep in a mountain range. He decides to investigate the mountains.",
+            "style_preferences": "Adventure mystery with elements of ancient lore.",
+            "chapters": 1, # Keep low for faster test, focus on first chapter's potential conflict
+            "words_per_chapter": 150, # Keep low
+            "mode": "auto"
+        }
+
+        print(f"Starting novel generation with potentially conflicting theme: {novel_payload['theme']}")
+        # Using print_json if available from common, otherwise just print
+        # print_json(novel_payload, "Novel payload for AM-3:")
+        print(f"Novel payload for AM-3: {novel_payload}")
+
+        start_response = post_api("/novels/", novel_payload)
+        novel_id = start_response.get("novel_id")
+
+        # Using print_json if available
+        # print_json(start_response, "Start novel response for AM-3:")
+        print(f"Start novel response for AM-3: {start_response}")
+
+        self.assertIsNotNone(novel_id, "Novel ID not received for AM-3")
+        self.assertEqual(start_response.get("status"), "pending", "Initial status not 'pending' for AM-3")
+
+        # Poll for completion
+        # This path includes conflict detection and auto-resolution attempts.
+        # The primary assertion is that it completes without runtime errors.
+        try:
+            final_status_data = poll_status(novel_id, expected_final_status="completed", timeout_secs=400) # Increased timeout slightly
+            self.assertEqual(final_status_data.get("status"), "completed",
+                f"AM-3 Final status not 'completed'. Got: {final_status_data.get('status')}, Full: {final_status_data}")
+            print(f"Novel {novel_id} (AM-3) completed successfully.")
+            print("Verification of this test primarily relies on the absence of errors during the run,")
+            print("implying the conflict detection/resolution path was exercised without breaking the flow.")
+            print("Deeper analysis of whether conflicts were truly found and resolved would require log inspection.")
+        except Exception as e:
+            print(f"ERROR during AM-3 E2E test for novel_id {novel_id}: {e}")
+            # If poll_status raises an exception (e.g. timeout or 'failed' status), this will catch it.
+            # We also need to fetch the final status from DB if possible to understand why it failed.
+            try:
+                status_from_db = query_db("SELECT workflow_status, error_message FROM novels WHERE id = ?", (novel_id,))
+                if status_from_db:
+                    print(f"Novel {novel_id} status from DB on error: {status_from_db[0]}")
+            except Exception as db_e:
+                print(f"Could not fetch novel status from DB after error: {db_e}")
+            self.fail(f"AM-3 test failed for novel_id {novel_id} due to: {e}")
+
+
+        print("--- E2E Test AM-3 Completed ---")
+
 if __name__ == "__main__":
     print("Running E2E tests for Auto-Mode scenarios...")
     print(f"Make sure the API server is running at {common.API_BASE_URL} and using DB: {common.DB_PATH}")
